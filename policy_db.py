@@ -7,7 +7,7 @@ app = FastAPI()
 is_down = False
 
 @app.get("/policy/{key}")
-async def get_policy(key: str):
+async def get_policy(key: str, sid: str = "", res: str = ""):
     global is_down
     if is_down:
         # Simulate hang or failure
@@ -16,6 +16,10 @@ async def get_policy(key: str):
     
     # Simulate DB latency
     await asyncio.sleep(0.02)
+    
+    if res == "restricted" or sid.endswith("/deny"):
+        return {"status": "deny", "role": "none"}
+        
     return {"status": "allow", "role": "admin"}
 
 @app.post("/chaos/db/{state}")

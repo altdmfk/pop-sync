@@ -4,6 +4,8 @@ import time
 import os
 import httpx
 import logging
+import threading
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -25,18 +27,57 @@ node_name = args.node
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 db_url = os.getenv("DB_URL", "http://localhost:8000")
 
-# Constants to replace magic numbers
+# Constants
 STREAM_NAME = "invalidation_stream"
 STREAM_GROUP = f"gateway_group_{node_name}"
 STREAM_CATCHUP_COUNT = 100
 STREAM_NORMAL_COUNT = 10
 STREAM_BLOCK_MS = 500
 PARTITION_SLEEP_SEC = 0.5
-REDIS_TIMEOUT_SEC = 3.0
+REDIS_TIMEOUT_SEC = 0.2
 
 redis_client = None
+stream_redis_client = None
 sync_http_client = None
-l1_cache = {}
+class L1Cache:
+    def __init__(self, max_size=1000, ttl=60):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+        self.ttl = ttl
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            if key in self.cache:
+                val, expires_at = self.cache[key]
+                if time.time() < expires_at:
+                    self.cache.move_to_end(key)
+                    return val
+                else:
+                    del self.cache[key]
+            return None
+
+    def set(self, key, value):
+        with self._lock:
+            if key in self.cache:
+                del self.cache[key]
+            elif len(self.cache) >= self.max_size:
+                self.cache.popitem(last=False)
+            self.cache[key] = (value, time.time() + self.ttl)
+            
+    def delete(self, key):
+        with self._lock:
+            if key in self.cache:
+                del self.cache[key]
+
+    def __contains__(self, key):
+        return self.get(key) is not None
+
+    def __len__(self):
+        with self._lock:
+            return len(self.cache)
+
+l1_cache = L1Cache()
 is_partitioned = False
 
 class CircuitBreaker:
@@ -46,27 +87,31 @@ class CircuitBreaker:
         self.max_failures = 3
         self.reset_timeout = 10
         self.last_failure_time = 0
+        self._lock = threading.Lock()
 
     def record_failure(self):
-        self.failures += 1
-        if self.failures >= self.max_failures:
-            if self.state != "OPEN":
-                self.state = "OPEN"
-                self.last_failure_time = time.time()
+        with self._lock:
+            self.failures += 1
+            if self.failures >= self.max_failures:
+                if self.state != "OPEN":
+                    self.state = "OPEN"
+                    self.last_failure_time = time.time()
             
     def record_success(self):
-        self.failures = 0
-        self.state = "CLOSED"
+        with self._lock:
+            self.failures = 0
+            self.state = "CLOSED"
 
     def can_execute(self):
-        if self.state == "CLOSED": return True
-        if self.state == "OPEN":
-            if time.time() - self.last_failure_time > self.reset_timeout:
-                self.state = "HALF_OPEN"
-                return True
+        with self._lock:
+            if self.state == "CLOSED": return True
+            if self.state == "OPEN":
+                if time.time() - self.last_failure_time > self.reset_timeout:
+                    self.state = "HALF_OPEN"
+                    return True
+                return False
+            if self.state == "HALF_OPEN": return True
             return False
-        if self.state == "HALF_OPEN": return True
-        return False
 
 cb = CircuitBreaker()
 
@@ -130,12 +175,14 @@ async def check_rate_limit(client_id: str) -> bool:
         return results[0] <= limit
     except Exception as e:
         # Fallback to local memory rate limiting
+        # Option B chosen: Apply a more conservative limit during Redis outage
+        # since accurate global coordination is impossible. Prevents 3x amplification.
+        fallback_limit = 15
         async with local_rl_lock:
             local_key = f"{client_id}:{window_key}"
             count = local_rate_limits.get(local_key, 0) + 1
             local_rate_limits[local_key] = count
-            # Optional cleanup of old windows could go here
-            return count <= limit
+            return count <= fallback_limit
 
 async def consume_nonce(nonce: str) -> bool:
     script = redis_client.register_script(NONCE_LUA)
@@ -147,12 +194,12 @@ def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
     payload = f"{len(sid)}:{sid}{len(uid)}:{uid}{len(res)}:{res}{len(act)}:{act}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
-def db_sync_call(key: str):
+def db_sync_call(key: str, sid: str, res: str):
     # Intentional synchronous blocking call to simulate legacy JDBC / DB operations
     # that threaten the reactive event loop (Paper Aegis-Mesh Section 5.4).
     # This is offloaded via asyncio.to_thread to prevent blocking the main loop.
     try:
-        resp = sync_http_client.get(f"{db_url}/policy/{key}", timeout=1.0)
+        resp = sync_http_client.get(f"{db_url}/policy/{key}?sid={sid}&res={res}", timeout=1.0)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -160,7 +207,7 @@ def db_sync_call(key: str):
 
 async def stream_listener():
     try:
-        await redis_client.xgroup_create(STREAM_NAME, STREAM_GROUP, id="0", mkstream=True)
+        await stream_redis_client.xgroup_create(STREAM_NAME, STREAM_GROUP, id="0", mkstream=True)
     except Exception:
         pass # Group might already exist
 
@@ -177,19 +224,19 @@ async def stream_listener():
                 total_pending = 0
                 
                 # 1. Pending
-                pending = await redis_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: "0"}, count=STREAM_CATCHUP_COUNT)
+                pending = await stream_redis_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: "0"}, count=STREAM_CATCHUP_COUNT)
                 if pending and pending[0][1]:
                     messages = pending[0][1]
                     total_pending += len(messages)
                     for msg_id, msg_data in messages:
                         key = msg_data.get(b"key").decode()
                         if key in l1_cache:
-                            del l1_cache[key]
-                        await redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+                            l1_cache.delete(key)
+                        await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
                 
                 # 2. Unread accumulated during partition
                 while True:
-                    new_msgs = await redis_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: ">"}, count=STREAM_CATCHUP_COUNT)
+                    new_msgs = await stream_redis_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: ">"}, count=STREAM_CATCHUP_COUNT)
                     if not new_msgs or not new_msgs[0][1]:
                         break
                     messages = new_msgs[0][1]
@@ -197,8 +244,8 @@ async def stream_listener():
                     for msg_id, msg_data in messages:
                         key = msg_data.get(b"key").decode()
                         if key in l1_cache:
-                            del l1_cache[key]
-                        await redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+                            l1_cache.delete(key)
+                        await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
                 
                 catchup_duration = int((time.time() - start_time) * 1000)
                 stats["last_catchup"] = {
@@ -210,11 +257,11 @@ async def stream_listener():
                 continue
 
             # NORMAL LOOP
-            pending = await redis_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: "0"}, count=STREAM_NORMAL_COUNT)
+            pending = await stream_redis_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: "0"}, count=STREAM_NORMAL_COUNT)
             if pending and pending[0][1]:
                 messages = pending[0][1]
             else:
-                messages_data = await redis_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: ">"}, count=STREAM_NORMAL_COUNT, block=STREAM_BLOCK_MS)
+                messages_data = await stream_redis_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: ">"}, count=STREAM_NORMAL_COUNT, block=STREAM_BLOCK_MS)
                 if not messages_data:
                     continue
                 
@@ -230,8 +277,8 @@ async def stream_listener():
             for msg_id, msg_data in messages:
                 key = msg_data.get(b"key").decode()
                 if key in l1_cache:
-                    del l1_cache[key]
-                await redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+                    l1_cache.delete(key)
+                await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -240,8 +287,9 @@ async def stream_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, sync_http_client
+    global redis_client, stream_redis_client, sync_http_client
     redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
+    stream_redis_client = Redis.from_url(redis_url, socket_timeout=5.0)
     sync_http_client = httpx.Client(timeout=1.0)
     task = asyncio.create_task(stream_listener())
     task_cleanup = asyncio.create_task(cleanup_local_rl())
@@ -250,6 +298,7 @@ async def lifespan(app: FastAPI):
     task_cleanup.cancel()
     sync_http_client.close()
     await redis_client.close()
+    await stream_redis_client.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -293,20 +342,22 @@ async def auth(
     except Exception as e:
         if isinstance(e, HTTPException): raise e
         logging.warning(f"Nonce check failed (Redis down?): {e}")
+        raise HTTPException(status_code=503, detail="Nonce Verification Unavailable")
 
     token = authorization.replace("Bearer ", "")
     comp_key = generate_composite_key(x_spiffe_id, token, x_res, x_act)
     
-    if comp_key in l1_cache:
+    cached_policy = l1_cache.get(comp_key)
+    if cached_policy is not None:
         stats["l1_hits"] += 1
-        return {"status": "allow", "source": "L1", "policy": l1_cache[comp_key]}
+        return {"status": "allow", "source": "L1", "policy": cached_policy}
         
     try:
         l2_val = await redis_client.get(f"policy:{comp_key}")
         if l2_val:
             stats["l2_hits"] += 1
             val = l2_val.decode()
-            l1_cache[comp_key] = val
+            l1_cache.set(comp_key, val)
             return {"status": "allow", "source": "L2", "policy": val}
     except Exception as e:
         logging.warning(f"L2 cache fetch failed (Redis down?): {e}")
@@ -318,12 +369,12 @@ async def auth(
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
         
     try:
-        db_resp = await asyncio.to_thread(db_sync_call, comp_key)
+        db_resp = await asyncio.to_thread(db_sync_call, comp_key, x_spiffe_id, x_res)
         cb.record_success()
         stats["circuit_state"] = cb.state
         
         policy = db_resp.get("role")
-        l1_cache[comp_key] = policy
+        l1_cache.set(comp_key, policy)
         try:
             await redis_client.set(f"policy:{comp_key}", policy, ex=60)
         except Exception as e:
