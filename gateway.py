@@ -191,6 +191,10 @@ async def consume_nonce(nonce: str) -> bool:
     return result == 1
 
 def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
+    sid = sid.strip()
+    uid = uid.strip()
+    res = res.strip()
+    act = act.strip().upper()
     payload = f"{len(sid)}:{sid}{len(uid)}:{uid}{len(res)}:{res}{len(act)}:{act}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -229,7 +233,12 @@ async def stream_listener():
                     messages = pending[0][1]
                     total_pending += len(messages)
                     for msg_id, msg_data in messages:
-                        key = msg_data.get(b"key").decode()
+                        key_bytes = msg_data.get(b"key")
+                        if not key_bytes:
+                            logging.warning(f"Malformed message skipped: {msg_data}")
+                            await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+                            continue
+                        key = key_bytes.decode()
                         if key in l1_cache:
                             l1_cache.delete(key)
                         await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
@@ -242,7 +251,12 @@ async def stream_listener():
                     messages = new_msgs[0][1]
                     total_pending += len(messages)
                     for msg_id, msg_data in messages:
-                        key = msg_data.get(b"key").decode()
+                        key_bytes = msg_data.get(b"key")
+                        if not key_bytes:
+                            logging.warning(f"Malformed message skipped: {msg_data}")
+                            await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+                            continue
+                        key = key_bytes.decode()
                         if key in l1_cache:
                             l1_cache.delete(key)
                         await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
@@ -275,7 +289,12 @@ async def stream_listener():
                 messages = messages_data[0][1]
 
             for msg_id, msg_data in messages:
-                key = msg_data.get(b"key").decode()
+                key_bytes = msg_data.get(b"key")
+                if not key_bytes:
+                    logging.warning(f"Malformed message skipped: {msg_data}")
+                    await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+                    continue
+                key = key_bytes.decode()
                 if key in l1_cache:
                     l1_cache.delete(key)
                 await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
