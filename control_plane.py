@@ -1,7 +1,7 @@
 import json
 import logging
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 import httpx
 import asyncio
@@ -31,7 +31,9 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def get_index():
-    with open("static/index.html", "r", encoding="utf-8") as f:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(base_dir, "static", "index.html")
+    with open(file_path, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
 async def fetch_metrics():
@@ -105,9 +107,15 @@ async def chaos_ddos():
 
 @app.post("/chaos/partition/{node}/{state}")
 async def chaos_partition(node: str, state: str):
-    if node in GATEWAYS:
-        await async_http_client.post(f"{GATEWAYS[node]}/chaos/partition/{state}")
-    return {"node": node, "state": state}
+    if node not in GATEWAYS:
+        return JSONResponse(status_code=400, content={"error": f"Unknown node {node}"})
+    try:
+        resp = await async_http_client.post(f"{GATEWAYS[node]}/chaos/partition/{state}")
+        resp.raise_for_status()
+        return {"node": node, "state": state}
+    except Exception as e:
+        logging.error(f"Partition {node} failed: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/chaos/redis/{state}")
 async def chaos_redis(state: str):
