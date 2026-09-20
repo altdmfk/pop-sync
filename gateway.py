@@ -134,6 +134,7 @@ class CircuitBreaker:
 
 cb = CircuitBreaker()
 
+stats_lock = threading.Lock()
 stats = {
     "l1_hits": 0,
     "l2_hits": 0,
@@ -198,15 +199,17 @@ async def check_rate_limit(client_id: str) -> bool:
         # since accurate global coordination is impossible. Prevents 3x amplification.
         fallback_limit = 15
         async with local_rl_lock:
+            if len(local_rate_limits) > 10000:
+                local_rate_limits.clear()
             local_key = f"{client_id}:{window_key}"
             count = local_rate_limits.get(local_key, 0) + 1
             local_rate_limits[local_key] = count
             return count <= fallback_limit
 
-async def consume_nonce(nonce: str) -> bool:
+async def consume_nonce(nonce: str, ttl: int = 60) -> bool:
     script = redis_client.register_script(NONCE_LUA)
     key = f"nonce:{nonce}"
-    result = await script(keys=[key], args=["1", 60])
+    result = await script(keys=[key], args=["1", ttl])
     return result == 1
 
 def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
@@ -214,7 +217,7 @@ def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
     uid = uid.strip()
     res = res.strip()
     act = act.strip().upper()
-    payload = f"{len(sid)}:{sid}{len(uid)}:{uid}{len(res)}:{res}{len(act)}:{act}"
+    payload = f"{len(sid)}\x00{sid}\x00{len(uid)}\x00{uid}\x00{len(res)}\x00{res}\x00{len(act)}\x00{act}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
 def db_sync_call(key: str, sid: str, res: str):
@@ -281,7 +284,8 @@ async def stream_listener():
                         await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
                 
                 catchup_duration = int((time.time() - start_time) * 1000)
-                stats["last_catchup"] = {
+                with stats_lock:
+                    stats["last_catchup"] = {
                     "pending_count": total_pending,
                     "duration_ms": catchup_duration,
                     "timestamp": time.time()
@@ -347,8 +351,24 @@ app = FastAPI(lifespan=lifespan)
 ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN", "super-secret-admin")
 
 @app.middleware("http")
+async def measure_latency(request: Request, call_next):
+    if is_partitioned and not (request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
+        return JSONResponse(status_code=503, content={"error": "Node Isolated"})
+        
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+    if request.url.path == "/auth":
+        with stats_lock:
+            stats["requests"] += 1
+            stats["latency_sum"] += duration
+    return response
+
+@app.middleware("http")
 async def admin_auth_middleware(request: Request, call_next):
     path = request.url.path
+    if path == "/health":
+        return await call_next(request)
     if path == "/metrics" or path.startswith("/chaos/"):
         admin_token = request.headers.get("X-Admin-Token")
         if admin_token != ADMIN_SECRET_TOKEN:
@@ -361,18 +381,6 @@ async def admin_auth_middleware(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Missing Authorization Header"})
     
     return await call_next(request)
-@app.middleware("http")
-async def measure_latency(request: Request, call_next):
-    if is_partitioned and not (request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
-        return JSONResponse(status_code=503, content={"error": "Node Isolated"})
-        
-    start = time.time()
-    response = await call_next(request)
-    duration = time.time() - start
-    if request.url.path == "/auth":
-        stats["requests"] += 1
-        stats["latency_sum"] += duration
-    return response
 
 @app.get("/auth")
 async def auth(
@@ -388,7 +396,8 @@ async def auth(
     try:
         allowed = await check_rate_limit(x_spiffe_id)
         if not allowed:
-            stats["rate_limited"] += 1
+            with stats_lock:
+                stats["rate_limited"] += 1
             return JSONResponse(status_code=429, headers={"Retry-After": "10"}, content={"error": "Too Many Requests"})
     except Exception as e:
         logging.warning(f"Rate limit check failed (Redis down?): {e}")
@@ -396,7 +405,8 @@ async def auth(
     try:
         nonce_ok = await consume_nonce(x_nonce)
         if not nonce_ok:
-            stats["nonce_replays"] += 1
+            with stats_lock:
+                stats["nonce_replays"] += 1
             raise HTTPException(status_code=401, detail="Replay Detected")
     except Exception as e:
         if isinstance(e, HTTPException): raise e
@@ -408,23 +418,27 @@ async def auth(
     
     cached_policy = l1_cache.get(comp_key)
     if cached_policy is not None:
-        stats["l1_hits"] += 1
+        with stats_lock:
+            stats["l1_hits"] += 1
         return {"status": "allow", "source": "L1", "policy": cached_policy}
         
     try:
         l2_val = await redis_client.get(f"policy:{comp_key}")
         if l2_val:
-            stats["l2_hits"] += 1
+            with stats_lock:
+                stats["l2_hits"] += 1
             val = l2_val.decode()
             l1_cache.set(comp_key, val)
             return {"status": "allow", "source": "L2", "policy": val}
     except Exception as e:
         logging.warning(f"L2 cache fetch failed (Redis down?): {e}")
         
-    stats["db_fallbacks"] += 1
+    with stats_lock:
+        stats["db_fallbacks"] += 1
     
     if not cb.can_execute():
-        stats["circuit_state"] = cb.state
+        with stats_lock:
+            stats["circuit_state"] = cb.state
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
         
     try:
@@ -438,7 +452,8 @@ async def auth(
         finally:
             db_semaphore.release()
         cb.record_success()
-        stats["circuit_state"] = cb.state
+        with stats_lock:
+            stats["circuit_state"] = cb.state
         
         policy = db_resp.get("role")
         l1_cache.set(comp_key, policy)
@@ -454,16 +469,23 @@ async def auth(
     except Exception as e:
         logging.warning(f"DB fallback failed: {e}")
         cb.record_failure()
-        stats["circuit_state"] = cb.state
+        with stats_lock:
+            stats["circuit_state"] = cb.state
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"})
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 @app.get("/metrics")
 async def get_metrics():
     cb.check_and_half_open()
-    stats["circuit_state"] = cb.state
-    stats["l1_cache_size"] = len(l1_cache)
-    stats["local_rl_size"] = len(local_rate_limits)
-    return {"node": node_name, "stats": stats, "is_partitioned": is_partitioned}
+    with stats_lock:
+        stats["circuit_state"] = cb.state
+        stats["l1_cache_size"] = len(l1_cache)
+        stats["local_rl_size"] = len(local_rate_limits)
+        snapshot = dict(stats)
+    return {"node": node_name, "stats": snapshot, "is_partitioned": is_partitioned}
 
 @app.post("/chaos/partition/{state}")
 async def set_partition(state: str):

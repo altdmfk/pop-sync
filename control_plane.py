@@ -6,6 +6,7 @@ from sse_starlette.sse import EventSourceResponse
 import httpx
 import asyncio
 import os
+ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN", "super-secret-admin")
 import uuid
 from contextlib import asynccontextmanager
 
@@ -110,7 +111,7 @@ async def chaos_partition(node: str, state: str):
     if node not in GATEWAYS:
         return JSONResponse(status_code=400, content={"error": f"Unknown node {node}"})
     try:
-        resp = await async_http_client.post(f"{GATEWAYS[node]}/chaos/partition/{state}")
+        resp = await async_http_client.post(f"{GATEWAYS[node]}/chaos/partition/{state}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         resp.raise_for_status()
         return {"node": node, "state": state}
     except Exception as e:
@@ -121,21 +122,21 @@ async def chaos_partition(node: str, state: str):
 async def chaos_redis(state: str):
     reqs = []
     for url in GATEWAYS.values():
-        reqs.append(async_http_client.post(f"{url}/chaos/redis/{state}"))
+        reqs.append(async_http_client.post(f"{url}/chaos/redis/{state}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}))
     await asyncio.gather(*reqs, return_exceptions=True)
     return {"redis_cluster": state}
 
 @app.post("/chaos/invalidate")
 async def chaos_invalidate():
     test_key = "a8f5f167f44f4964e6c998dee827110c"
-    await async_http_client.post(f"{GATEWAYS['Node-A']}/chaos/invalidate/{test_key}")
+    await async_http_client.post(f"{GATEWAYS['Node-A']}/chaos/invalidate/{test_key}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
     return {"status": "invalidated"}
 
 @app.post("/chaos/db/{state}")
 async def chaos_db(state: str):
     await async_http_client.post(f"{POLICY_DB}/chaos/db/{state}")
     if state == "up":
-        tasks = [async_http_client.post(f"{url}/chaos/cb/reset") for url in GATEWAYS.values()]
+        tasks = [async_http_client.post(f"{url}/chaos/cb/reset", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
         await asyncio.gather(*tasks, return_exceptions=True)
     elif state == "down":
         headers = {"Authorization": "Bearer test_token", "X-SPIFFE-ID": "spiffe://example.org/test"}
