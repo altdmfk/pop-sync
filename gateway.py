@@ -19,7 +19,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 MAX_DB_WORKERS = 5
-db_executor = ThreadPoolExecutor(max_workers=MAX_DB_WORKERS)
+db_executor = None
 db_semaphore = None
 
 class DBOverloadError(Exception): pass
@@ -96,6 +96,17 @@ class CircuitBreaker:
         self.reset_timeout = 10
         self.last_failure_time = 0
         self._lock = threading.Lock()
+
+    def check_and_half_open(self):
+        with self._lock:
+            if self.state == "OPEN" and time.time() - self.last_failure_time > self.reset_timeout:
+                self.state = "HALF_OPEN"
+
+    def reset(self):
+        with self._lock:
+            self.failures = 0
+            self.state = "CLOSED"
+            self.last_failure_time = 0
 
     def record_failure(self):
         with self._lock:
@@ -211,7 +222,7 @@ def db_sync_call(key: str, sid: str, res: str):
     # that threaten the reactive event loop (Paper Aegis-Mesh Section 5.4).
     # This is offloaded via asyncio.to_thread to prevent blocking the main loop.
     try:
-        resp = sync_http_client.get(f"{db_url}/policy/{key}?sid={sid}&res={res}", timeout=1.0)
+        resp = sync_http_client.get(f"{db_url}/policy/{key}", params={"sid": sid, "res": res}, timeout=1.0)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -314,8 +325,9 @@ async def stream_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, stream_redis_client, sync_http_client, db_semaphore
+    global redis_client, stream_redis_client, sync_http_client, db_semaphore, db_executor
     db_semaphore = asyncio.Semaphore(MAX_DB_WORKERS)
+    db_executor = ThreadPoolExecutor(max_workers=MAX_DB_WORKERS)
     redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
     stream_redis_client = Redis.from_url(redis_url, socket_timeout=5.0)
     sync_http_client = httpx.Client(timeout=1.0)
@@ -325,6 +337,8 @@ async def lifespan(app: FastAPI):
     task.cancel()
     task_cleanup.cancel()
     sync_http_client.close()
+    if db_executor:
+        db_executor.shutdown(wait=True)
     await redis_client.close()
     await stream_redis_client.close()
 
@@ -441,8 +455,7 @@ async def auth(
 
 @app.get("/metrics")
 async def get_metrics():
-    if cb.state == "OPEN" and time.time() - cb.last_failure_time > cb.reset_timeout:
-        cb.state = "HALF_OPEN"
+    cb.check_and_half_open()
     stats["circuit_state"] = cb.state
     stats["l1_cache_size"] = len(l1_cache)
     stats["local_rl_size"] = len(local_rate_limits)
@@ -456,12 +469,15 @@ async def set_partition(state: str):
 
 @app.post("/chaos/redis/{state}")
 async def set_redis(state: str):
-    global redis_client
+    global redis_client, stream_redis_client
     await redis_client.close()
+    await stream_redis_client.close()
     if state == "down":
         redis_client = Redis.from_url("redis://127.0.0.1:9999", socket_timeout=0.1)
+        stream_redis_client = Redis.from_url("redis://127.0.0.1:9999", socket_timeout=0.1)
     else:
         redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
+        stream_redis_client = Redis.from_url(redis_url, socket_timeout=5.0)
     return {"status": state}
 
 @app.post("/chaos/invalidate/{key}")
@@ -474,8 +490,7 @@ async def invalidate_cache(key: str):
 
 @app.post("/chaos/cb/reset")
 async def reset_cb():
-    cb.record_success()
-    cb.last_failure_time = 0
+    cb.reset()
     return {"status": "reset"}
 
 if __name__ == "__main__":
