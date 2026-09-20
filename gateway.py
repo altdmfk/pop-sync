@@ -322,6 +322,20 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
+async def auth_bypass_middleware(request: Request, call_next):
+    path = request.url.path
+    # Fast-Path Bypass
+    if path == "/metrics" or path.startswith("/chaos/"):
+        return await call_next(request)
+    
+    # All other routes require Authorization header
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return JSONResponse(status_code=401, content={"detail": "Missing Authorization Header"})
+    
+    return await call_next(request)
+
+@app.middleware("http")
 async def measure_latency(request: Request, call_next):
     if is_partitioned and not (request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
         return JSONResponse(status_code=503, content={"error": "Node Isolated"})
