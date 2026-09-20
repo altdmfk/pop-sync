@@ -215,13 +215,9 @@ async def check_rate_limit(client_id: str) -> bool:
             return count <= fallback_limit
 
 async def consume_nonce(nonce: str, ttl: int = 60) -> bool:
-    try:
-        key = f"nonce:{nonce}"
-        result = await nonce_script(keys=[key], args=["1", str(ttl)])
-        return result == 1
-    except Exception as e:
-        logging.warning(f"consume_nonce connection error: {e}")
-        raise HTTPException(status_code=503, detail="Nonce Verification Unavailable")
+    key = f"nonce:{nonce}"
+    result = await nonce_script(keys=[key], args=["1", str(ttl)])
+    return result == 1
 
 def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
     sid = sid.strip()
@@ -384,7 +380,7 @@ async def admin_auth_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def measure_latency(request: Request, call_next):
-    if is_partitioned and not (request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
+    if is_partitioned and not (request.url.path == "/health" or request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
         return JSONResponse(status_code=503, content={"error": "Node Isolated"})
         
     start = time.time()

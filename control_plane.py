@@ -1,3 +1,4 @@
+import random
 import json
 import logging
 from fastapi import FastAPI
@@ -43,7 +44,6 @@ async def get_index():
     with open(file_path, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
-import random
 
 async def fetch_metrics():
     results = {}
@@ -146,16 +146,30 @@ async def chaos_redis(state: str):
 @app.post("/chaos/invalidate")
 async def chaos_invalidate():
     test_key = "a8f5f167f44f4964e6c998dee827110c"
+    metrics = await fetch_metrics()
+    available_nodes = [name for name, data in metrics.items() if data.get('status') != 'offline' and not data.get('is_partitioned')]
+    
+    if not available_nodes:
+        return JSONResponse(status_code=500, content={"error": "No available nodes"})
+        
+    target_node = random.choice(available_nodes)
+    
     try:
-        resp = await async_http_client.post(f"{GATEWAYS['Node-A']}/chaos/invalidate/{test_key}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        resp = await async_http_client.post(f"{GATEWAYS[target_node]}/chaos/invalidate/{test_key}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         resp.raise_for_status()
-        return {"status": "invalidated"}
+        return {"status": "invalidated", "node": target_node}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/chaos/db/{state}")
 async def chaos_db(state: str):
-    await async_http_client.post(f"{POLICY_DB}/chaos/db/{state}")
+    try:
+        resp = await async_http_client.post(f"{POLICY_DB}/chaos/db/{state}")
+        resp.raise_for_status()
+    except Exception as e:
+        logging.error(f"Failed to change DB state: {e}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to change DB state: {e}"})
+
     if state == "up":
         tasks = [async_http_client.post(f"{url}/chaos/cb/reset", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
         await asyncio.gather(*tasks, return_exceptions=True)
