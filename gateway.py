@@ -344,11 +344,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN", "super-secret-admin")
+
 @app.middleware("http")
-async def auth_bypass_middleware(request: Request, call_next):
+async def admin_auth_middleware(request: Request, call_next):
     path = request.url.path
-    # Fast-Path Bypass
     if path == "/metrics" or path.startswith("/chaos/"):
+        admin_token = request.headers.get("X-Admin-Token")
+        if admin_token != ADMIN_SECRET_TOKEN:
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
         return await call_next(request)
     
     # All other routes require Authorization header
