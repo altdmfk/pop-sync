@@ -29,7 +29,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
-      - ADMIN_SECRET_TOKEN=super-secret-admin
+      - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
     depends_on:
       redis:
         condition: service_healthy
@@ -49,7 +49,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
-      - ADMIN_SECRET_TOKEN=super-secret-admin
+      - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
     depends_on:
       redis:
         condition: service_healthy
@@ -69,7 +69,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
-      - ADMIN_SECRET_TOKEN=super-secret-admin
+      - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
     depends_on:
       redis:
         condition: service_healthy
@@ -92,7 +92,7 @@ services:
       - GATEWAY_B=http://gateway-b:8002
       - GATEWAY_C=http://gateway-c:8003
       - POLICY_DB=http://policy_db:8000
-      - ADMIN_SECRET_TOKEN=super-secret-admin
+      - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
     depends_on:
       gateway-a:
         condition: service_healthy

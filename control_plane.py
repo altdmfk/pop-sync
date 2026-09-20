@@ -6,7 +6,9 @@ from sse_starlette.sse import EventSourceResponse
 import httpx
 import asyncio
 import os
-ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN", "super-secret-admin")
+ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN")
+if not ADMIN_SECRET_TOKEN:
+    raise RuntimeError("ADMIN_SECRET_TOKEN environment variable is required")
 import uuid
 from contextlib import asynccontextmanager
 
@@ -37,11 +39,16 @@ async def get_index():
     with open(file_path, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
+import random
+
 async def fetch_metrics():
     results = {}
     for name, url in GATEWAYS.items():
         try:
-            resp = await async_http_client.get(f"{url}/metrics")
+            resp = await async_http_client.get(
+                f"{url}/metrics",
+                headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}
+            )
             results[name] = resp.json()
         except Exception as e:
             logging.warning(f"Failed to fetch metrics from {name}: {e}")
@@ -91,11 +98,17 @@ async def chaos_ddos():
         "Authorization": "Bearer test_token",
         "X-SPIFFE-ID": "spiffe://example.org/attacker"
     }
+    metrics = await fetch_metrics()
+    available_nodes = [name for name, data in metrics.items() if data.get('status') != 'offline' and not data.get('is_partitioned')]
+    if not available_nodes:
+        available_nodes = list(GATEWAYS.keys())
+
     reqs = []
     for i in range(60):
         h = headers.copy()
         h["X-Nonce"] = str(uuid.uuid4())
-        reqs.append(async_http_client.get(f"{GATEWAYS['Node-A']}/auth", headers=h))
+        target_node = random.choice(available_nodes)
+        reqs.append(async_http_client.get(f"{GATEWAYS[target_node]}/auth", headers=h))
     
     resps = await asyncio.gather(*reqs, return_exceptions=True)
     codes = {}
