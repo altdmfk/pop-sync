@@ -46,6 +46,7 @@ REDIS_TIMEOUT_SEC = 0.2
 
 redis_client = None
 stream_redis_client = None
+nonce_script = None
 sync_http_client = None
 class L1Cache:
     def __init__(self, max_size=1000, ttl=60):
@@ -200,16 +201,18 @@ async def check_rate_limit(client_id: str) -> bool:
         fallback_limit = 15
         async with local_rl_lock:
             if len(local_rate_limits) > 10000:
-                local_rate_limits.clear()
+                now_w = int(time.time() / window)
+                to_delete = [k for k in local_rate_limits.keys() if int(k.rsplit(":", 1)[-1]) < now_w]
+                for k in to_delete:
+                    del local_rate_limits[k]
             local_key = f"{client_id}:{window_key}"
             count = local_rate_limits.get(local_key, 0) + 1
             local_rate_limits[local_key] = count
             return count <= fallback_limit
 
 async def consume_nonce(nonce: str, ttl: int = 60) -> bool:
-    script = redis_client.register_script(NONCE_LUA)
     key = f"nonce:{nonce}"
-    result = await script(keys=[key], args=["1", ttl])
+    result = await nonce_script(keys=[key], args=["1", str(ttl)])
     return result == 1
 
 def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
@@ -217,8 +220,8 @@ def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
     uid = uid.strip()
     res = res.strip()
     act = act.strip().upper()
-    payload = f"{len(sid)}\x00{sid}\x00{len(uid)}\x00{uid}\x00{len(res)}\x00{res}\x00{len(act)}\x00{act}"
-    return hashlib.sha256(payload.encode()).hexdigest()
+    payload = "\x00".join([sid, uid, res, act]).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 def db_sync_call(key: str, sid: str, res: str):
     # Intentional synchronous blocking call to simulate legacy JDBC / DB operations
@@ -329,10 +332,11 @@ async def stream_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, stream_redis_client, sync_http_client, db_semaphore, db_executor
+    global redis_client, stream_redis_client, sync_http_client, db_semaphore, db_executor, nonce_script
     db_semaphore = asyncio.Semaphore(MAX_DB_WORKERS)
     db_executor = ThreadPoolExecutor(max_workers=MAX_DB_WORKERS)
     redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
+    nonce_script = redis_client.register_script(NONCE_LUA)
     stream_redis_client = Redis.from_url(redis_url, socket_timeout=5.0)
     sync_http_client = httpx.Client(timeout=1.0)
     task = asyncio.create_task(stream_listener())
@@ -348,7 +352,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN", "super-secret-admin")
+ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN")
+if not ADMIN_SECRET_TOKEN:
+    raise RuntimeError("ADMIN_SECRET_TOKEN environment variable is required")
 
 @app.middleware("http")
 async def measure_latency(request: Request, call_next):
@@ -495,7 +501,7 @@ async def set_partition(state: str):
 
 @app.post("/chaos/redis/{state}")
 async def set_redis(state: str):
-    global redis_client, stream_redis_client
+    global redis_client, stream_redis_client, nonce_script
     await redis_client.close()
     await stream_redis_client.close()
     if state == "down":
@@ -504,6 +510,7 @@ async def set_redis(state: str):
     else:
         redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
         stream_redis_client = Redis.from_url(redis_url, socket_timeout=5.0)
+    nonce_script = redis_client.register_script(NONCE_LUA)
     return {"status": state}
 
 @app.post("/chaos/invalidate/{key}")
