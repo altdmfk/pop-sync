@@ -4,12 +4,22 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   policy_db:
     build: .
     command: python policy_db.py
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/policy/test?sid=1&res=1')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   gateway-a:
     build: .
@@ -20,8 +30,15 @@ services:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
     depends_on:
-      - redis
-      - policy_db
+      redis:
+        condition: service_healthy
+      policy_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/metrics')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   gateway-b:
     build: .
@@ -32,8 +49,15 @@ services:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
     depends_on:
-      - redis
-      - policy_db
+      redis:
+        condition: service_healthy
+      policy_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/metrics')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   gateway-c:
     build: .
@@ -44,8 +68,15 @@ services:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
     depends_on:
-      - redis
-      - policy_db
+      redis:
+        condition: service_healthy
+      policy_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/metrics')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   control_plane:
     build: .
@@ -59,6 +90,14 @@ services:
       - GATEWAY_C=http://gateway-c:8003
       - POLICY_DB=http://policy_db:8000
     depends_on:
-      - gateway-a
-      - gateway-b
-      - gateway-c
+      gateway-a:
+        condition: service_healthy
+      gateway-b:
+        condition: service_healthy
+      gateway-c:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
