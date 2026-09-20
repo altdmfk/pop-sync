@@ -32,6 +32,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 @app.get("/")
 async def get_index():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -142,8 +146,12 @@ async def chaos_redis(state: str):
 @app.post("/chaos/invalidate")
 async def chaos_invalidate():
     test_key = "a8f5f167f44f4964e6c998dee827110c"
-    await async_http_client.post(f"{GATEWAYS['Node-A']}/chaos/invalidate/{test_key}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
-    return {"status": "invalidated"}
+    try:
+        resp = await async_http_client.post(f"{GATEWAYS['Node-A']}/chaos/invalidate/{test_key}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        resp.raise_for_status()
+        return {"status": "invalidated"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/chaos/db/{state}")
 async def chaos_db(state: str):
@@ -157,7 +165,8 @@ async def chaos_db(state: str):
         for _ in range(5):
             h = headers.copy()
             h["X-Nonce"] = str(uuid.uuid4())
-            tasks.append(async_http_client.get(f"{GATEWAYS['Node-A']}/auth", headers=h))
+            target_node = random.choice(list(GATEWAYS.keys()))
+            tasks.append(async_http_client.get(f"{GATEWAYS[target_node]}/auth", headers=h))
         await asyncio.gather(*tasks, return_exceptions=True)
     return {"db_state": state}
 

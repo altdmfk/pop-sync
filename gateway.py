@@ -102,12 +102,14 @@ class CircuitBreaker:
         with self._lock:
             if self.state == "OPEN" and time.time() - self.last_failure_time > self.reset_timeout:
                 self.state = "HALF_OPEN"
+            return self.state
 
     def reset(self):
         with self._lock:
             self.failures = 0
             self.state = "CLOSED"
             self.last_failure_time = 0
+            return self.state
 
     def record_failure(self):
         with self._lock:
@@ -116,22 +118,24 @@ class CircuitBreaker:
                 if self.state != "OPEN":
                     self.state = "OPEN"
                     self.last_failure_time = time.time()
+            return (None, self.state)
             
     def record_success(self):
         with self._lock:
             self.failures = 0
             self.state = "CLOSED"
+            return (None, self.state)
 
     def can_execute(self):
         with self._lock:
-            if self.state == "CLOSED": return True
+            if self.state == "CLOSED": return (True, self.state)
             if self.state == "OPEN":
                 if time.time() - self.last_failure_time > self.reset_timeout:
                     self.state = "HALF_OPEN"
-                    return True
-                return False
-            if self.state == "HALF_OPEN": return True
-            return False
+                    return (True, self.state)
+                return (False, self.state)
+            if self.state == "HALF_OPEN": return (True, self.state)
+            return (False, self.state)
 
 cb = CircuitBreaker()
 
@@ -211,9 +215,13 @@ async def check_rate_limit(client_id: str) -> bool:
             return count <= fallback_limit
 
 async def consume_nonce(nonce: str, ttl: int = 60) -> bool:
-    key = f"nonce:{nonce}"
-    result = await nonce_script(keys=[key], args=["1", str(ttl)])
-    return result == 1
+    try:
+        key = f"nonce:{nonce}"
+        result = await nonce_script(keys=[key], args=["1", str(ttl)])
+        return result == 1
+    except Exception as e:
+        logging.warning(f"consume_nonce connection error: {e}")
+        raise HTTPException(status_code=503, detail="Nonce Verification Unavailable")
 
 def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
     sid = sid.strip()
@@ -289,10 +297,10 @@ async def stream_listener():
                 catchup_duration = int((time.time() - start_time) * 1000)
                 with stats_lock:
                     stats["last_catchup"] = {
-                    "pending_count": total_pending,
-                    "duration_ms": catchup_duration,
-                    "timestamp": time.time()
-                }
+                        "pending_count": total_pending,
+                        "duration_ms": catchup_duration,
+                        "timestamp": time.time()
+                    }
                 was_partitioned = False
                 continue
 
@@ -357,20 +365,6 @@ if not ADMIN_SECRET_TOKEN:
     raise RuntimeError("ADMIN_SECRET_TOKEN environment variable is required")
 
 @app.middleware("http")
-async def measure_latency(request: Request, call_next):
-    if is_partitioned and not (request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
-        return JSONResponse(status_code=503, content={"error": "Node Isolated"})
-        
-    start = time.time()
-    response = await call_next(request)
-    duration = time.time() - start
-    if request.url.path == "/auth":
-        with stats_lock:
-            stats["requests"] += 1
-            stats["latency_sum"] += duration
-    return response
-
-@app.middleware("http")
 async def admin_auth_middleware(request: Request, call_next):
     path = request.url.path
     if path == "/health":
@@ -387,6 +381,20 @@ async def admin_auth_middleware(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Missing Authorization Header"})
     
     return await call_next(request)
+
+@app.middleware("http")
+async def measure_latency(request: Request, call_next):
+    if is_partitioned and not (request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
+        return JSONResponse(status_code=503, content={"error": "Node Isolated"})
+        
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+    if request.url.path == "/auth":
+        with stats_lock:
+            stats["requests"] += 1
+            stats["latency_sum"] += duration
+    return response
 
 @app.get("/auth")
 async def auth(
@@ -442,9 +450,10 @@ async def auth(
     with stats_lock:
         stats["db_fallbacks"] += 1
     
-    if not cb.can_execute():
+    can_exec, current_state = cb.can_execute()
+    if not can_exec:
         with stats_lock:
-            stats["circuit_state"] = cb.state
+            stats["circuit_state"] = current_state
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
         
     try:
@@ -457,9 +466,9 @@ async def auth(
             db_resp = await loop.run_in_executor(db_executor, db_sync_call, comp_key, x_spiffe_id, x_res)
         finally:
             db_semaphore.release()
-        cb.record_success()
+        _, current_state = cb.record_success()
         with stats_lock:
-            stats["circuit_state"] = cb.state
+            stats["circuit_state"] = current_state
         
         policy = db_resp.get("role")
         l1_cache.set(comp_key, policy)
@@ -474,9 +483,9 @@ async def auth(
         return JSONResponse(status_code=503, content={"error": "Service Unavailable - DB Overload"})
     except Exception as e:
         logging.warning(f"DB fallback failed: {e}")
-        cb.record_failure()
+        _, current_state = cb.record_failure()
         with stats_lock:
-            stats["circuit_state"] = cb.state
+            stats["circuit_state"] = current_state
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"})
 
 @app.get("/health")
@@ -485,9 +494,9 @@ async def health_check():
 
 @app.get("/metrics")
 async def get_metrics():
-    cb.check_and_half_open()
+    current_state = cb.check_and_half_open()
     with stats_lock:
-        stats["circuit_state"] = cb.state
+        stats["circuit_state"] = current_state
         stats["l1_cache_size"] = len(l1_cache)
         stats["local_rl_size"] = len(local_rate_limits)
         snapshot = dict(stats)
@@ -502,15 +511,29 @@ async def set_partition(state: str):
 @app.post("/chaos/redis/{state}")
 async def set_redis(state: str):
     global redis_client, stream_redis_client, nonce_script
-    await redis_client.close()
-    await stream_redis_client.close()
+    old_redis = redis_client
+    old_stream = stream_redis_client
+    
     if state == "down":
-        redis_client = Redis.from_url("redis://127.0.0.1:9999", socket_timeout=0.1)
-        stream_redis_client = Redis.from_url("redis://127.0.0.1:9999", socket_timeout=0.1)
+        new_redis = Redis.from_url("redis://127.0.0.1:9999", socket_timeout=0.1)
+        new_stream = Redis.from_url("redis://127.0.0.1:9999", socket_timeout=0.1)
     else:
-        redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
-        stream_redis_client = Redis.from_url(redis_url, socket_timeout=5.0)
-    nonce_script = redis_client.register_script(NONCE_LUA)
+        new_redis = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
+        new_stream = Redis.from_url(redis_url, socket_timeout=5.0)
+        
+    new_nonce_script = new_redis.register_script(NONCE_LUA)
+    
+    # Atomic swap
+    nonce_script = new_nonce_script
+    redis_client = new_redis
+    stream_redis_client = new_stream
+    
+    # Safely close old clients
+    try:
+        await old_redis.close()
+        await old_stream.close()
+    except Exception:
+        pass
     return {"status": state}
 
 @app.post("/chaos/invalidate/{key}")
