@@ -16,6 +16,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor
+
+MAX_DB_WORKERS = 5
+db_executor = ThreadPoolExecutor(max_workers=MAX_DB_WORKERS)
+db_semaphore = None
+
+class DBOverloadError(Exception): pass
+
 
 # Parse args before any initialization that uses node_name
 parser = argparse.ArgumentParser()
@@ -306,7 +314,8 @@ async def stream_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, stream_redis_client, sync_http_client
+    global redis_client, stream_redis_client, sync_http_client, db_semaphore
+    db_semaphore = asyncio.Semaphore(MAX_DB_WORKERS)
     redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
     stream_redis_client = Redis.from_url(redis_url, socket_timeout=5.0)
     sync_http_client = httpx.Client(timeout=1.0)
@@ -334,7 +343,6 @@ async def auth_bypass_middleware(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Missing Authorization Header"})
     
     return await call_next(request)
-
 @app.middleware("http")
 async def measure_latency(request: Request, call_next):
     if is_partitioned and not (request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
@@ -402,7 +410,15 @@ async def auth(
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
         
     try:
-        db_resp = await asyncio.to_thread(db_sync_call, comp_key, x_spiffe_id, x_res)
+        try:
+            await asyncio.wait_for(db_semaphore.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
+        try:
+            loop = asyncio.get_running_loop()
+            db_resp = await loop.run_in_executor(db_executor, db_sync_call, comp_key, x_spiffe_id, x_res)
+        finally:
+            db_semaphore.release()
         cb.record_success()
         stats["circuit_state"] = cb.state
         
@@ -414,6 +430,9 @@ async def auth(
             logging.warning(f"Failed to set L2 cache: {e}")
             
         return {"status": "allow", "source": "DB", "policy": policy}
+    except DBOverloadError as e:
+        logging.warning(str(e))
+        return JSONResponse(status_code=503, content={"error": "Service Unavailable - DB Overload"})
     except Exception as e:
         logging.warning(f"DB fallback failed: {e}")
         cb.record_failure()
