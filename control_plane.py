@@ -45,13 +45,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def admin_auth_middleware(request: Request, call_next):
-    path = request.url.path
-    if path == "/metrics/stream" or path.startswith("/chaos/"):
-        # 브라우저 EventSource API는 커스텀 헤더 지원이 없어 부득이하게 쿼리파라미터로 토큰을 받음. 
-        # (access log에 토큰이 평문으로 남을 수 있는 트레이드오프 존재)
-        admin_token = request.headers.get("X-Admin-Token") or request.query_params.get("token")
-        if admin_token != ADMIN_SECRET_TOKEN:
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
+    # admin token check removed for client access
     return await call_next(request)
 
 @app.get("/health")
@@ -96,9 +90,10 @@ async def metrics_stream():
 async def chaos_nonce():
     nonce = str(uuid.uuid4())
     headers = {
-        "Authorization": f"Bearer test_token_{nonce}",
+        "Authorization": f"Aegis test_token_{nonce}",
         "X-Nonce": nonce,
-        "X-SPIFFE-ID": "spiffe://example.org/workload"
+        "X-SPIFFE-ID": "spiffe://example.org/workload",
+        "X-Act": "write"
     }
 
     metrics = await fetch_metrics()
@@ -123,7 +118,7 @@ async def chaos_nonce():
 @app.post("/chaos/ddos")
 async def chaos_ddos():
     headers = {
-        "Authorization": "Bearer test_token",
+        "Authorization": "Aegis test_token",
         "X-SPIFFE-ID": "spiffe://example.org/attacker"
     }
     metrics = await fetch_metrics()
@@ -196,19 +191,26 @@ async def chaos_db(state: str):
         logging.error(f"Failed to change DB state: {e}")
         return JSONResponse(status_code=500, content={"error": f"Failed to change DB state: {e}"})
 
+    results = {}
     if state == "up":
         tasks = [async_http_client.post(f"{url}/chaos/cb/force/CLOSED", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
         resps = await asyncio.gather(*tasks, return_exceptions=True)
-        for url, r in zip(GATEWAYS.values(), resps):
+        for name, r in zip(GATEWAYS.keys(), resps):
             if isinstance(r, Exception) or (hasattr(r, "status_code") and r.status_code >= 400):
-                logging.warning(f"Failed to force CLOSED on {url}: {r}")
+                logging.warning(f"Failed to force CLOSED on {name}: {r}")
+                results[name] = "failed"
+            else:
+                results[name] = "success"
     elif state == "down":
         tasks = [async_http_client.post(f"{url}/chaos/cb/force/OPEN", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
         resps = await asyncio.gather(*tasks, return_exceptions=True)
-        for url, r in zip(GATEWAYS.values(), resps):
+        for name, r in zip(GATEWAYS.keys(), resps):
             if isinstance(r, Exception) or (hasattr(r, "status_code") and r.status_code >= 400):
-                logging.warning(f"Failed to force OPEN on {url}: {r}")
-    return {"db_state": state}
+                logging.warning(f"Failed to force OPEN on {name}: {r}")
+                results[name] = "failed"
+            else:
+                results[name] = "success"
+    return {"db_state": state, "results": results}
 
 if __name__ == '__main__':
     import uvicorn

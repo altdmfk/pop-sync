@@ -273,10 +273,21 @@ async def check_rate_limit(client_id: str) -> bool:
             local_rate_limits[local_key] = count
             return count <= RL_FALLBACK_LIMIT
 
-async def consume_nonce(nonce: str, ttl: int = NONCE_TTL_SEC) -> bool:
-    key = f"nonce:{nonce}"
-    result = await nonce_script(keys=[key], args=["1", str(ttl)])
-    return result == 1
+async def consume_nonce(nonce: str, ttl: int = NONCE_TTL_SEC, act: str = "read") -> bool:
+    try:
+        key = f"nonce:{nonce}"
+        result = await nonce_script(keys=[key], args=["1", str(ttl)])
+        return result == 1
+    except Exception:
+        # Fallback: check local cache
+        if act.lower() in ["write", "pay", "update", "delete", "critical"]:
+            return False # Fail Closed for strong consistency
+
+        local_key = f"local_nonce:{nonce}"
+        if local_key in l1_cache:
+            return False
+        l1_cache.set(local_key, "1")
+        return True
 
 def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
     sid = sid.strip()
@@ -471,17 +482,17 @@ async def auth(
         logging.warning(f"Rate limit check failed (Redis down?): {e}")
         
     try:
-        nonce_ok = await consume_nonce(x_nonce)
+        nonce_ok = await consume_nonce(x_nonce, act=x_act)
         if not nonce_ok:
             with stats_lock:
                 stats["nonce_replays"] += 1
             raise HTTPException(status_code=401, detail="Replay Detected")
     except Exception as e:
         if isinstance(e, HTTPException): raise e
-        logging.warning(f"Nonce check failed (Redis down?): {e}")
-        raise HTTPException(status_code=503, detail="Nonce Verification Unavailable")
+        logging.warning(f"Nonce check fallback failed: {e}")
+        # Allow degraded pass if even local fallback fails
 
-    token = authorization.replace("Bearer ", "")
+    token = authorization.replace("Aegis ", "").replace("Bearer ", "")
     comp_key = generate_composite_key(x_spiffe_id, token, x_res, x_act)
     
     cached_policy = l1_cache.get(comp_key)
@@ -549,12 +560,25 @@ async def health_check():
 @app.get("/metrics")
 async def get_metrics():
     current_state = cb.check_and_half_open()
+    try:
+        redis_ok = await redis_client.ping()
+    except Exception:
+        redis_ok = False
+
     with stats_lock:
         stats["circuit_state"] = current_state
         stats["l1_cache_size"] = len(l1_cache)
         stats["local_rl_size"] = len(local_rate_limits)
         snapshot = dict(stats)
-    return {"node": node_name, "stats": snapshot, "is_partitioned": is_partitioned}
+    return {"node": node_name, "stats": snapshot, "is_partitioned": is_partitioned, "redis_ok": redis_ok}
+
+async def probe_db_health():
+    try:
+        await asyncio.to_thread(db_sync_call, "probe", "probe", "probe")
+        cb.record_success()
+    except Exception as e:
+        logging.warning(f"DB probe failed upon healing: {e}")
+        cb.force_state("OPEN")
 
 @app.post("/chaos/partition/{state}")
 async def set_partition(state: str):
@@ -562,6 +586,8 @@ async def set_partition(state: str):
         raise HTTPException(status_code=400, detail=f"Invalid partition state: {state}")
     global is_partitioned
     is_partitioned = (state == "isolate")
+    if state == "heal":
+        asyncio.create_task(probe_db_health())
     return {"status": is_partitioned}
 
 @app.post("/chaos/redis/{state}")
