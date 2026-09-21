@@ -23,11 +23,21 @@ GATEWAYS = {
 POLICY_DB = os.getenv("POLICY_DB", "http://policy_db:8000")
 
 async_http_client = None
+index_html_cache = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global async_http_client
+    global async_http_client, index_html_cache
     async_http_client = httpx.AsyncClient(timeout=5.0)
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(base_dir, "static", "index.html")
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            index_html_cache = f.read()
+    except Exception as e:
+        logging.error(f"Failed to load index.html: {e}")
+        
     yield
     await async_http_client.aclose()
 
@@ -37,6 +47,8 @@ app = FastAPI(lifespan=lifespan)
 async def admin_auth_middleware(request: Request, call_next):
     path = request.url.path
     if path == "/metrics/stream" or path.startswith("/chaos/"):
+        # 브라우저 EventSource API는 커스텀 헤더 지원이 없어 부득이하게 쿼리파라미터로 토큰을 받음. 
+        # (access log에 토큰이 평문으로 남을 수 있는 트레이드오프 존재)
         admin_token = request.headers.get("X-Admin-Token") or request.query_params.get("token")
         if admin_token != ADMIN_SECRET_TOKEN:
             return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
@@ -48,10 +60,13 @@ async def health():
 
 @app.get("/")
 async def get_index():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(base_dir, "static", "index.html")
-    with open(file_path, "r", encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+    if index_html_cache is None:
+        return JSONResponse(status_code=503, content={"error": "Service Unavailable - index.html not loaded"})
+    return HTMLResponse(index_html_cache)
+
+@app.get("/chaos/auth_check")
+async def auth_check():
+    return {"status": "ok"}
 
 
 async def fetch_metrics():
@@ -172,6 +187,8 @@ async def chaos_invalidate():
 
 @app.post("/chaos/db/{state}")
 async def chaos_db(state: str):
+    if state not in ["up", "down"]:
+        return JSONResponse(status_code=400, content={"error": f"Invalid db state: {state}"})
     try:
         resp = await async_http_client.post(f"{POLICY_DB}/chaos/db/{state}")
         resp.raise_for_status()

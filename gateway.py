@@ -56,6 +56,7 @@ L1_TTL_SEC                   = _int("L1_TTL_SEC", 60)                # ≤ L2_CA
 CB_MAX_FAILURES              = _int("CB_MAX_FAILURES", 3)
 CB_RESET_TIMEOUT_SEC         = _int("CB_RESET_TIMEOUT_SEC", 10)
 CB_DEBOUNCE_SEC              = _float("CB_DEBOUNCE_SEC", 2.0)        # ignore failures in first N sec after state change
+VALID_CB_STATES              = frozenset(["OPEN", "CLOSED", "HALF_OPEN"])
 
 # DB / thread pool
 DB_TIMEOUT_SEC               = _float("DB_TIMEOUT_SEC", 1.0)         # policy_db simulates 2s hang → gateway times out first
@@ -186,7 +187,7 @@ class CircuitBreaker:
             return (False, self.state)
 
     def force_state(self, state: str):
-        if state not in ["OPEN", "CLOSED", "HALF_OPEN"]:
+        if state not in VALID_CB_STATES:
             raise ValueError(f"Invalid state: {state}")
         with self._lock:
             self.state = state
@@ -557,12 +558,16 @@ async def get_metrics():
 
 @app.post("/chaos/partition/{state}")
 async def set_partition(state: str):
+    if state not in ["isolate", "heal"]:
+        raise HTTPException(status_code=400, detail=f"Invalid partition state: {state}")
     global is_partitioned
     is_partitioned = (state == "isolate")
     return {"status": is_partitioned}
 
 @app.post("/chaos/redis/{state}")
 async def set_redis(state: str):
+    if state not in ["up", "down"]:
+        raise HTTPException(status_code=400, detail=f"Invalid redis state: {state}")
     global redis_client, stream_redis_client, nonce_script
     old_redis = redis_client
     old_stream = stream_redis_client
@@ -598,9 +603,9 @@ async def invalidate_cache(key: str):
     return {"status": "published"}
 
 @app.post("/chaos/cb/force/{state}")
-async def force_cb_state(state: str):
-    if state not in ["OPEN", "CLOSED", "HALF_OPEN"]:
-        return JSONResponse(status_code=400, content={"error": f"Invalid state: {state}"})
+async def force_cb_state(state: str, request: Request):
+    if state not in VALID_CB_STATES:
+        raise HTTPException(status_code=400, detail=f"Invalid circuit breaker state: {state}")
     cb.force_state(state)
     return {"status": state}
 

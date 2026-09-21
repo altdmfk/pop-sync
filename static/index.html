@@ -417,12 +417,12 @@
         }
 
         function getAdminToken(forcePrompt = false) {
-            let token = localStorage.getItem('admin_token');
+            let token = sessionStorage.getItem('admin_token');
             if (!token || forcePrompt) {
                 token = prompt(forcePrompt ? "인증 실패 (401): 올바른 Admin Secret Token을 입력해주세요:" : "Admin Secret Token을 입력해주세요:");
                 if (token) {
                     token = token.trim();
-                    localStorage.setItem('admin_token', token);
+                    sessionStorage.setItem('admin_token', token);
                 }
             }
             return token || '';
@@ -499,18 +499,50 @@
                     }
                 }
                 else if (endpoint.includes('db/down')) {
-                    msg = "DB 다운됨";
-                    readableMsg = `DB 강제 중단됨: 서킷 브레이커가 작동하여 OPEN 상태로 전환되었습니다. → 연쇄 장애(Cascading Failure)를 막고 서비스 전체 다운을 방어합니다.`;
-                    type = "danger";
                     activeFaults.db = true;
                     nodes.forEach(n => triggerFlash(n));
+                    if (data.results) {
+                        let failedNodes = [];
+                        for (const [node, status] of Object.entries(data.results)) {
+                            if (status === "failed") failedNodes.push(node);
+                        }
+                        if (failedNodes.length > 0) {
+                            msg = `DB 다운됨 (경고: ${failedNodes.join(", ")} 부분 반영 실패)`;
+                            readableMsg = `DB 강제 중단됨 (단, ${failedNodes.join(", ")} 노드에는 반영 실패했습니다. 격리 상태이거나 통신 장애일 수 있습니다.)`;
+                            type = "warning";
+                        } else {
+                            msg = "DB 다운됨";
+                            readableMsg = `DB 강제 중단됨: 서킷 브레이커가 작동하여 OPEN 상태로 전환되었습니다. → 연쇄 장애(Cascading Failure)를 막고 서비스 전체 다운을 방어합니다.`;
+                            type = "danger";
+                        }
+                    } else {
+                        msg = "DB 다운됨";
+                        readableMsg = `DB 강제 중단됨: 서킷 브레이커가 작동하여 OPEN 상태로 전환되었습니다. → 연쇄 장애(Cascading Failure)를 막고 서비스 전체 다운을 방어합니다.`;
+                        type = "danger";
+                    }
                 }
                 else if (endpoint.includes('db/up')) {
-                    msg = "DB 복구됨";
-                    readableMsg = `DB 정상 복구됨: 서킷 브레이커가 원래 상태로 돌아왔습니다.`;
-                    type = "normal";
                     activeFaults.db = false;
                     nodes.forEach(n => triggerFlash(n));
+                    if (data.results) {
+                        let failedNodes = [];
+                        for (const [node, status] of Object.entries(data.results)) {
+                            if (status === "failed") failedNodes.push(node);
+                        }
+                        if (failedNodes.length > 0) {
+                            msg = `DB 복구됨 (경고: ${failedNodes.join(", ")} 부분 반영 실패)`;
+                            readableMsg = `DB 정상 복구됨 (단, ${failedNodes.join(", ")} 노드에는 복구 신호 전달 실패했습니다. 격리 상태일 수 있습니다.)`;
+                            type = "warning";
+                        } else {
+                            msg = "DB 복구됨";
+                            readableMsg = `DB 정상 복구됨: 서킷 브레이커가 원래 상태로 돌아왔습니다.`;
+                            type = "normal";
+                        }
+                    } else {
+                        msg = "DB 복구됨";
+                        readableMsg = `DB 정상 복구됨: 서킷 브레이커가 원래 상태로 돌아왔습니다.`;
+                        type = "normal";
+                    }
                 }
                 else if (endpoint.includes('redis/down')) {
                     msg = "Redis 다운됨 (L1 전용 모드)";
@@ -573,16 +605,37 @@
         let lastCatchup = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
 
         let evtSource = null;
-        function initMetricsStream() {
+        async function initMetricsStream() {
             if (evtSource) {
                 evtSource.close();
             }
-            const token = getAdminToken();
+            let token = getAdminToken();
             if (!token) return;
+
+            // 401 구분을 위해 SSE 연결 전 가벼운 사전 확인
+            try {
+                let res = await fetch("/chaos/auth_check", {
+                    headers: { 'X-Admin-Token': token }
+                });
+                if (res.status === 401) {
+                    token = getAdminToken(true);
+                    if (!token) return;
+                    res = await fetch("/chaos/auth_check", {
+                        headers: { 'X-Admin-Token': token }
+                    });
+                    if (res.status === 401) {
+                        showBanner("인증 실패: 잘못된 Admin Token입니다.", "danger");
+                        return;
+                    }
+                }
+            } catch (e) {
+                console.error("Auth check failed", e);
+            }
 
             evtSource = new EventSource(`/metrics/stream?token=${encodeURIComponent(token)}`);
             evtSource.onerror = function() {
                 // If 401 or stream disconnected, don't spam loop, wait
+                console.warn("EventSource error, but re-auth is handled by pre-flight check");
             };
             evtSource.onmessage = function(event) {
                 const data = JSON.parse(event.data);
@@ -590,69 +643,71 @@
                 for (const [nodeName, nodeData] of Object.entries(data)) {
                     if(nodeData.status === "offline") continue;
                 
-                const stats = nodeData.stats;
-                const el = document.getElementById(nodeName);
-                const badge = document.getElementById(`badge-${nodeName}`);
-                const cb = stats.circuit_state;
-                
-                let badgeText = "Normal";
-                let badgeClass = "badge normal";
-                let nodeClass = "node normal";
-                
-                let reasonText = "모든 기능이 정상적으로 트래픽을 처리하고 있습니다.";
+                    const stats = nodeData.stats;
+                    const el = document.getElementById(nodeName);
+                    const badge = document.getElementById(`badge-${nodeName}`);
+                    const cb = stats.circuit_state;
+                    
+                    let badgeText = "Normal";
+                    let badgeClass = "badge normal";
+                    let nodeClass = "node normal";
+                    
+                    let reasonText = "모든 기능이 정상적으로 트래픽을 처리하고 있습니다.";
 
-                if (nodeData.is_partitioned) {
-                    badgeText = "Stale (Partitioned)";
-                    badgeClass = "badge danger";
-                    nodeClass = "node danger-pulse"; // Red
-                    reasonText = "네트워크 단절: 중앙 캐시와 고립되었으나 과거 데이터로 단독 서비스 생존 중";
-                } else if (cb === "OPEN") {
-                    badgeText = "Protected (Circuit Open)";
-                    badgeClass = "badge danger"; // Match DB layer Red
-                    nodeClass = "node danger-pulse";
-                    reasonText = "DB 장애 감지 (원인: Policy DB): 연쇄 장애 방지를 위해 신규 인증 요청 즉시 차단 중";
-                } else if (cb === "HALF_OPEN") {
-                    badgeText = "Recovery (Half-Open)";
-                    badgeClass = "badge warning";
-                    nodeClass = "node warning-pulse";
-                    reasonText = "DB 복구 확인 중: 제한된 트래픽만 흘려보내며 백엔드 안정성 테스트 중";
-                } else if (activeFaults.redis) {
-                    badgeText = "Degraded (L1 Only)";
-                    badgeClass = "badge warning"; // Match Redis layer Orange
-                    nodeClass = "node warning-pulse";
-                    reasonText = "상태 공유 중단 (원인: Redis): 로컬(L1) 캐시만으로 기존 사용자 무중단 서비스 중";
-                }
-
-                el.className = nodeClass;
-                badge.className = badgeClass;
-                badge.innerText = badgeText;
-                document.getElementById(`reason-${nodeName}`).innerText = reasonText;
-                
-                if (stats.last_catchup && stats.last_catchup.timestamp > lastCatchup[nodeName]) {
-                    lastCatchup[nodeName] = stats.last_catchup.timestamp;
-                    if (stats.last_catchup.pending_count > 0) {
-                        triggerFlash(nodeName);
-                        const toast = document.getElementById(`toast-${nodeName}`);
-                        toast.innerText = `Caught up: ${stats.last_catchup.pending_count} events in ${stats.last_catchup.duration_ms}ms`;
-                        toast.style.opacity = '1';
-                        setTimeout(() => toast.style.opacity = '0', 3000);
+                    if (nodeData.is_partitioned) {
+                        badgeText = "Stale (Partitioned)";
+                        badgeClass = "badge danger";
+                        nodeClass = "node danger-pulse"; // Red
+                        reasonText = "네트워크 단절: 중앙 캐시와 고립되었으나 과거 데이터로 단독 서비스 생존 중";
+                    } else if (cb === "OPEN") {
+                        badgeText = "Protected (Circuit Open)";
+                        badgeClass = "badge danger"; // Match DB layer Red
+                        nodeClass = "node danger-pulse";
+                        reasonText = "DB 장애 감지 (원인: Policy DB): 연쇄 장애 방지를 위해 신규 인증 요청 즉시 차단 중";
+                    } else if (cb === "HALF_OPEN") {
+                        badgeText = "Recovery (Half-Open)";
+                        badgeClass = "badge warning";
+                        nodeClass = "node warning-pulse";
+                        reasonText = "DB 복구 확인 중: 제한된 트래픽만 흘려보내며 백엔드 안정성 테스트 중";
+                    } else if (activeFaults.redis) {
+                        badgeText = "Degraded (L1 Only)";
+                        badgeClass = "badge warning"; // Match Redis layer Orange
+                        nodeClass = "node warning-pulse";
+                        reasonText = "상태 공유 중단 (원인: Redis): 로컬(L1) 캐시만으로 기존 사용자 무중단 서비스 중";
                     }
+
+                    el.className = nodeClass;
+                    badge.className = badgeClass;
+                    badge.innerText = badgeText;
+                    document.getElementById(`reason-${nodeName}`).innerText = reasonText;
+                    
+                    if (stats.last_catchup && stats.last_catchup.timestamp > lastCatchup[nodeName]) {
+                        lastCatchup[nodeName] = stats.last_catchup.timestamp;
+                        if (stats.last_catchup.pending_count > 0) {
+                            triggerFlash(nodeName);
+                            const toast = document.getElementById(`toast-${nodeName}`);
+                            toast.innerText = `Caught up: ${stats.last_catchup.pending_count} events in ${stats.last_catchup.duration_ms}ms`;
+                            toast.style.opacity = '1';
+                            setTimeout(() => toast.style.opacity = '0', 3000);
+                        }
+                    }
+                    
+                    const currentReqs = stats.requests;
+                    document.getElementById(`rps-${nodeName}`).innerText = currentReqs - prevStats[nodeName];
+                    prevStats[nodeName] = currentReqs;
+                    
+                    document.getElementById(`l1-${nodeName}`).innerText = stats.l1_hits;
+                    document.getElementById(`l2-${nodeName}`).innerText = stats.l2_hits;
+                    document.getElementById(`lat-${nodeName}`).innerText = stats.requests > 0 ? (stats.latency_sum / stats.requests * 1000).toFixed(0) : 0;
+                    
+                    const cbEl = document.getElementById(`cb-${nodeName}`);
+                    const cbLabel = cb === 'OPEN' ? 'Open' : (cb === 'HALF_OPEN' ? 'Half-Open' : 'Closed');
+                    cbEl.innerText = cbLabel;
+                    cbEl.style.color = cb === 'OPEN' ? 'var(--danger)' : (cb === 'HALF_OPEN' ? 'var(--warning)' : 'var(--normal)');
                 }
-                
-                const currentReqs = stats.requests;
-                document.getElementById(`rps-${nodeName}`).innerText = currentReqs - prevStats[nodeName];
-                prevStats[nodeName] = currentReqs;
-                
-                document.getElementById(`l1-${nodeName}`).innerText = stats.l1_hits;
-                document.getElementById(`l2-${nodeName}`).innerText = stats.l2_hits;
-                document.getElementById(`lat-${nodeName}`).innerText = stats.requests > 0 ? (stats.latency_sum / stats.requests * 1000).toFixed(0) : 0;
-                
-                const cbEl = document.getElementById(`cb-${nodeName}`);
-                const cbLabel = cb === 'OPEN' ? 'Open' : (cb === 'HALF_OPEN' ? 'Half-Open' : 'Closed');
-                cbEl.innerText = cbLabel;
-                cbEl.style.color = cb === 'OPEN' ? 'var(--danger)' : (cb === 'HALF_OPEN' ? 'var(--warning)' : 'var(--normal)');
-            }
-        };
+            };
+        }
+        
         initMetricsStream();
     </script>
 </body>
