@@ -416,13 +416,42 @@
             updateButtons();
         }
 
+        function getAdminToken(forcePrompt = false) {
+            let token = localStorage.getItem('admin_token');
+            if (!token || forcePrompt) {
+                token = prompt(forcePrompt ? "인증 실패 (401): 올바른 Admin Secret Token을 입력해주세요:" : "Admin Secret Token을 입력해주세요:");
+                if (token) {
+                    token = token.trim();
+                    localStorage.setItem('admin_token', token);
+                }
+            }
+            return token || '';
+        }
+
         async function runChaos(endpoint) {
             try {
-                const adminToken = document.querySelector('meta[name="admin-token"]').content;
-                const res = await fetch(endpoint, {
+                let adminToken = getAdminToken();
+                let res = await fetch(endpoint, {
                     method: 'POST',
                     headers: { 'X-Admin-Token': adminToken }
                 });
+
+                if (res.status === 401) {
+                    adminToken = getAdminToken(true);
+                    if (adminToken) {
+                        res = await fetch(endpoint, {
+                            method: 'POST',
+                            headers: { 'X-Admin-Token': adminToken }
+                        });
+                        if (initMetricsStream) initMetricsStream();
+                    }
+                    if (res.status === 401) {
+                        showBanner("인증 실패: 잘못된 Admin Token입니다.", "danger");
+                        logAction("인증 실패: 401 Unauthorized Admin Access", "");
+                        return;
+                    }
+                }
+
                 const data = await res.json();
 
                 let msg = "", type = "normal", readableMsg = "";
@@ -543,13 +572,23 @@
         let prevStats = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
         let lastCatchup = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
 
-        const adminToken = document.querySelector('meta[name="admin-token"]').content;
-        const evtSource = new EventSource(`/metrics/stream?token=${adminToken}`);
-        evtSource.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            
-            for (const [nodeName, nodeData] of Object.entries(data)) {
-                if(nodeData.status === "offline") continue;
+        let evtSource = null;
+        function initMetricsStream() {
+            if (evtSource) {
+                evtSource.close();
+            }
+            const token = getAdminToken();
+            if (!token) return;
+
+            evtSource = new EventSource(`/metrics/stream?token=${encodeURIComponent(token)}`);
+            evtSource.onerror = function() {
+                // If 401 or stream disconnected, don't spam loop, wait
+            };
+            evtSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                for (const [nodeName, nodeData] of Object.entries(data)) {
+                    if(nodeData.status === "offline") continue;
                 
                 const stats = nodeData.stats;
                 const el = document.getElementById(nodeName);
@@ -614,6 +653,7 @@
                 cbEl.style.color = cb === 'OPEN' ? 'var(--danger)' : (cb === 'HALF_OPEN' ? 'var(--warning)' : 'var(--normal)');
             }
         };
+        initMetricsStream();
     </script>
 </body>
 </html>

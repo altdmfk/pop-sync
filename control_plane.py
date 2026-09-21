@@ -51,9 +51,7 @@ async def get_index():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(base_dir, "static", "index.html")
     with open(file_path, "r", encoding="utf-8") as f:
-        html_content = f.read()
-        html_content = html_content.replace('</head>', f'<meta name="admin-token" content="{ADMIN_SECRET_TOKEN}">\n</head>')
-        return HTMLResponse(html_content)
+        return HTMLResponse(f.read())
 
 
 async def fetch_metrics():

@@ -194,6 +194,9 @@ class CircuitBreaker:
             if state == "OPEN":
                 self.failures = self.max_failures
                 self.last_failure_time = time.time()
+            elif state == "HALF_OPEN":
+                self.failures = self.max_failures
+                self.last_failure_time = time.time() - self.reset_timeout - 1.0
             elif state == "CLOSED":
                 self.failures = 0
                 self.last_failure_time = 0
