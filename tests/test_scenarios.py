@@ -1,17 +1,21 @@
 import httpx
 import uuid
 import time
+import os
 
 BASE_URL = "http://localhost:8080"
 NODE_A = "http://localhost:8001"
 NODE_B = "http://localhost:8002"
+NODE_C = "http://localhost:8003"
+
+ADMIN_SECRET_TOKEN = os.getenv("ADMIN_SECRET_TOKEN", "super-secret-admin")
 
 def print_header(title):
     print(f"\n{'='*50}\n{title}\n{'='*50}")
 
 def test_nonce_atomicity():
     print_header("Scenario 1: Nonce Atomicity")
-    resp = httpx.post(f"{BASE_URL}/chaos/nonce", headers={"X-Admin-Token": "super-secret-admin"})
+    resp = httpx.post(f"{BASE_URL}/chaos/nonce", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
     data = resp.json()
     print("Concurrent requests sent.")
     node_a = data["results"]["Node-A"]
@@ -25,7 +29,7 @@ def test_nonce_atomicity():
 
 def test_rate_limiting():
     print_header("Scenario 2: O(1) Rate Limiting")
-    resp = httpx.post(f"{BASE_URL}/chaos/ddos", headers={"X-Admin-Token": "super-secret-admin"})
+    resp = httpx.post(f"{BASE_URL}/chaos/ddos", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
     data = resp.json()
     print(f"Responses: {data['responses']}")
     assert "429" in data["responses"], "Expected 429 Too Many Requests"
@@ -34,7 +38,7 @@ def test_rate_limiting():
 def test_circuit_breaker():
     print_header("Scenario 3: Circuit Breaker & Fallback Degradation")
     print("Bringing DB down...")
-    httpx.post(f"{BASE_URL}/chaos/db/down", headers={"X-Admin-Token": "super-secret-admin"})
+    httpx.post(f"{BASE_URL}/chaos/db/down", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
     time.sleep(1)
     
     print("Sending requests to trigger breaker...")
@@ -45,13 +49,13 @@ def test_circuit_breaker():
             "X-SPIFFE-ID": f"spiffe://example.org/cb_{uuid.uuid4()}"
         })
     
-    metrics = httpx.get(f"{NODE_A}/metrics", headers={"X-Admin-Token": "super-secret-admin"}).json()
+    metrics = httpx.get(f"{NODE_A}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}).json()
     state = metrics["stats"]["circuit_state"]
     print(f"Circuit state is: {state}")
     assert state == "OPEN", "Circuit should be OPEN after 3 failures"
     
     print("Restoring DB...")
-    httpx.post(f"{BASE_URL}/chaos/db/up", headers={"X-Admin-Token": "super-secret-admin"})
+    httpx.post(f"{BASE_URL}/chaos/db/up", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
     
     # Wait for reset timeout (10s)
     print("Waiting 10s for HALF_OPEN transition...")
@@ -63,7 +67,7 @@ def test_circuit_breaker():
         "X-SPIFFE-ID": f"spiffe://example.org/cb_{uuid.uuid4()}"
     })
     
-    metrics = httpx.get(f"{NODE_A}/metrics", headers={"X-Admin-Token": "super-secret-admin"}).json()
+    metrics = httpx.get(f"{NODE_A}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}).json()
     state = metrics["stats"]["circuit_state"]
     print(f"Circuit state is: {state}")
     assert state == "CLOSED", "Circuit should recover to CLOSED"
@@ -86,29 +90,29 @@ def test_partition_catchup():
                 "X-SPIFFE-ID": f"spiffe://example.org/catchup_test_{iteration}_{i}"
             })
         
-        size_before = httpx.get(f"{NODE_B}/metrics", headers={"X-Admin-Token": "super-secret-admin"}).json()["stats"]["l1_cache_size"]
+        size_before = httpx.get(f"{NODE_B}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}).json()["stats"]["l1_cache_size"]
         
         # Random sleep BEFORE isolate to simulate arbitrary timing within the Redis block window
         time.sleep(random.uniform(0.0, 0.5))
         
         print("Isolating Node-B...")
-        httpx.post(f"{BASE_URL}/chaos/partition/Node-B/isolate", headers={"X-Admin-Token": "super-secret-admin"})
+        httpx.post(f"{BASE_URL}/chaos/partition/Node-B/isolate", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         
         # Random sleep AFTER isolate, can be 0, to simulate immediate publishing
         time.sleep(random.uniform(0.0, 0.2))
         
         print("Publishing 4 invalidation events...")
         for _ in range(4):
-            httpx.post(f"{BASE_URL}/chaos/invalidate", headers={"X-Admin-Token": "super-secret-admin"})
+            httpx.post(f"{BASE_URL}/chaos/invalidate", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         
-        size_during = httpx.get(f"{NODE_B}/metrics", headers={"X-Admin-Token": "super-secret-admin"}).json()["stats"]["l1_cache_size"]
+        size_during = httpx.get(f"{NODE_B}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}).json()["stats"]["l1_cache_size"]
         assert size_during == size_before, "Cache should be stale (events not processed during partition)"
         
         print("Healing Node-B...")
-        httpx.post(f"{BASE_URL}/chaos/partition/Node-B/heal", headers={"X-Admin-Token": "super-secret-admin"})
+        httpx.post(f"{BASE_URL}/chaos/partition/Node-B/heal", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         time.sleep(1) # Give it time to catch up upon healing
         
-        metrics = httpx.get(f"{NODE_B}/metrics", headers={"X-Admin-Token": "super-secret-admin"}).json()
+        metrics = httpx.get(f"{NODE_B}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}).json()
         catchup = metrics["stats"].get("last_catchup", {})
         print(f"Catch-up stats: {catchup}")
         

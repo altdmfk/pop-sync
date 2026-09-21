@@ -1,5 +1,8 @@
 import httpx
 import asyncio
+import os
+
+ADMIN_SECRET_TOKEN = os.getenv("ADMIN_SECRET_TOKEN", "super-secret-admin")
 
 async def test_auth_and_half_open():
     async with httpx.AsyncClient() as client:
@@ -10,7 +13,7 @@ async def test_auth_and_half_open():
         assert r_bad.status_code == 401
 
         # 1-2. 올바른 토큰으로 호출 -> 200
-        r_good = await client.post("http://localhost:8080/chaos/ddos", headers={"X-Admin-Token": "super-secret-admin"})
+        r_good = await client.post("http://localhost:8080/chaos/ddos", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         print(f"Correct token test: status={r_good.status_code}, flooded={r_good.json().get('status')}")
         assert r_good.status_code == 200
 
@@ -21,19 +24,19 @@ async def test_auth_and_half_open():
 
         print("\n=== 2. HALF_OPEN 강제 주입 및 can_execute 검증 ===")
         # 2-1. HALF_OPEN 강제 주입
-        r_force = await client.post("http://localhost:8001/chaos/cb/force/HALF_OPEN", headers={"X-Admin-Token": "super-secret-admin"})
+        r_force = await client.post("http://localhost:8001/chaos/cb/force/HALF_OPEN", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         print(f"Force HALF_OPEN: status={r_force.status_code}, body={r_force.json()}")
         assert r_force.status_code == 200
         assert r_force.json().get("status") == "HALF_OPEN"
 
         # 2-2. /metrics로 상태 확인
-        r_metrics = await client.get("http://localhost:8001/metrics", headers={"X-Admin-Token": "super-secret-admin"})
+        r_metrics = await client.get("http://localhost:8001/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         state = r_metrics.json()["stats"]["circuit_state"]
         print(f"Node-A circuit state after force HALF_OPEN: {state}")
         assert state == "HALF_OPEN"
 
         # 2-3. 복구 상태에서 정상 성공 요청 1건 전송하여 CLOSED 전환 확인
-        await client.post("http://localhost:8080/chaos/db/up", headers={"X-Admin-Token": "super-secret-admin"})
+        await client.post("http://localhost:8080/chaos/db/up", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         r_probe = await client.get("http://localhost:8001/auth", headers={
             "Authorization": "Bearer test",
             "X-Nonce": "half-open-test-nonce-1",
@@ -41,7 +44,7 @@ async def test_auth_and_half_open():
         })
         print(f"Probe request in HALF_OPEN: status={r_probe.status_code}, response={r_probe.json()}")
 
-        r_metrics_after = await client.get("http://localhost:8001/metrics", headers={"X-Admin-Token": "super-secret-admin"})
+        r_metrics_after = await client.get("http://localhost:8001/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         state_after = r_metrics_after.json()["stats"]["circuit_state"]
         print(f"Node-A circuit state after successful probe: {state_after} (Expected: CLOSED)")
         assert state_after == "CLOSED"

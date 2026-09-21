@@ -2,6 +2,9 @@ import httpx
 import asyncio
 import time
 import uuid
+import os
+
+ADMIN_SECRET_TOKEN = os.getenv("ADMIN_SECRET_TOKEN", "super-secret-admin")
 
 async def fire(client, i):
     try:
@@ -16,7 +19,7 @@ async def fire(client, i):
 
 async def check_cb_state(client):
     try:
-        resp = await client.get("http://localhost:8001/metrics", headers={"X-Admin-Token": "super-secret-admin"})
+        resp = await client.get("http://localhost:8001/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         return resp.json()["stats"]["circuit_state"]
     except:
         return "UNKNOWN"
@@ -24,7 +27,7 @@ async def check_cb_state(client):
 async def main():
     async with httpx.AsyncClient() as client:
         print("1. Bringing DB down...")
-        await client.post("http://localhost:8080/chaos/db/down", headers={"X-Admin-Token": "super-secret-admin"})
+        await client.post("http://localhost:8080/chaos/db/down", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         
         # Ensure CB is OPEN
         for i in range(5):
@@ -38,7 +41,7 @@ async def main():
         await asyncio.sleep(0.2)
         
         print("3. Instantly bringing DB up (which resets CB to CLOSED)...")
-        await client.post("http://localhost:8080/chaos/db/up", headers={"X-Admin-Token": "super-secret-admin"})
+        await client.post("http://localhost:8080/chaos/db/up", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         print(f"CB state right after up: {await check_cb_state(client)}")
         
         print("4. Monitoring CB state for 3 seconds...")
