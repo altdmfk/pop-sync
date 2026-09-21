@@ -1,7 +1,7 @@
 import random
 import json
 import logging
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 import httpx
@@ -33,6 +33,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+@app.middleware("http")
+async def admin_auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if path == "/metrics/stream" or path.startswith("/chaos/"):
+        admin_token = request.headers.get("X-Admin-Token") or request.query_params.get("token")
+        if admin_token != ADMIN_SECRET_TOKEN:
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
+    return await call_next(request)
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -42,7 +51,9 @@ async def get_index():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(base_dir, "static", "index.html")
     with open(file_path, "r", encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+        html_content = f.read()
+        html_content = html_content.replace('</head>', f'<meta name="admin-token" content="{ADMIN_SECRET_TOKEN}">\n</head>')
+        return HTMLResponse(html_content)
 
 
 async def fetch_metrics():
@@ -171,17 +182,17 @@ async def chaos_db(state: str):
         return JSONResponse(status_code=500, content={"error": f"Failed to change DB state: {e}"})
 
     if state == "up":
-        tasks = [async_http_client.post(f"{url}/chaos/cb/reset", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [async_http_client.post(f"{url}/chaos/cb/force/CLOSED", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
+        resps = await asyncio.gather(*tasks, return_exceptions=True)
+        for url, r in zip(GATEWAYS.values(), resps):
+            if isinstance(r, Exception) or (hasattr(r, "status_code") and r.status_code >= 400):
+                logging.warning(f"Failed to force CLOSED on {url}: {r}")
     elif state == "down":
-        headers = {"Authorization": "Bearer test_token", "X-SPIFFE-ID": "spiffe://example.org/test"}
-        tasks = []
-        for _ in range(5):
-            h = headers.copy()
-            h["X-Nonce"] = str(uuid.uuid4())
-            target_node = random.choice(list(GATEWAYS.keys()))
-            tasks.append(async_http_client.get(f"{GATEWAYS[target_node]}/auth", headers=h))
-        await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [async_http_client.post(f"{url}/chaos/cb/force/OPEN", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
+        resps = await asyncio.gather(*tasks, return_exceptions=True)
+        for url, r in zip(GATEWAYS.values(), resps):
+            if isinstance(r, Exception) or (hasattr(r, "status_code") and r.status_code >= 400):
+                logging.warning(f"Failed to force OPEN on {url}: {r}")
     return {"db_state": state}
 
 if __name__ == '__main__':

@@ -418,7 +418,11 @@
 
         async function runChaos(endpoint) {
             try {
-                const res = await fetch(endpoint, {method: 'POST'});
+                const adminToken = document.querySelector('meta[name="admin-token"]').content;
+                const res = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'X-Admin-Token': adminToken }
+                });
                 const data = await res.json();
 
                 let msg = "", type = "normal", readableMsg = "";
@@ -539,7 +543,8 @@
         let prevStats = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
         let lastCatchup = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
 
-        const evtSource = new EventSource("/metrics/stream");
+        const adminToken = document.querySelector('meta[name="admin-token"]').content;
+        const evtSource = new EventSource(`/metrics/stream?token=${adminToken}`);
         evtSource.onmessage = function(event) {
             const data = JSON.parse(event.data);
             
