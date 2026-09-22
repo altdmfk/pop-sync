@@ -2,7 +2,6 @@ import asyncio
 import httpx
 import uuid
 import time
-import requests
 
 GATEWAYS = ["http://localhost:8001", "http://localhost:8002", "http://localhost:8003"]
 CONTROL_PLANE = "http://localhost:8080"
@@ -11,7 +10,6 @@ async def test_rl_fallback():
     print("=== Rate Limit Fallback Test ===")
     # 1. Redis Down (Implicitly down in local standalone run)
     print("Assuming Redis is down/unreachable...")
-    # requests.post(f"{CONTROL_PLANE}/chaos/redis/down")
     # time.sleep(2)
     
     # 2. Generate random spiffe_id
@@ -51,7 +49,6 @@ async def test_rl_fallback():
         # The remaining 90 - 45 = 45 requests should return 429 (Rate limited).
         
     print("Restoring Redis...")
-    # requests.post(f"{CONTROL_PLANE}/chaos/redis/up")
 
 if __name__ == '__main__':
     asyncio.run(test_rl_fallback())

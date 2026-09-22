@@ -65,12 +65,7 @@ MAX_DB_WORKERS               = _int("MAX_DB_WORKERS", 5)
 
 # ---------------------------------------------------------------------------
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--node", default="Node-X")
-parser.add_argument("--port", type=int, default=8000)
-args, _ = parser.parse_known_args()
-
-node_name = args.node
+node_name = os.getenv("NODE_NAME", "Node-X")
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 db_url    = os.getenv("DB_URL",    "http://localhost:8000")
 
@@ -126,6 +121,8 @@ class L1Cache:
 
 l1_cache = L1Cache(max_size=L1_MAX_SIZE, ttl=L1_TTL_SEC)
 is_partitioned = False
+partition_lock = asyncio.Lock()
+redis_swap_lock = asyncio.Lock()
 
 class CircuitBreaker:
     def __init__(self):
@@ -261,7 +258,6 @@ async def check_rate_limit(client_id: str) -> bool:
             results = await pipe.execute()
         return results[0] <= RL_LIMIT
     except Exception:
-        # Option B: conservative local cap when Redis is down (see RL_FALLBACK_LIMIT comment)
         async with local_rl_lock:
             if len(local_rate_limits) > RL_LOCAL_MAX_KEYS:
                 now_w = int(time.time() / RL_WINDOW_SEC)
@@ -300,12 +296,9 @@ def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
 def db_sync_call(key: str, sid: str, res: str):
     # Intentional synchronous blocking call to simulate legacy JDBC / DB operations.
     # Offloaded via run_in_executor to avoid blocking the event loop.
-    try:
-        resp = sync_http_client.get(f"{db_url}/policy/{key}", params={"sid": sid, "res": res}, timeout=DB_TIMEOUT_SEC)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        raise e
+    resp = sync_http_client.get(f"{db_url}/policy/{key}", params={"sid": sid, "res": res}, timeout=DB_TIMEOUT_SEC)
+    resp.raise_for_status()
+    return resp.json()
 
 async def stream_listener():
     try:
@@ -316,7 +309,9 @@ async def stream_listener():
     was_partitioned = False
     while True:
         try:
-            if is_partitioned:
+            async with partition_lock:
+                current_partitioned = is_partitioned
+            if current_partitioned:
                 was_partitioned = True
                 await asyncio.sleep(PARTITION_SLEEP_SEC)
                 continue
@@ -382,7 +377,9 @@ async def stream_listener():
                 # Prevent processing if partition signal arrived during the blocking read.
                 # The message is now in the PEL (Pending Entries List) but not ACK'd,
                 # so the catch-up logic will safely process it upon healing.
-                if is_partitioned:
+                async with partition_lock:
+                    current_partitioned = is_partitioned
+                if current_partitioned:
                     continue
                     
                 messages = messages_data[0][1]
@@ -449,8 +446,10 @@ async def admin_auth_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def measure_latency(request: Request, call_next):
-    if is_partitioned and not (request.url.path == "/health" or request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis")):
-        return JSONResponse(status_code=503, content={"error": "Node Isolated"})
+    async with partition_lock:
+        current_partitioned = is_partitioned
+    if current_partitioned and not (request.url.path == "/health" or request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis") or request.url.path.startswith("/chaos/cb/force/") or request.url.path.startswith("/chaos/invalidate/")):
+        return JSONResponse(status_code=503, content={"detail": "Node Isolated"})
         
     start = time.time()
     response = await call_next(request)
@@ -477,9 +476,10 @@ async def auth(
         if not allowed:
             with stats_lock:
                 stats["rate_limited"] += 1
-            return JSONResponse(status_code=429, headers={"Retry-After": str(RL_WINDOW_SEC)}, content={"error": "Too Many Requests"})
+            return JSONResponse(status_code=429, headers={"Retry-After": str(RL_WINDOW_SEC)}, content={"detail": "Too Many Requests"})
     except Exception as e:
         logging.warning(f"Rate limit check failed (Redis down?): {e}")
+        raise HTTPException(status_code=503, detail="Service Unavailable - Rate Limit Failed")
         
     try:
         nonce_ok = await consume_nonce(x_nonce, act=x_act)
@@ -490,7 +490,7 @@ async def auth(
     except Exception as e:
         if isinstance(e, HTTPException): raise e
         logging.warning(f"Nonce check fallback failed: {e}")
-        # Allow degraded pass if even local fallback fails
+        raise HTTPException(status_code=503, detail="Service Unavailable - Nonce Check Failed")
 
     token = authorization.replace("Aegis ", "").replace("Bearer ", "")
     comp_key = generate_composite_key(x_spiffe_id, token, x_res, x_act)
@@ -499,7 +499,8 @@ async def auth(
     if cached_policy is not None:
         with stats_lock:
             stats["l1_hits"] += 1
-        return {"status": "allow", "source": "L1", "policy": cached_policy}
+        ret_status = "deny" if cached_policy == "DENY" else "allow"
+        return {"status": ret_status, "source": "L1", "policy": cached_policy}
         
     try:
         l2_val = await redis_client.get(f"policy:{comp_key}")
@@ -508,7 +509,8 @@ async def auth(
                 stats["l2_hits"] += 1
             val = l2_val.decode()
             l1_cache.set(comp_key, val)
-            return {"status": "allow", "source": "L2", "policy": val}
+            ret_status = "deny" if val == "DENY" else "allow"
+            return {"status": ret_status, "source": "L2", "policy": val}
     except Exception as e:
         logging.warning(f"L2 cache fetch failed (Redis down?): {e}")
         
@@ -535,17 +537,22 @@ async def auth(
         with stats_lock:
             stats["circuit_state"] = current_state
         
-        policy = db_resp.get("role")
+        db_status = db_resp.get("status")
+        if db_status == "deny":
+            policy = "DENY"
+        else:
+            policy = db_resp.get("role")
+            
         l1_cache.set(comp_key, policy)
         try:
             await redis_client.set(f"policy:{comp_key}", policy, ex=L2_CACHE_TTL_SEC)
         except Exception as e:
             logging.warning(f"Failed to set L2 cache: {e}")
             
-        return {"status": "allow", "source": "DB", "policy": policy}
+        return {"status": "deny" if db_status == "deny" else "allow", "source": "DB", "policy": policy}
     except DBOverloadError as e:
         logging.warning(str(e))
-        return JSONResponse(status_code=503, content={"error": "Service Unavailable - DB Overload"})
+        return JSONResponse(status_code=503, content={"detail": "Service Unavailable - DB Overload"})
     except Exception as e:
         logging.warning(f"DB fallback failed: {e}")
         _, current_state = cb.record_failure()
@@ -559,7 +566,8 @@ async def health_check():
 
 @app.get("/metrics")
 async def get_metrics():
-    current_state = cb.check_and_half_open()
+    with cb._lock:
+        current_state = cb.state
     try:
         redis_ok = await redis_client.ping()
     except Exception:
@@ -570,25 +578,34 @@ async def get_metrics():
         stats["l1_cache_size"] = len(l1_cache)
         stats["local_rl_size"] = len(local_rate_limits)
         snapshot = dict(stats)
-    return {"node": node_name, "stats": snapshot, "is_partitioned": is_partitioned, "redis_ok": redis_ok}
+    async with partition_lock:
+        current_partitioned = is_partitioned
+    return {"node": node_name, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
+
+probe_semaphore = asyncio.Semaphore(1)
 
 async def probe_db_health():
-    try:
-        await asyncio.to_thread(db_sync_call, "probe", "probe", "probe")
-        cb.record_success()
-    except Exception as e:
-        logging.warning(f"DB probe failed upon healing: {e}")
-        cb.force_state("OPEN")
+    if probe_semaphore.locked():
+        return
+    async with probe_semaphore:
+        try:
+            await asyncio.to_thread(db_sync_call, "probe", "probe", "probe")
+            cb.record_success()
+        except Exception as e:
+            logging.warning(f"DB probe failed upon healing: {e}")
+            cb.force_state("OPEN")
 
 @app.post("/chaos/partition/{state}")
 async def set_partition(state: str):
     if state not in ["isolate", "heal"]:
         raise HTTPException(status_code=400, detail=f"Invalid partition state: {state}")
     global is_partitioned
-    is_partitioned = (state == "isolate")
+    async with partition_lock:
+        is_partitioned = (state == "isolate")
+        current_partitioned = is_partitioned
     if state == "heal":
         asyncio.create_task(probe_db_health())
-    return {"status": is_partitioned}
+    return {"status": current_partitioned}
 
 @app.post("/chaos/redis/{state}")
 async def set_redis(state: str):
@@ -608,9 +625,10 @@ async def set_redis(state: str):
     new_nonce_script = new_redis.register_script(NONCE_LUA)
     
     # Atomic swap
-    nonce_script = new_nonce_script
-    redis_client = new_redis
-    stream_redis_client = new_stream
+    async with redis_swap_lock:
+        nonce_script = new_nonce_script
+        redis_client = new_redis
+        stream_redis_client = new_stream
     
     # Safely close old clients
     try:
@@ -636,4 +654,9 @@ async def force_cb_state(state: str, request: Request):
     return {"status": state}
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--node", default="Node-X")
+    parser.add_argument("--port", type=int, default=8000)
+    args, _ = parser.parse_known_args()
+    os.environ["NODE_NAME"] = args.node
     uvicorn.run("gateway:app", host="0.0.0.0", port=args.port)

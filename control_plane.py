@@ -45,7 +45,9 @@ app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def admin_auth_middleware(request: Request, call_next):
-    # admin token check removed for client access
+    if request.url.path.startswith("/chaos/") and request.url.path != "/chaos/auth_check":
+        if request.headers.get("X-Admin-Token") != ADMIN_SECRET_TOKEN:
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
     return await call_next(request)
 
 @app.get("/health")
@@ -55,7 +57,7 @@ async def health():
 @app.get("/")
 async def get_index():
     if index_html_cache is None:
-        return JSONResponse(status_code=503, content={"error": "Service Unavailable - index.html not loaded"})
+        return JSONResponse(status_code=503, content={"detail": "Service Unavailable - index.html not loaded"})
     return HTMLResponse(index_html_cache)
 
 @app.get("/chaos/auth_check")
@@ -145,14 +147,14 @@ async def chaos_ddos():
 @app.post("/chaos/partition/{node}/{state}")
 async def chaos_partition(node: str, state: str):
     if node not in GATEWAYS:
-        return JSONResponse(status_code=400, content={"error": f"Unknown node {node}"})
+        return JSONResponse(status_code=400, content={"detail": f"Unknown node {node}"})
     try:
         resp = await async_http_client.post(f"{GATEWAYS[node]}/chaos/partition/{state}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         resp.raise_for_status()
         return {"node": node, "state": state}
     except Exception as e:
         logging.error(f"Partition {node} failed: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/chaos/redis/{state}")
 async def chaos_redis(state: str):
@@ -169,7 +171,7 @@ async def chaos_invalidate():
     available_nodes = [name for name, data in metrics.items() if data.get('status') != 'offline' and not data.get('is_partitioned')]
     
     if not available_nodes:
-        return JSONResponse(status_code=500, content={"error": "No available nodes"})
+        return JSONResponse(status_code=500, content={"detail": "No available nodes"})
         
     target_node = random.choice(available_nodes)
     
@@ -178,18 +180,21 @@ async def chaos_invalidate():
         resp.raise_for_status()
         return {"status": "invalidated", "node": target_node}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/chaos/db/{state}")
 async def chaos_db(state: str):
     if state not in ["up", "down"]:
-        return JSONResponse(status_code=400, content={"error": f"Invalid db state: {state}"})
+        return JSONResponse(status_code=400, content={"detail": f"Invalid db state: {state}"})
     try:
-        resp = await async_http_client.post(f"{POLICY_DB}/chaos/db/{state}")
+        resp = await async_http_client.post(
+            f"{POLICY_DB}/chaos/db/{state}",
+            headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}
+        )
         resp.raise_for_status()
     except Exception as e:
         logging.error(f"Failed to change DB state: {e}")
-        return JSONResponse(status_code=500, content={"error": f"Failed to change DB state: {e}"})
+        return JSONResponse(status_code=500, content={"detail": f"Failed to change DB state: {e}"})
 
     results = {}
     if state == "up":
