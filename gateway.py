@@ -32,7 +32,7 @@ STREAM_SOCKET_TIMEOUT        = _float("STREAM_SOCKET_TIMEOUT", 5.0) # must be > 
 REDIS_DOWN_SOCKET_TIMEOUT    = _float("REDIS_DOWN_SOCKET_TIMEOUT", 0.1) # fast-fail for simulated dead Redis
 
 # Stream / partition
-STREAM_NAME                  = "invalidation_stream"
+STREAM_NAME                  = os.getenv("STREAM_NAME", "invalidation_stream")
 STREAM_CATCHUP_COUNT         = _int("STREAM_CATCHUP_COUNT", 100)
 STREAM_NORMAL_COUNT          = _int("STREAM_NORMAL_COUNT", 10)
 STREAM_BLOCK_MS              = _int("STREAM_BLOCK_MS", 500)          # < STREAM_SOCKET_TIMEOUT * 1000
@@ -52,10 +52,14 @@ L2_CACHE_TTL_SEC             = _int("L2_CACHE_TTL_SEC", 60)          # evict tog
 L1_MAX_SIZE                  = _int("L1_MAX_SIZE", 1000)
 L1_TTL_SEC                   = _int("L1_TTL_SEC", 60)                # ≤ L2_CACHE_TTL_SEC to avoid stale L1 hits
 
+# Rate limiting modifiers
+RL_EXPIRE_MULTIPLIER         = _int("RL_EXPIRE_MULTIPLIER", 2)
+
 # Circuit breaker
 CB_MAX_FAILURES              = _int("CB_MAX_FAILURES", 3)
 CB_RESET_TIMEOUT_SEC         = _int("CB_RESET_TIMEOUT_SEC", 10)
-CB_DEBOUNCE_SEC              = _float("CB_DEBOUNCE_SEC", 2.0)        # ignore failures in first N sec after state change
+CB_DEBOUNCE_SEC              = _float("CB_DEBOUNCE_SEC", 2.0)
+CB_FORCE_STATE_MARGIN_SEC    = _float("CB_FORCE_STATE_MARGIN_SEC", 1.0)
 VALID_CB_STATES              = frozenset(["OPEN", "CLOSED", "HALF_OPEN"])
 
 # DB / thread pool
@@ -68,6 +72,7 @@ MAX_DB_WORKERS               = _int("MAX_DB_WORKERS", 5)
 node_name = os.getenv("NODE_NAME", "Node-X")
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 db_url    = os.getenv("DB_URL",    "http://localhost:8000")
+DB_MODE   = os.getenv("DB_MODE",   "sync")  # "sync" or "async"
 
 STREAM_GROUP = f"gateway_group_{node_name}"
 
@@ -80,6 +85,7 @@ redis_client = None
 stream_redis_client = None
 nonce_script = None
 sync_http_client = None
+async_db_client = None
 
 class L1Cache:
     def __init__(self, max_size=1000, ttl=60):
@@ -188,13 +194,13 @@ class CircuitBreaker:
             raise ValueError(f"Invalid state: {state}")
         with self._lock:
             self.state = state
-            self.last_transition_time = time.time() - CB_DEBOUNCE_SEC - 1.0
+            self.last_transition_time = time.time() - CB_DEBOUNCE_SEC - CB_FORCE_STATE_MARGIN_SEC
             if state == "OPEN":
                 self.failures = self.max_failures
                 self.last_failure_time = time.time()
             elif state == "HALF_OPEN":
                 self.failures = self.max_failures
-                self.last_failure_time = time.time() - self.reset_timeout - 1.0
+                self.last_failure_time = time.time() - self.reset_timeout - CB_FORCE_STATE_MARGIN_SEC
             elif state == "CLOSED":
                 self.failures = 0
                 self.last_failure_time = 0
@@ -251,39 +257,16 @@ async def check_rate_limit(client_id: str) -> bool:
     window_key = now // RL_WINDOW_SEC
     key = f"rl:{client_id}:{window_key}"
 
-    try:
-        async with redis_client.pipeline(transaction=True) as pipe:
-            pipe.incr(key)
-            pipe.expire(key, RL_WINDOW_SEC * 2)
-            results = await pipe.execute()
-        return results[0] <= RL_LIMIT
-    except Exception:
-        async with local_rl_lock:
-            if len(local_rate_limits) > RL_LOCAL_MAX_KEYS:
-                now_w = int(time.time() / RL_WINDOW_SEC)
-                to_delete = [k for k in local_rate_limits.keys() if int(k.rsplit(":", 1)[-1]) < now_w]
-                for k in to_delete:
-                    del local_rate_limits[k]
-            local_key = f"{client_id}:{window_key}"
-            count = local_rate_limits.get(local_key, 0) + 1
-            local_rate_limits[local_key] = count
-            return count <= RL_FALLBACK_LIMIT
+    async with redis_client.pipeline(transaction=True) as pipe:
+        pipe.incr(key)
+        pipe.expire(key, RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER)
+        results = await pipe.execute()
+    return results[0] <= RL_LIMIT
 
 async def consume_nonce(nonce: str, ttl: int = NONCE_TTL_SEC, act: str = "read") -> bool:
-    try:
-        key = f"nonce:{nonce}"
-        result = await nonce_script(keys=[key], args=["1", str(ttl)])
-        return result == 1
-    except Exception:
-        # Fallback: check local cache
-        if act.lower() in ["write", "pay", "update", "delete", "critical"]:
-            return False # Fail Closed for strong consistency
-
-        local_key = f"local_nonce:{nonce}"
-        if local_key in l1_cache:
-            return False
-        l1_cache.set(local_key, "1")
-        return True
+    key = f"nonce:{nonce}"
+    result = await nonce_script(keys=[key], args=["1", str(ttl)])
+    return result == 1
 
 def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
     sid = sid.strip()
@@ -294,17 +277,22 @@ def generate_composite_key(sid: str, uid: str, res: str, act: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 def db_sync_call(key: str, sid: str, res: str):
-    # Intentional synchronous blocking call to simulate legacy JDBC / DB operations.
-    # Offloaded via run_in_executor to avoid blocking the event loop.
     resp = sync_http_client.get(f"{db_url}/policy/{key}", params={"sid": sid, "res": res}, timeout=DB_TIMEOUT_SEC)
+    resp.raise_for_status()
+    return resp.json()
+
+async def db_async_call(key: str, sid: str, res: str):
+    resp = await async_db_client.get(f"{db_url}/policy/{key}", params={"sid": sid, "res": res}, timeout=DB_TIMEOUT_SEC)
     resp.raise_for_status()
     return resp.json()
 
 async def stream_listener():
     try:
         await stream_redis_client.xgroup_create(STREAM_NAME, STREAM_GROUP, id="0", mkstream=True)
-    except Exception:
-        pass # Group might already exist
+    except Exception as e:
+        if "BUSYGROUP" not in str(e):
+            logging.error(f"Failed to create stream group: {e}")
+            raise
 
     was_partitioned = False
     while True:
@@ -334,6 +322,10 @@ async def stream_listener():
                         key = key_bytes.decode()
                         if key in l1_cache:
                             l1_cache.delete(key)
+                        try:
+                            await redis_client.delete(f"policy:{key}")
+                        except Exception as e:
+                            logging.warning(f"Failed to delete L2 cache: {e}")
                         await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
                 
                 # 2. Unread accumulated during partition
@@ -352,6 +344,10 @@ async def stream_listener():
                         key = key_bytes.decode()
                         if key in l1_cache:
                             l1_cache.delete(key)
+                        try:
+                            await redis_client.delete(f"policy:{key}")
+                        except Exception as e:
+                            logging.warning(f"Failed to delete L2 cache: {e}")
                         await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
                 
                 catchup_duration = int((time.time() - start_time) * 1000)
@@ -373,10 +369,6 @@ async def stream_listener():
                 if not messages_data:
                     continue
                 
-                # [Fix] Post-read State Barrier: 
-                # Prevent processing if partition signal arrived during the blocking read.
-                # The message is now in the PEL (Pending Entries List) but not ACK'd,
-                # so the catch-up logic will safely process it upon healing.
                 async with partition_lock:
                     current_partitioned = is_partitioned
                 if current_partitioned:
@@ -393,6 +385,10 @@ async def stream_listener():
                 key = key_bytes.decode()
                 if key in l1_cache:
                     l1_cache.delete(key)
+                try:
+                    await redis_client.delete(f"policy:{key}")
+                except Exception as e:
+                    logging.warning(f"Failed to delete L2 cache: {e}")
                 await stream_redis_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
         except asyncio.CancelledError:
             break
@@ -402,25 +398,34 @@ async def stream_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, stream_redis_client, sync_http_client, db_semaphore, db_executor, nonce_script
+    global redis_client, stream_redis_client, sync_http_client, async_db_client, db_semaphore, db_executor, nonce_script
     db_semaphore = asyncio.Semaphore(MAX_DB_WORKERS)
     db_executor = ThreadPoolExecutor(max_workers=MAX_DB_WORKERS)
     redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
     nonce_script = redis_client.register_script(NONCE_LUA)
     stream_redis_client = Redis.from_url(redis_url, socket_timeout=STREAM_SOCKET_TIMEOUT)
     sync_http_client = httpx.Client(timeout=DB_TIMEOUT_SEC)
+    async_db_client = httpx.AsyncClient(timeout=DB_TIMEOUT_SEC, limits=httpx.Limits(max_connections=MAX_DB_WORKERS))
     task = asyncio.create_task(stream_listener())
     task_cleanup = asyncio.create_task(cleanup_local_rl())
     yield
     task.cancel()
     task_cleanup.cancel()
     sync_http_client.close()
+    await async_db_client.aclose()
     if db_executor:
         db_executor.shutdown(wait=True)
     await redis_client.close()
     await stream_redis_client.close()
 
 app = FastAPI(lifespan=lifespan)
+
+@app.exception_handler(HTTPException)
+async def unified_http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "message": exc.detail}
+    )
 
 ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN")
 if not ADMIN_SECRET_TOKEN:
@@ -434,13 +439,13 @@ async def admin_auth_middleware(request: Request, call_next):
     if path == "/metrics" or path.startswith("/chaos/"):
         admin_token = request.headers.get("X-Admin-Token")
         if admin_token != ADMIN_SECRET_TOKEN:
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
+            return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized Admin Access"})
         return await call_next(request)
     
     # All other routes require Authorization header
     auth_header = request.headers.get("Authorization")
     if not auth_header:
-        return JSONResponse(status_code=401, content={"detail": "Missing Authorization Header"})
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Missing Authorization Header"})
     
     return await call_next(request)
 
@@ -449,7 +454,7 @@ async def measure_latency(request: Request, call_next):
     async with partition_lock:
         current_partitioned = is_partitioned
     if current_partitioned and not (request.url.path == "/health" or request.url.path.startswith("/chaos/partition") or request.url.path.startswith("/metrics") or request.url.path.startswith("/chaos/redis") or request.url.path.startswith("/chaos/cb/force/") or request.url.path.startswith("/chaos/invalidate/")):
-        return JSONResponse(status_code=503, content={"detail": "Node Isolated"})
+        return JSONResponse(status_code=503, content={"status": "error", "message": "Node Isolated"})
         
     start = time.time()
     response = await call_next(request)
@@ -476,7 +481,7 @@ async def auth(
         if not allowed:
             with stats_lock:
                 stats["rate_limited"] += 1
-            return JSONResponse(status_code=429, headers={"Retry-After": str(RL_WINDOW_SEC)}, content={"detail": "Too Many Requests"})
+            return JSONResponse(status_code=429, headers={"Retry-After": str(RL_WINDOW_SEC)}, content={"status": "error", "message": "Too Many Requests"})
     except Exception as e:
         logging.warning(f"Rate limit check failed (Redis down?): {e}")
         raise HTTPException(status_code=503, detail="Service Unavailable - Rate Limit Failed")
@@ -489,7 +494,7 @@ async def auth(
             raise HTTPException(status_code=401, detail="Replay Detected")
     except Exception as e:
         if isinstance(e, HTTPException): raise e
-        logging.warning(f"Nonce check fallback failed: {e}")
+        logging.warning(f"Nonce check failed (Redis down?): {e}")
         raise HTTPException(status_code=503, detail="Service Unavailable - Nonce Check Failed")
 
     token = authorization.replace("Aegis ", "").replace("Bearer ", "")
@@ -524,15 +529,18 @@ async def auth(
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
         
     try:
-        try:
-            await asyncio.wait_for(db_semaphore.acquire(), timeout=DB_SEMAPHORE_ACQUIRE_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
-        try:
-            loop = asyncio.get_running_loop()
-            db_resp = await loop.run_in_executor(db_executor, db_sync_call, comp_key, x_spiffe_id, x_res)
-        finally:
-            db_semaphore.release()
+        if DB_MODE == "async":
+            db_resp = await db_async_call(comp_key, x_spiffe_id, x_res)
+        else:
+            try:
+                await asyncio.wait_for(db_semaphore.acquire(), timeout=DB_SEMAPHORE_ACQUIRE_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
+            try:
+                loop = asyncio.get_running_loop()
+                db_resp = await loop.run_in_executor(db_executor, db_sync_call, comp_key, x_spiffe_id, x_res)
+            finally:
+                db_semaphore.release()
         _, current_state = cb.record_success()
         with stats_lock:
             stats["circuit_state"] = current_state
@@ -552,7 +560,7 @@ async def auth(
         return {"status": "deny" if db_status == "deny" else "allow", "source": "DB", "policy": policy}
     except DBOverloadError as e:
         logging.warning(str(e))
-        return JSONResponse(status_code=503, content={"detail": "Service Unavailable - DB Overload"})
+        return JSONResponse(status_code=503, content={"status": "error", "message": "Service Unavailable - DB Overload"})
     except Exception as e:
         logging.warning(f"DB fallback failed: {e}")
         _, current_state = cb.record_failure()
@@ -580,7 +588,7 @@ async def get_metrics():
         snapshot = dict(stats)
     async with partition_lock:
         current_partitioned = is_partitioned
-    return {"node": node_name, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
+    return {"node": node_name, "db_mode": DB_MODE, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
 
 probe_semaphore = asyncio.Semaphore(1)
 
@@ -589,7 +597,10 @@ async def probe_db_health():
         return
     async with probe_semaphore:
         try:
-            await asyncio.to_thread(db_sync_call, "probe", "probe", "probe")
+            if DB_MODE == "async":
+                await db_async_call("probe", "probe", "probe")
+            else:
+                await asyncio.to_thread(db_sync_call, "probe", "probe", "probe")
             cb.record_success()
         except Exception as e:
             logging.warning(f"DB probe failed upon healing: {e}")
@@ -631,11 +642,15 @@ async def set_redis(state: str):
         stream_redis_client = new_stream
     
     # Safely close old clients
-    try:
-        await old_redis.close()
-        await old_stream.close()
-    except Exception as e:
-        logging.warning(f"Failed to close old Redis clients: {e}")
+    async def close_old_clients(r, s):
+        await asyncio.sleep(2.0)
+        try:
+            await r.close()
+            await s.close()
+        except Exception as e:
+            logging.warning(f"Failed to close old Redis clients: {e}")
+            
+    asyncio.create_task(close_old_clients(old_redis, old_stream))
     return {"status": state}
 
 @app.post("/chaos/invalidate/{key}")
@@ -657,6 +672,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--node", default="Node-X")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--db-mode", default="sync", choices=["sync", "async"])
     args, _ = parser.parse_known_args()
     os.environ["NODE_NAME"] = args.node
+    os.environ["DB_MODE"] = args.db_mode
     uvicorn.run("gateway:app", host="0.0.0.0", port=args.port)

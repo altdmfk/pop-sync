@@ -30,7 +30,7 @@ Redis Pipeline으로 슬라이딩 윈도우 방식의 레이트 리미팅을 구
 
 ---
 
-## 비예호서비스 동작 정리
+## 장애 대응 동작 정리 (Resilience)
 
 | 장애 유형 | 동작 |
 | --- | --- |
@@ -38,7 +38,7 @@ Redis Pipeline으로 슬라이딩 윈도우 방식의 레이트 리미팅을 구
 | **DB 다운** | 서킷 브레이커 `OPEN` 전환. L1/L2 캐시 히트는 정상 응답, 캐시 미스 시 `degraded_allow` |
 | **네트워크 파티션** | 노드 격리. 합 시 Redis Stream PEL 소급 적용으로 L1 캐시 일관성 복원 |
 | **DDoS** | Rate Limiting 429 반환 (노드별 50req/10s, Redis 다운 시 15req/10s) |
-| **Nonce 재사용** | Lua 원자적 Redis 연산. Redis 다운 시 write 액션은 Fail Closed |
+| **Nonce 재사용** | Lua 원자적 Redis 연산. Redis 다운 시 Fail Closed 원칙에 따라 503 반환 및 상위 전파 |
 
 ---
 

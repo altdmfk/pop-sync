@@ -13,6 +13,11 @@ if not ADMIN_SECRET_TOKEN:
 import uuid
 from contextlib import asynccontextmanager
 
+HTTP_TIMEOUT_SEC = 5.0
+METRICS_STREAM_SLEEP_SEC = 1.0
+DDOS_REQUEST_COUNT = 60
+TEST_INVALIDATE_KEY = "a8f5f167f44f4964e6c998dee827110c"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 GATEWAYS = {
@@ -28,7 +33,7 @@ index_html_cache = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global async_http_client, index_html_cache
-    async_http_client = httpx.AsyncClient(timeout=5.0)
+    async_http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC)
     
     base_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(base_dir, "static", "index.html")
@@ -45,8 +50,13 @@ app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def admin_auth_middleware(request: Request, call_next):
-    if request.url.path.startswith("/chaos/") and request.url.path != "/chaos/auth_check":
+    path = request.url.path
+    if path.startswith("/chaos/") and path != "/chaos/auth_check":
         if request.headers.get("X-Admin-Token") != ADMIN_SECRET_TOKEN:
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
+    elif path == "/metrics/stream":
+        token = request.query_params.get("token") or request.headers.get("X-Admin-Token")
+        if token != ADMIN_SECRET_TOKEN:
             return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
     return await call_next(request)
 
@@ -85,7 +95,7 @@ async def metrics_stream():
         while True:
             metrics = await fetch_metrics()
             yield {"data": json.dumps(metrics)}
-            await asyncio.sleep(1)
+            await asyncio.sleep(METRICS_STREAM_SLEEP_SEC)
     return EventSourceResponse(event_generator())
 
 @app.post("/chaos/nonce")
@@ -129,7 +139,7 @@ async def chaos_ddos():
         available_nodes = list(GATEWAYS.keys())
 
     reqs = []
-    for i in range(60):
+    for i in range(DDOS_REQUEST_COUNT):
         h = headers.copy()
         h["X-Nonce"] = str(uuid.uuid4())
         target_node = random.choice(available_nodes)
@@ -166,7 +176,7 @@ async def chaos_redis(state: str):
 
 @app.post("/chaos/invalidate")
 async def chaos_invalidate():
-    test_key = "a8f5f167f44f4964e6c998dee827110c"
+    test_key = TEST_INVALIDATE_KEY
     metrics = await fetch_metrics()
     available_nodes = [name for name, data in metrics.items() if data.get('status') != 'offline' and not data.get('is_partitioned')]
     

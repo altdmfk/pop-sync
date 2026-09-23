@@ -1,6 +1,9 @@
 import asyncio
 from fastapi import FastAPI, HTTPException
 
+CHAOS_DOWN_SLEEP_SEC = 2.0
+SIMULATED_DB_LATENCY_SEC = 0.02
+
 app = FastAPI()
 
 # Chaos state
@@ -14,10 +17,10 @@ async def get_policy(key: str, sid: str = "", res: str = ""):
         current_down = is_down
         
     if current_down:
-        await asyncio.sleep(2)
+        await asyncio.sleep(CHAOS_DOWN_SLEEP_SEC)
         raise HTTPException(status_code=503, detail="DB Outage")
     
-    await asyncio.sleep(0.02)
+    await asyncio.sleep(SIMULATED_DB_LATENCY_SEC)
     
     if res == "restricted" or sid.endswith("/deny"):
         return {"status": "deny", "role": "none"}

@@ -457,7 +457,14 @@
         }
 
         function getAdminToken(forcePrompt = false) {
-            return '';
+            let token = sessionStorage.getItem('adminToken');
+            if (!token || forcePrompt) {
+                token = prompt('Admin Token을 입력하세요:');
+                if (token) {
+                    sessionStorage.setItem('adminToken', token);
+                }
+            }
+            return token || '';
         }
 
         async function runChaos(endpoint) {
@@ -617,7 +624,7 @@
             layer.innerHTML += `
                 <div class="node normal" id="${n}">
                     <div class="node-header">
-                        <h3>${n}</h3>
+                        <h3>${n} <span id="mode-${n}" style="font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; display: none; color: white; margin-left: 6px; vertical-align: middle;"></span></h3>
                         <span class="badge normal" id="badge-${n}">Normal</span>
                     </div>
                     <div class="node-reason" id="reason-${n}">모든 기능이 정상적으로 트래픽을 처리하고 있습니다.</div>
@@ -659,6 +666,19 @@
                     const el = document.getElementById(nodeName);
                     const badge = document.getElementById(`badge-${nodeName}`);
                     const cb = stats.circuit_state;
+                    
+                    if (nodeData.db_mode) {
+                        const modeBadge = document.getElementById(`mode-${nodeName}`);
+                        if (modeBadge) {
+                            modeBadge.innerText = nodeData.db_mode.toUpperCase();
+                            modeBadge.style.display = 'inline-block';
+                            if (nodeData.db_mode === 'async') {
+                                modeBadge.style.background = '#3b82f6';
+                            } else {
+                                modeBadge.style.background = '#64748b';
+                            }
+                        }
+                    }
                     
                     let badgeText = "Normal";
                     let badgeClass = "badge normal";
