@@ -15,6 +15,8 @@ services:
     command: python policy_db.py
     ports:
       - "8000:8000"
+    environment:
+      - SIMULATED_DB_LATENCY_SEC=${SIMULATED_DB_LATENCY_SEC:-0.02}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/policy/test?sid=1&res=1')"]
       interval: 10s
