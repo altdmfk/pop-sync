@@ -805,16 +805,25 @@
                     const lhs = stats.requests;
                     const rhs = (stats.rate_limited || 0) + (stats.nonce_replays || 0) + (stats.pop_rejected || 0) + (stats.l1_hits || 0) + (stats.l2_hits || 0) + (stats.db_fallbacks || 0);
                     const invEl = document.getElementById(`inv-${nodeName}`);
+                    const invContainer = invEl.parentElement;
                     
                     if (lhs === rhs) {
                         invariantDebounce[nodeName] = 0;
                         invEl.innerText = `Pass (${lhs} = ${rhs})`;
                         invEl.className = "badge normal";
+                        invContainer.title = "Transient mismatches while requests are in flight may appear. Equality holds for finished requests.";
                     } else {
                         invariantDebounce[nodeName] = (invariantDebounce[nodeName] || 0) + 1;
                         if (invariantDebounce[nodeName] >= 2) {
-                            invEl.innerText = `Fail (${lhs} != ${rhs})`;
-                            invEl.className = "badge danger";
+                            if (nodeData.redis_ok === false) {
+                                invEl.innerText = `Warning (${lhs} != ${rhs})`;
+                                invEl.className = "badge warning";
+                                invContainer.title = "Redis outage: 503 responses are not in classification counters; mismatch expected";
+                            } else {
+                                invEl.innerText = `Fail (${lhs} != ${rhs})`;
+                                invEl.className = "badge danger";
+                                invContainer.title = "Transient mismatches while requests are in flight may appear. Equality holds for finished requests.";
+                            }
                         }
                     }
 
