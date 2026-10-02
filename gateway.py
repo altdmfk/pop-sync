@@ -41,8 +41,13 @@ PARTITION_SLEEP_SEC          = _float("PARTITION_SLEEP_SEC", 0.5)
 # Rate limiting
 RL_WINDOW_SEC                = _int("RL_WINDOW_SEC", 10)             # aligns with Retry-After header value
 RL_LIMIT                     = _int("RL_LIMIT", 50)                  # per-node; global ≈ RL_LIMIT × N_nodes
-RL_FALLBACK_LIMIT            = _int("RL_FALLBACK_LIMIT", 15)         # when Redis is down: 50 / 3 nodes ≈ 15
+RL_FALLBACK_LIMIT            = _int("RL_FALLBACK_LIMIT", 15)         # when Redis is down: per-node local sliding counter limit
 RL_LOCAL_MAX_KEYS            = _int("RL_LOCAL_MAX_KEYS", 10000)      # OOM guard for fallback dict
+# RL_ALGORITHM: "sliding" (default) or "fixed".
+# sliding = weighted-counter approximation: estimated = prev*(1 - elapsed/W) + curr
+# Max approx error: ±1 count (integer weight truncation). Not exact sliding log.
+# Node-clock limit: sub-second skew between nodes acceptable (skew << RL_WINDOW_SEC).
+RL_ALGORITHM                 = os.getenv("RL_ALGORITHM", "sliding").lower()
 
 # Nonce / L2 cache
 NONCE_TTL_SEC                = _int("NONCE_TTL_SEC", 60)             # replay window; must equal L2_CACHE_TTL_SEC
@@ -85,6 +90,7 @@ class DBOverloadError(Exception): pass
 redis_client = None
 stream_redis_client = None
 nonce_script = None
+rl_script    = None
 sync_http_client = None
 async_db_client = None
 
@@ -238,6 +244,24 @@ else
 end
 """
 
+# Lua sliding-window rate-limit script.
+# KEYS[1] = prev window key  "rl:{client_id}:{window-1}"
+# KEYS[2] = curr window key  "rl:{client_id}:{window}"
+# ARGV[1] = TTL seconds (integer)
+# ARGV[2] = weight*1000 (integer) = floor((1 - elapsed/W) * 1000)
+# Returns estimated count (integer). Caller compares to RL_LIMIT.
+# prev_key TTL is NOT reset here: it was set when that window was created
+# (by a prior INCR call) and will expire naturally. Resetting it here would
+# extend its lifetime by up to W seconds, causing stale counts.
+SLIDING_RL_LUA = """
+local prev = tonumber(redis.call('GET', KEYS[1])) or 0
+local curr = redis.call('INCR', KEYS[2])
+redis.call('EXPIRE', KEYS[2], ARGV[1])
+local weight = tonumber(ARGV[2])
+local estimated = math.floor(prev * weight / 1000) + curr
+return estimated
+"""
+
 local_rate_limits = {}
 local_rl_lock = asyncio.Lock()
 in_flight: dict[str, asyncio.Future] = {}
@@ -259,15 +283,70 @@ async def cleanup_local_rl():
                 del local_rate_limits[k]
 
 async def check_rate_limit(client_id: str) -> bool:
+    """Return True if request is within rate limit, False if it should be 429-ed.
+
+    Redis path (normal): uses RL_ALGORITHM ("sliding" or "fixed").
+    Local fallback path (Redis down): always uses sliding approximation with
+    RL_FALLBACK_LIMIT as the threshold.  Errors from this path are re-raised so
+    the caller can decide (currently: 503 for Redis failure, 429 for RL exceeded).
+    """
     now = int(time.time())
     window_key = now // RL_WINDOW_SEC
-    key = f"rl:{client_id}:{window_key}"
 
-    async with redis_client.pipeline(transaction=True) as pipe:
-        pipe.incr(key)
-        pipe.expire(key, RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER)
-        results = await pipe.execute()
-    return results[0] <= RL_LIMIT
+    try:
+        if RL_ALGORITHM == "sliding":
+            elapsed    = now % RL_WINDOW_SEC
+            weight     = int((1 - elapsed / RL_WINDOW_SEC) * 1000)  # 0..1000
+            prev_key   = f"rl:{client_id}:{window_key - 1}"
+            curr_key   = f"rl:{client_id}:{window_key}"
+            estimated  = await rl_script(
+                keys=[prev_key, curr_key],
+                args=[str(RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER), str(weight)],
+            )
+            return int(estimated) <= RL_LIMIT
+        else:  # "fixed"
+            key = f"rl:{client_id}:{window_key}"
+            async with redis_client.pipeline(transaction=True) as pipe:
+                pipe.incr(key)
+                pipe.expire(key, RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER)
+                results = await pipe.execute()
+            return results[0] <= RL_LIMIT
+
+    except Exception:
+        # Redis unavailable — fall back to per-node in-memory sliding counter.
+        # Note: subsequent nonce check (consume_nonce) also needs Redis and will
+        # return 503 for RL-passing requests. Fallback still provides meaningful
+        # 429 responses to clients that exceed RL_FALLBACK_LIMIT.
+        return _local_rate_limit(client_id, now, window_key)
+
+
+def _local_rate_limit(client_id: str, now: int, window_key: int) -> bool:
+    """In-memory sliding-window fallback used when Redis is unavailable.
+
+    Uses two integer buckets (prev/curr) per client.
+    Threshold: RL_FALLBACK_LIMIT (default 15, i.e. per-node).
+
+    Thread-safety: this is an await-free synchronous function called only from
+    check_rate_limit(), which runs exclusively on the asyncio event-loop thread.
+    dict reads and writes are therefore non-concurrent and require no additional lock.
+    """
+    # local_rate_limits maps key -> count.
+    # Key format: "{client_id}:{window_key}" (no "rl:" prefix to avoid confusion).
+    prev_key  = f"{client_id}:{window_key - 1}"
+    curr_key  = f"{client_id}:{window_key}"
+
+    # OOM guard: evict when too many keys accumulated.
+    if len(local_rate_limits) >= RL_LOCAL_MAX_KEYS:
+        local_rate_limits.clear()
+
+    prev_count = local_rate_limits.get(prev_key, 0)
+    curr_count = local_rate_limits.get(curr_key, 0) + 1
+    local_rate_limits[curr_key] = curr_count
+
+    elapsed   = now % RL_WINDOW_SEC
+    weight    = 1.0 - (elapsed / RL_WINDOW_SEC)
+    estimated = prev_count * weight + curr_count
+    return estimated <= RL_FALLBACK_LIMIT
 
 async def consume_nonce(nonce: str, ttl: int = NONCE_TTL_SEC, act: str = "read") -> bool:
     key = f"nonce:{nonce}"
@@ -453,11 +532,12 @@ async def stream_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, stream_redis_client, sync_http_client, async_db_client, db_semaphore, db_executor, nonce_script
+    global redis_client, stream_redis_client, sync_http_client, async_db_client, db_semaphore, db_executor, nonce_script, rl_script
     db_semaphore = asyncio.Semaphore(MAX_DB_WORKERS)
     db_executor = ThreadPoolExecutor(max_workers=MAX_DB_WORKERS)
     redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
     nonce_script = redis_client.register_script(NONCE_LUA)
+    rl_script    = redis_client.register_script(SLIDING_RL_LUA)
     stream_redis_client = Redis.from_url(redis_url, socket_timeout=STREAM_SOCKET_TIMEOUT)
     sync_http_client = httpx.Client(timeout=DB_TIMEOUT_SEC)
     async_db_client = httpx.AsyncClient(timeout=DB_TIMEOUT_SEC, limits=httpx.Limits(max_connections=MAX_DB_WORKERS))
@@ -636,7 +716,7 @@ async def get_metrics():
         snapshot = dict(stats)
     async with partition_lock:
         current_partitioned = is_partitioned
-    return {"node": node_name, "db_mode": DB_MODE, "singleflight_enabled": SINGLEFLIGHT_ENABLED, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
+    return {"node": node_name, "db_mode": DB_MODE, "singleflight_enabled": SINGLEFLIGHT_ENABLED, "rl_algorithm": RL_ALGORITHM, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
 
 probe_semaphore = asyncio.Semaphore(1)
 
@@ -670,7 +750,7 @@ async def set_partition(state: str):
 async def set_redis(state: str):
     if state not in ["up", "down"]:
         raise HTTPException(status_code=400, detail=f"Invalid redis state: {state}")
-    global redis_client, stream_redis_client, nonce_script
+    global redis_client, stream_redis_client, nonce_script, rl_script
     old_redis = redis_client
     old_stream = stream_redis_client
     
@@ -682,10 +762,12 @@ async def set_redis(state: str):
         new_stream = Redis.from_url(redis_url, socket_timeout=STREAM_SOCKET_TIMEOUT)
         
     new_nonce_script = new_redis.register_script(NONCE_LUA)
+    new_rl_script    = new_redis.register_script(SLIDING_RL_LUA)
     
     # Atomic swap
     async with redis_swap_lock:
         nonce_script = new_nonce_script
+        rl_script    = new_rl_script
         redis_client = new_redis
         stream_redis_client = new_stream
     
