@@ -75,3 +75,5 @@ desktop.ini
 
 # Docker compose local override
 docker-compose.override.yml
+# Backup files
+*.bak
