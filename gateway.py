@@ -335,6 +335,7 @@ async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future,
     except Exception as e:
         if not fut.done():
             fut.set_exception(e)
+            fut.exception() # Retrieve immediately to suppress 'never retrieved' warning
         if not isinstance(e, DBOverloadError):
             cb.record_failure()
     finally:

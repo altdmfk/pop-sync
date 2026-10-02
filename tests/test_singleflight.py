@@ -265,3 +265,33 @@ async def test_stats_invariants(mock_dependencies):
             stats["l1_double_check_hits"] + 
             stats["circuit_blocked"]
         )
+
+@pytest.mark.asyncio
+async def test_unretrieved_future_exception(mock_dependencies):
+    m_redis, m_db = mock_dependencies
+    class TestException(Exception): pass
+    async def failing_db_call(*args, **kwargs):
+        await asyncio.sleep(0.1)
+        raise TestException("DB Failed")
+    m_db.side_effect = failing_db_call
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {
+            "Authorization": "Bearer token",
+            "X-SPIFFE-ID": "spiffe://unretrieved",
+            "X-Nonce": "nonce-unretrieved"
+        }
+        
+        leader_task = asyncio.create_task(client.get("/auth", headers=headers))
+        await asyncio.sleep(0.02) # Let it start
+        leader_task.cancel() # Cancel leader
+        
+        try:
+            await leader_task
+        except asyncio.CancelledError:
+            pass
+            
+        # Wait for background db_loader_task to finish and set exception
+        await asyncio.sleep(0.15)
+        # Without fix, garbage collection will complain. We can't easily assert on gc warnings directly in pytest without specific fixtures, but running pytest -W error will fail if there is a warning.
