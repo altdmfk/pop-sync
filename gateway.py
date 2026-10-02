@@ -218,7 +218,9 @@ stats = {
     "nonce_replays": 0,
     "latency_sum": 0.0,
     "circuit_state": "CLOSED",
-    "sync_lag": 0
+    "sync_lag": 0,
+    "db_queries_executed": 0,
+    "singleflight_coalesced": 0
 }
 
 NONCE_LUA = """
@@ -235,6 +237,7 @@ end
 
 local_rate_limits = {}
 local_rl_lock = asyncio.Lock()
+in_flight: dict[str, asyncio.Future] = {}
 
 async def cleanup_local_rl():
     while True:
@@ -285,6 +288,51 @@ async def db_async_call(key: str, sid: str, res: str):
     resp = await async_db_client.get(f"{db_url}/policy/{key}", params={"sid": sid, "res": res}, timeout=DB_TIMEOUT_SEC)
     resp.raise_for_status()
     return resp.json()
+
+async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future):
+    try:
+        cached_policy = l1_cache.get(comp_key)
+        if cached_policy is not None:
+            if not fut.done():
+                fut.set_result({"status": "deny" if cached_policy == "DENY" else "allow", "source": "L1", "policy": cached_policy})
+            return
+
+        with stats_lock:
+            stats["db_queries_executed"] += 1
+
+        if DB_MODE == "async":
+            db_resp = await db_async_call(comp_key, sid, res)
+        else:
+            try:
+                await asyncio.wait_for(db_semaphore.acquire(), timeout=DB_SEMAPHORE_ACQUIRE_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
+            try:
+                loop = asyncio.get_running_loop()
+                db_resp = await loop.run_in_executor(db_executor, db_sync_call, comp_key, sid, res)
+            finally:
+                db_semaphore.release()
+                
+        cb.record_success()
+        
+        db_status = db_resp.get("status")
+        policy = "DENY" if db_status == "deny" else db_resp.get("role")
+            
+        l1_cache.set(comp_key, policy)
+        try:
+            await redis_client.set(f"policy:{comp_key}", policy, ex=L2_CACHE_TTL_SEC)
+        except Exception as e:
+            logging.warning(f"Failed to set L2 cache: {e}")
+            
+        if not fut.done():
+            fut.set_result({"status": "deny" if db_status == "deny" else "allow", "source": "DB", "policy": policy})
+    except Exception as e:
+        if not fut.done():
+            fut.set_exception(e)
+        if not isinstance(e, DBOverloadError):
+            cb.record_failure()
+    finally:
+        in_flight.pop(comp_key, None)
 
 async def stream_listener():
     try:
@@ -519,53 +567,43 @@ async def auth(
     except Exception as e:
         logging.warning(f"L2 cache fetch failed (Redis down?): {e}")
         
-    with stats_lock:
-        stats["db_fallbacks"] += 1
-    
+    fut = in_flight.get(comp_key)
+    if fut:
+        with stats_lock:
+            stats["singleflight_coalesced"] += 1
+            stats["db_fallbacks"] += 1
+        try:
+            return await asyncio.shield(fut)
+        except DBOverloadError as e:
+            return JSONResponse(status_code=503, content={"status": "error", "message": "Service Unavailable - DB Overload"})
+        except Exception as e:
+            with stats_lock:
+                stats["circuit_state"] = cb.state
+            return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"})
+
     can_exec, current_state = cb.can_execute()
     if not can_exec:
         with stats_lock:
             stats["circuit_state"] = current_state
+            stats["db_fallbacks"] += 1
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
+
+    fut = asyncio.get_running_loop().create_future()
+    in_flight[comp_key] = fut
+    
+    with stats_lock:
+        stats["db_fallbacks"] += 1
         
+    task = asyncio.create_task(db_loader_task(comp_key, x_spiffe_id, x_res, fut))
     try:
-        if DB_MODE == "async":
-            db_resp = await db_async_call(comp_key, x_spiffe_id, x_res)
-        else:
-            try:
-                await asyncio.wait_for(db_semaphore.acquire(), timeout=DB_SEMAPHORE_ACQUIRE_TIMEOUT)
-            except asyncio.TimeoutError:
-                raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
-            try:
-                loop = asyncio.get_running_loop()
-                db_resp = await loop.run_in_executor(db_executor, db_sync_call, comp_key, x_spiffe_id, x_res)
-            finally:
-                db_semaphore.release()
-        _, current_state = cb.record_success()
-        with stats_lock:
-            stats["circuit_state"] = current_state
-        
-        db_status = db_resp.get("status")
-        if db_status == "deny":
-            policy = "DENY"
-        else:
-            policy = db_resp.get("role")
-            
-        l1_cache.set(comp_key, policy)
-        try:
-            await redis_client.set(f"policy:{comp_key}", policy, ex=L2_CACHE_TTL_SEC)
-        except Exception as e:
-            logging.warning(f"Failed to set L2 cache: {e}")
-            
-        return {"status": "deny" if db_status == "deny" else "allow", "source": "DB", "policy": policy}
+        return await asyncio.shield(fut)
     except DBOverloadError as e:
         logging.warning(str(e))
         return JSONResponse(status_code=503, content={"status": "error", "message": "Service Unavailable - DB Overload"})
     except Exception as e:
         logging.warning(f"DB fallback failed: {e}")
-        _, current_state = cb.record_failure()
         with stats_lock:
-            stats["circuit_state"] = current_state
+            stats["circuit_state"] = cb.state
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"})
 
 @app.get("/health")
