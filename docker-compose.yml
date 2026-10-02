@@ -30,6 +30,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
+      - SINGLEFLIGHT_ENABLED=${SINGLEFLIGHT_ENABLED:-true}
     depends_on:
       redis:
         condition: service_healthy
@@ -50,6 +51,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
+      - SINGLEFLIGHT_ENABLED=${SINGLEFLIGHT_ENABLED:-true}
     depends_on:
       redis:
         condition: service_healthy
@@ -70,6 +72,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DB_URL=http://policy_db:8000
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
+      - SINGLEFLIGHT_ENABLED=${SINGLEFLIGHT_ENABLED:-true}
     depends_on:
       redis:
         condition: service_healthy
