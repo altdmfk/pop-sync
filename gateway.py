@@ -73,6 +73,7 @@ node_name = os.getenv("NODE_NAME", "Node-X")
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 db_url    = os.getenv("DB_URL",    "http://localhost:8000")
 DB_MODE   = os.getenv("DB_MODE",   "sync")  # "sync" or "async"
+SINGLEFLIGHT_ENABLED = os.getenv("SINGLEFLIGHT_ENABLED", "true").lower() == "true"
 
 STREAM_GROUP = f"gateway_group_{node_name}"
 
@@ -220,7 +221,9 @@ stats = {
     "circuit_state": "CLOSED",
     "sync_lag": 0,
     "db_queries_executed": 0,
-    "singleflight_coalesced": 0
+    "singleflight_coalesced": 0,
+    "circuit_blocked": 0,
+    "l1_double_check_hits": 0
 }
 
 NONCE_LUA = """
@@ -289,13 +292,16 @@ async def db_async_call(key: str, sid: str, res: str):
     resp.raise_for_status()
     return resp.json()
 
-async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future):
+async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future, use_singleflight: bool = True):
     try:
-        cached_policy = l1_cache.get(comp_key)
-        if cached_policy is not None:
-            if not fut.done():
-                fut.set_result({"status": "deny" if cached_policy == "DENY" else "allow", "source": "L1", "policy": cached_policy})
-            return
+        if use_singleflight:
+            cached_policy = l1_cache.get(comp_key)
+            if cached_policy is not None:
+                with stats_lock:
+                    stats["l1_double_check_hits"] += 1
+                if not fut.done():
+                    fut.set_result({"status": "deny" if cached_policy == "DENY" else "allow", "source": "L1", "policy": cached_policy})
+                return
 
         with stats_lock:
             stats["db_queries_executed"] += 1
@@ -567,34 +573,37 @@ async def auth(
     except Exception as e:
         logging.warning(f"L2 cache fetch failed (Redis down?): {e}")
         
-    fut = in_flight.get(comp_key)
-    if fut:
-        with stats_lock:
-            stats["singleflight_coalesced"] += 1
-            stats["db_fallbacks"] += 1
-        try:
-            return await asyncio.shield(fut)
-        except DBOverloadError as e:
-            return JSONResponse(status_code=503, content={"status": "error", "message": "Service Unavailable - DB Overload"})
-        except Exception as e:
+    if SINGLEFLIGHT_ENABLED:
+        fut = in_flight.get(comp_key)
+        if fut:
             with stats_lock:
-                stats["circuit_state"] = cb.state
-            return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"})
+                stats["singleflight_coalesced"] += 1
+                stats["db_fallbacks"] += 1
+            try:
+                return await asyncio.shield(fut)
+            except DBOverloadError as e:
+                return JSONResponse(status_code=503, content={"status": "error", "message": "Service Unavailable - DB Overload"})
+            except Exception as e:
+                with stats_lock:
+                    stats["circuit_state"] = cb.state
+                return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"})
 
     can_exec, current_state = cb.can_execute()
     if not can_exec:
         with stats_lock:
             stats["circuit_state"] = current_state
             stats["db_fallbacks"] += 1
+            stats["circuit_blocked"] += 1
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
 
     fut = asyncio.get_running_loop().create_future()
-    in_flight[comp_key] = fut
+    if SINGLEFLIGHT_ENABLED:
+        in_flight[comp_key] = fut
     
     with stats_lock:
         stats["db_fallbacks"] += 1
         
-    task = asyncio.create_task(db_loader_task(comp_key, x_spiffe_id, x_res, fut))
+    task = asyncio.create_task(db_loader_task(comp_key, x_spiffe_id, x_res, fut, use_singleflight=SINGLEFLIGHT_ENABLED))
     try:
         return await asyncio.shield(fut)
     except DBOverloadError as e:
@@ -626,7 +635,7 @@ async def get_metrics():
         snapshot = dict(stats)
     async with partition_lock:
         current_partitioned = is_partitioned
-    return {"node": node_name, "db_mode": DB_MODE, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
+    return {"node": node_name, "db_mode": DB_MODE, "singleflight_enabled": SINGLEFLIGHT_ENABLED, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
 
 probe_semaphore = asyncio.Semaphore(1)
 
