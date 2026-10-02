@@ -17,7 +17,7 @@ SINGLEFLIGHT_ENABLED가 활성화되어 있어, 캐시 미스로 인해 발생�
 네트워크 단절(파티션) 발생 시 지연됐던 Redis Stream의 대기 메시지(PEL)를 누락된 메시지부터 연속으로 긴급 적용한다. 최종 일관성(Eventual Consistency)을 보장한다.
 
 ### O(1) 데이터 리밋 & Nonce 리플레이 방어
-Redis Pipeline과 Lua 스크립트를 통해 가중 합산 근사치 기반의 슬라이딩 윈도우(또는 RL_ALGORITHM 토글을 통한 고정 윈도우) 방식 데이터 리밋을 구현했다. (경계 버스트 측정 결과: docs/benchmarks/rate-limit-sliding.md). Rate Limit은 노드당 한도가 아닌, 클라이언트 ID(SPIFFE ID) 단위의 클러스터 전역(Global) 한도를 갖는다.
+RL_ALGORITHM 토글을 통해 데이터 리밋 방식을 결정한다(기본값은 sliding). sliding 방식은 Lua 스크립트를 통한 가중 합산 근사치 기반으로 동작하며, fixed 방식은 Redis Pipeline을 사용한다. (경계 버스트 측정 결과: docs/benchmarks/rate-limit-sliding.md). Rate Limit은 노드당 한도가 아닌, 클라이언트 ID(SPIFFE ID) 단위의 클러스터 전역(Global) 한도를 갖는다.
 Lua 스크립트 기반 원자적 Nonce 소비로 DDoS와 리플레이 공격을 방어한다.
 
 ### PoP 검증 (Proof of Possession - Scope B)
@@ -30,7 +30,7 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
 본 게이트웨이는 클라이언트 식별과 Rate Limiting에 X-SPIFFE-ID HTTP 헤더를 의존한다.
 
 - **mTLS 위임**: mTLS 인증은 상위 L4/L7 리버스 프록시(Envoy 등)에서 처리된다고 가정한다. 프록시가 클라이언트 인증서를 검증하고 X-SPIFFE-ID 헤더를 주입하는 구조다.
-- **데모 스코프**: 프록시 계층 구현과 mTLS 인증서 파싱은 이 코드베이스에서 의도적으로 생략했다. 테스트 환경에는 단일 Demo Key만 등록되어 있다. 프록시가 Trust Boundary를 보장한다는 전제하에 분산 시스템 복원력에만 집중한다.
+- **데모 스코프**: 프록시 계층 구현과 mTLS 인증서 파싱은 본 게이트웨이에서는 구현하지 않으며 상위 프록시가 처리한다고 가정한다. 테스트 환경에는 단일 Demo Key만 등록되어 있다. 프록시가 Trust Boundary를 보장한다는 전제하에 분산 시스템 복원력에만 집중한다.
 
 ### fido2-pop-gateway 및 aegis-mesh 대비 변경 사항
 | 계승 / 변경 / 미이식 | 원본 구현체 | 현재 코드베이스 (Aegis-Sync) |
@@ -47,7 +47,7 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
 
 | 장애 유형 | 동작 |
 | --- | --- |
-| **Redis 다운** | 로컬 폴백이 429(Too Many Requests) 여부를 결정(측정치: 15/5, 15/5, 20/0 차단 발생 - 3회차 미재현). 그러나 이를 통과한 요청도 이어지는 Nonce 검사(Redis 의존)에서 503(Fail Closed)이 발생하므로, Redis 다운 시 /auth는 실질적으로 전체 503 실패로 귀결된다. |
+| **Redis 다운** | 로컬 폴백이 429(Too Many Requests) 여부를 결정한다(실측 결과 각 회차별 503 N건 / 429 M건: 1회차 15/5, 2회차 15/5, 3회차 20/0. 3회차 결과는 재현되지 않았으며 원인은 미상임). 그러나 이를 통과한 요청도 이어지는 Nonce 검사(Redis 의존)에서 503(Fail Closed)이 발생하므로, Redis 다운 시 /auth는 실질적으로 전체 503 실패로 귀결된다. |
 | **DB 다운** | 서킷 브레이커 OPEN 전환. L1/L2 캐시 히트는 정상 응답, 캐시 미스 시 degraded_allow 처리 |
 | **네트워크 파티션** | 노드 격리. 해소 시 Redis Stream PEL 긴급 적용으로 L1 캐시 오염 복원 |
 
@@ -68,7 +68,7 @@ Control Plane의 /chaos/* 엔드포인트는 X-Admin-Token 헤더로 보호된�
 `ash
 cp .env.example .env
 `
-2. .env 파일 내부의 ADMIN_SECRET_TOKEN 값을 원하는 토큰(기본 your-secure-token-here)으로 설정.
+2. .env 파일 내부의 ADMIN_SECRET_TOKEN 값을 설정한다. 단, 테스트 스크립트와 conftest 등은 기본적으로 super-secret-admin 토큰을 사용하므로 스크립트 구동 시에는 해당 값으로 설정해야 한다.
 3. 클러스터 빌드 및 구동:
 `ash
 docker-compose up -d --build

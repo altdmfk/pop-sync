@@ -109,10 +109,10 @@ edis_swap_lock을 걸고 스왑하지만, 인플라이트 트래픽은 글로벌
 ### 9. Sliding Window 전환 및 불확실성 검증 (해결)
 
 **결정 배경**
-기존 Fixed Window의 경계선(Boundary Burst) 문제를 완화하기 위해 Sliding Window Log 대신 성능을 고려한 Redis Pipeline 기반 가중 합산(Weighted) 슬라이딩 카운터 근사 알고리즘을 도입했다.
+기존 Fixed Window 방식에서는 경계 버스트가 구조상 가능하여 교체하였다. 성능을 고려하여 Sliding Window Log 대신 Redis Pipeline 기반 가중 합산(Weighted) 슬라이딩 카운터 근사 알고리즘을 도입했다.
 
 **검증 및 한계**
-Lua 스크립트를 실제 Redis에 주입하여 테스트한 결과 가중치 계산은 완벽히 동작했다 (docs/benchmarks/rate-limit-sliding.md 참조). 그러나 Redis 장애 시의 Fallback 검증(3회차)에서 503/429 차단 비율이 재현되지 않는 재현성(Reproducibility) 이슈가 발생하여, 이는 근사 알고리즘의 오차와 차단된 요청까지 누적 카운트되는 특성이 원인일 것으로 추정되었다.
+Lua 스크립트를 실제 Redis에 주입하여 테스트한 결과 가중치 계산은 완벽히 동작했다 (docs/benchmarks/rate-limit-sliding.md 참조). 그러나 Redis 장애 시의 Fallback 검증(3회차)에서 503/429 차단 비율이 재현되지 않는 재현성(Reproducibility) 이슈가 발생하여, 원인은 미상(unconfirmed)이다.
 
 ---
 
@@ -133,4 +133,4 @@ equests == rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_
 FIDO2 기반의 경량화된 ECDSA P-256 서명 검증(PoP)을 도입하면서, 서명 검증과 Nonce 검사의 순서 배치가 중요해졌다. 본 프로젝트에서는 클라이언트가 직접 생성(Client-generated)한 uuid 기반 Nonce를 사용하고 있다.
 
 **해결 방안**
-Nonce 검사 완료 **이후**에 서명을 검증하도록 로직을 배치했다. 공격자가 노출된 타인의 Nonce를 알아내더라도 서명을 위조할 수는 없으며, 검증에 실패하는 즉시 해당 Nonce가 소진(Burn)된다. 따라서 원천적인 차단(Crypto-DoS 완전 방어)은 불가능하지만, 동일한 노출 Nonce로 비용이 큰 서명 검증을 반복적으로 시도하는 공격을 효과적으로 제한할 수 있다.
+Nonce 검사 완료 **이후**에 서명을 검증하도록 로직을 배치했다. 공격자가 노출된 타인의 Nonce를 알아내더라도 서명을 위조할 수는 없으며, 검증에 실패하는 즉시 해당 Nonce가 소진(Burn)된다. 따라서 원천적인 차단(Crypto-DoS 완전 방어)은 불가능하지만, 공격자는 같은 nonce로 서명 검증을 반복할 수 없다.

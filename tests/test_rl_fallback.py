@@ -9,9 +9,8 @@ CONTROL_PLANE = "http://localhost:8080"
 async def test_rl_fallback():
     print("=== Rate Limit Fallback Test ===")
     
-    # Note: This test expects to be run in an environment where Redis is intentionally stopped
-    # (e.g. \docker stop aegis-sync-main-redis-1\).
-    # If run against a fully healthy cluster, it will hit the global Redis limit of 50.
+    # Note: This test runs with Redis UP in a normal environment, giving 200: 50, 429: 40.
+    # If you intentionally stop Redis (e.g. docker stop aegis-sync-main-redis-1), see the expectation note below.
     
     spiffe_id = f"spiffe://example.org/attacker-{uuid.uuid4()}"
     print(f"Target SPIFFE ID: {spiffe_id}")
@@ -41,10 +40,11 @@ async def test_rl_fallback():
                 status_codes[r.status_code] = status_codes.get(r.status_code, 0) + 1
                 
         print(f"Result Status Codes: {status_codes}")
-        # Expected if Redis is down:
-        # Node fallback limit is 15. 3 nodes * 15 = 45 requests should pass RL.
+        # Expected if Redis is UP: 200: 50, 429: 40 (Global limit of 50).
+        # Expected ONLY if Redis is intentionally DOWN:
+        # Node fallback limit is 15. 3 nodes * 15 = 45 requests pass RL.
         # Passing RL means they go to nonce check, which returns 503.
-        # The remaining 90 - 45 = 45 requests should return 429.
+        # The remaining 45 requests return 429.
 
 if __name__ == '__main__':
     asyncio.run(test_rl_fallback())
