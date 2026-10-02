@@ -98,3 +98,8 @@ pytest tests/test_singleflight.py tests/test_rate_limit.py tests/test_pop.py -v
 - **PoP 서명의 한계**: 검증 필드에 Timestamp, Body, Query, Host가 결합되지 않으며(Unbound fields), kid(Key-ID) 헤더 지원 및 하드웨어 Attestation 파싱 기능이 없다. 테스트에는 단일 Demo Key만 사용된다.
 - **PoP 테스트 구성**: PoP 기능(Toggle ON) 시나리오는 클라이언트가 실제로 서명을 생성해야 하므로 기존 	est_scenarios.py (서명 없이 전송) 환경과 분리되어 검증이 제한적이다.
 - **테스트 환경 제약**: 단위 테스트는 Redis/DB를 Mock으로 대체하며, 일부 기존 E2E 테스트(컨테이너명 하드코딩, Fixture 누락, pre-singleflight 비교 부재)가 실패하는 제약이 있다. 잘못된 "노드당 한도(per-node)" 주석 등은 현재 버전에서 수정되었다.
+
+## 대시보드 기능 및 측정
+- **불변성(Invariant) 패널**: 요청 수가 각 처리 단계(L1/L2 Hit, DB 폴백, Rate Limit, Nonce 재전송, PoP 검증 실패)의 합과 일치하는지 실시간으로 모니터링하여 시스템의 정합성을 검증합니다.
+- **단일 비행(Single-flight) 패널 및 측정 데모**: 동일한 키에 대한 동시 다발적인 요청이 유입될 때 백엔드 DB로 전달되는 쿼리 수를 최소화하는 과정을 시각화합니다. 대시보드의 'Same-key Burst' 버튼을 통해 50개의 중복 요청을 동시에 발송하고, 실제 DB 실행 쿼리 수와 병합(Coalesced)된 요청 수를 측정하여 비교할 수 있습니다.
+- **Config & DB Stats**: Rate-limit 알고리즘, PoP(Proof of Possession) 검증 활성화 여부 등 노드의 보안 설정을 확인할 수 있습니다.
