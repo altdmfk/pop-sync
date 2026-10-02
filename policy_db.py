@@ -29,7 +29,7 @@ async def get_policy(key: str, sid: str = "", res: str = ""):
         
     return {"status": "allow", "role": "admin"}
 
-# Hardcoded test public key (P-256)
+# Hardcoded test public key (P-256) - demo key only
 TEST_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEK/FZtF232TXMUVkVdwFY/kwB5ixL
 NDFx4B1gvVh9I0AfzjCRSGCkMWJT2xWt6HJkqbUN7wNGdVbQIj0HQFQczA==
