@@ -127,6 +127,51 @@ async def chaos_nonce():
         else: out.append(f"Status: {r.status_code} ({r.json()})")
     return {"nonce": nonce, "results": {target_nodes[0]: out[0], target_nodes[1]: out[1]}}
 
+
+@app.post("/chaos/same_key_burst")
+async def chaos_same_key_burst(node: str, count: int = 50):
+    if node not in GATEWAYS:
+        return JSONResponse(status_code=400, content={"detail": f"Unknown node {node}"})
+    
+    # Generate unique SPIFFE-ID
+    spiffe_id = f"spiffe://example.org/burst_{uuid.uuid4()}"
+    headers = {
+        "Authorization": "Aegis test_token",
+        "X-SPIFFE-ID": spiffe_id
+    }
+    
+    # Metrics before
+    try:
+        resp_before = await async_http_client.get(f"{GATEWAYS[node]}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        stats_before = resp_before.json().get("stats", {})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+    # Send requests
+    reqs = []
+    for _ in range(count):
+        h = headers.copy()
+        h["X-Nonce"] = str(uuid.uuid4())
+        reqs.append(async_http_client.get(f"{GATEWAYS[node]}/auth", headers=h))
+    
+    await asyncio.gather(*reqs, return_exceptions=True)
+    
+    # Metrics after
+    try:
+        resp_after = await async_http_client.get(f"{GATEWAYS[node]}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        stats_after = resp_after.json().get("stats", {})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+        
+    delta_db = stats_after.get("db_queries_executed", 0) - stats_before.get("db_queries_executed", 0)
+    delta_coal = stats_after.get("singleflight_coalesced", 0) - stats_before.get("singleflight_coalesced", 0)
+    
+    return {
+        "node": node,
+        "delta_db_queries_executed": delta_db,
+        "delta_singleflight_coalesced": delta_coal
+    }
+
 @app.post("/chaos/ddos")
 async def chaos_ddos():
     headers = {

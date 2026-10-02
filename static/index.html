@@ -302,7 +302,7 @@
                 <p class="control-desc">짧은 시간에 대량의 요청을 보내 시스템이 초과 요청을 즉각 차단하여 방어하는지 확인합니다.</p>
                 <details class="hint-details">
                     <summary>💡 예상 결과 및 원리 보기</summary>
-                    <div class="hint-content">10초 내 50개 초과 시 공격자의 트래픽이 100% 방어됩니다. (연속 클릭 시 10초 윈도우 한도가 꽉 차 있어 처음부터 방어될 수 있습니다)</div>
+                    <div class="hint-content">글로벌 클라이언트 제한(기본값 10초 윈도우당 50개, sliding-window 근사)에 따라 초과 트래픽이 방어됩니다.<br>참고: Redis 장애 시, 로컬 rate-limit 폴백 한도에 도달하기 전에 Nonce 검증 단계에서 /auth 요청이 실패할 수 있습니다. (연속 클릭 시 10초 윈도우 한도가 꽉 차 있어 처음부터 방어될 수 있습니다)</div>
                 </details>
                 <div class="btn-row">
                     <button onclick="runChaos('/chaos/ddos')">DDoS 시뮬레이션</button>
@@ -343,6 +343,15 @@
                     <button id="btn-redis-up" class="btn-heal" onclick="runChaos('/chaos/redis/up')">Redis 복구</button>
                 </div>
             </div>
+        
+            <div class="control-group">
+                <h4>6. Same-key Burst (Single-flight Test)</h4>
+                <p class="control-desc">동일한 키로 동시에 여러 요청이 들어올 때 백엔드 부하를 얼마나 줄이는지 확인합니다.</p>
+                <div class="btn-row">
+                    <button onclick="runSameKeyBurst('Node-A', 50)">Node-A에 Burst 50 발송</button>
+                </div>
+                <div id="burst-result" style="margin-top: 8px; font-size: 0.85rem; color: var(--normal);"></div>
+            </div>
         </div>
     </div>
 
@@ -355,6 +364,25 @@
             redis: false,
             partition: {}
         };
+
+        
+        async function runSameKeyBurst(node, n) {
+            try {
+                let token = getAdminToken();
+                let res = await fetch(`/chaos/same_key_burst?node=${node}&count=${n}`, {
+                    method: 'POST',
+                    headers: { 'X-Admin-Token': token }
+                });
+                if (res.status === 401) {
+                    showBanner("인증 실패: 잘못된 Admin Token입니다.", "danger");
+                    return;
+                }
+                const data = await res.json();
+                document.getElementById('burst-result').innerText = `[Burst 50] Δ DB Queries: ${data.delta_db_queries_executed}, Δ Coalesced: ${data.delta_singleflight_coalesced}`;
+            } catch(e) {
+                console.error(e);
+            }
+        }
 
         function logAction(readableMsg, rawJson) {
             const time = new Date().toISOString().substring(11,19);
@@ -628,8 +656,31 @@
                         <span class="badge normal" id="badge-${n}">Normal</span>
                     </div>
                     <div class="node-reason" id="reason-${n}">모든 기능이 정상적으로 트래픽을 처리하고 있습니다.</div>
+                    
                     <div class="metrics">
                         <div>RPS: <span class="metric-val" id="rps-${n}">0</span></div>
+                        <div>Lat: <span class="metric-val" id="lat-${n}">0</span>ms</div>
+                        <div>L1 Hit: <span class="metric-val" id="l1-${n}">0</span></div>
+                        <div>L2 Hit: <span class="metric-val" id="l2-${n}">0</span></div>
+                        <div style="grid-column: span 2;">Circuit: <span class="cb-val" id="cb-${n}">Closed</span></div>
+                    </div>
+                    <div title="Transient mismatches while requests are in flight may appear. Equality holds for finished requests." style="margin-top:8px; font-size: 0.8rem;">
+                        Invariant: <span class="badge normal" id="inv-${n}">Pass (0 = 0)</span>
+                    </div>
+                    <details style="margin-top: 8px;">
+                        <summary style="font-size: 0.8rem; color: var(--action);">Config & DB Stats</summary>
+                        <div class="metrics" style="margin-top: 4px;">
+                            <div style="grid-column: span 2;">Config: <span class="metric-val" id="cfg-rl-${n}">-</span> | <span class="metric-val" id="cfg-pop-${n}">-</span></div>
+                            <div style="grid-column: span 2;">SF Enabled: <span class="metric-val" id="sf-en-${n}">-</span> <a href="docs/benchmarks/singleflight-effect.md" target="_blank" style="color:var(--text-secondary); text-decoration:underline;">(docs)</a></div>
+                            <div>DB Exec: <span class="metric-val" id="db-exec-${n}">0</span></div>
+                            <div>Coalesced: <span class="metric-val" id="sf-coal-${n}">0</span></div>
+                            <div>Blocked: <span class="metric-val" id="cb-block-${n}">0</span></div>
+                            <div>L1 DblChk: <span class="metric-val" id="l1-dbl-${n}">0</span></div>
+                            <div>PoP Verif: <span class="metric-val" id="pop-ver-${n}">0</span></div>
+                            <div>PoP Rej: <span class="metric-val" id="pop-rej-${n}">0</span></div>
+                        </div>
+                    </details>
+
                         <div>Lat: <span class="metric-val" id="lat-${n}">0</span>ms</div>
                         <div>L1 Hit: <span class="metric-val" id="l1-${n}">0</span></div>
                         <div>L2 Hit: <span class="metric-val" id="l2-${n}">0</span></div>
@@ -641,6 +692,8 @@
         });
 
         let prevStats = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
+        let prevLat = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
+        let invariantDebounce = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
         let lastCatchup = { "Node-A": 0, "Node-B": 0, "Node-C": 0 };
 
         let evtSource = null;
@@ -725,12 +778,46 @@
                     }
                     
                     const currentReqs = stats.requests;
-                    document.getElementById(`rps-${nodeName}`).innerText = currentReqs - prevStats[nodeName];
+                    const deltaReqs = currentReqs - prevStats[nodeName];
+                    document.getElementById(`rps-${nodeName}`).innerText = deltaReqs;
                     prevStats[nodeName] = currentReqs;
+                    
+                    const currentLat = stats.latency_sum;
+                    const deltaLat = currentLat - (prevLat[nodeName] || 0);
+                    document.getElementById(`lat-${nodeName}`).innerText = deltaReqs > 0 ? (deltaLat / deltaReqs * 1000).toFixed(0) : 0;
+                    prevLat[nodeName] = currentLat;
+                    
                     
                     document.getElementById(`l1-${nodeName}`).innerText = stats.l1_hits;
                     document.getElementById(`l2-${nodeName}`).innerText = stats.l2_hits;
-                    document.getElementById(`lat-${nodeName}`).innerText = stats.requests > 0 ? (stats.latency_sum / stats.requests * 1000).toFixed(0) : 0;
+                    
+                    document.getElementById(`db-exec-${nodeName}`).innerText = stats.db_queries_executed;
+                    document.getElementById(`sf-coal-${nodeName}`).innerText = stats.singleflight_coalesced;
+                    document.getElementById(`cb-block-${nodeName}`).innerText = stats.circuit_blocked;
+                    document.getElementById(`l1-dbl-${nodeName}`).innerText = stats.l1_double_check_hits;
+                    document.getElementById(`pop-ver-${nodeName}`).innerText = stats.pop_verified;
+                    document.getElementById(`pop-rej-${nodeName}`).innerText = stats.pop_rejected;
+                    document.getElementById(`cfg-rl-${nodeName}`).innerText = nodeData.rl_algorithm;
+                    document.getElementById(`cfg-pop-${nodeName}`).innerText = nodeData.pop_verify_enabled ? "PoP: On" : "PoP: Off";
+                    document.getElementById(`sf-en-${nodeName}`).innerText = nodeData.singleflight_enabled;
+
+                    // Invariant badge
+                    const lhs = stats.requests;
+                    const rhs = (stats.rate_limited || 0) + (stats.nonce_replays || 0) + (stats.pop_rejected || 0) + (stats.l1_hits || 0) + (stats.l2_hits || 0) + (stats.db_fallbacks || 0);
+                    const invEl = document.getElementById(`inv-${nodeName}`);
+                    
+                    if (lhs === rhs) {
+                        invariantDebounce[nodeName] = 0;
+                        invEl.innerText = `Pass (${lhs} = ${rhs})`;
+                        invEl.className = "badge normal";
+                    } else {
+                        invariantDebounce[nodeName] = (invariantDebounce[nodeName] || 0) + 1;
+                        if (invariantDebounce[nodeName] >= 2) {
+                            invEl.innerText = `Fail (${lhs} != ${rhs})`;
+                            invEl.className = "badge danger";
+                        }
+                    }
+
                     
                     const cbEl = document.getElementById(`cb-${nodeName}`);
                     const cbLabel = cb === 'OPEN' ? 'Open' : (cb === 'HALF_OPEN' ? 'Half-Open' : 'Closed');
