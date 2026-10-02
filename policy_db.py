@@ -1,8 +1,10 @@
 import asyncio
 from fastapi import FastAPI, HTTPException
 
+import os
+
 CHAOS_DOWN_SLEEP_SEC = 2.0
-SIMULATED_DB_LATENCY_SEC = 0.02
+SIMULATED_DB_LATENCY_SEC = float(os.getenv("SIMULATED_DB_LATENCY_SEC", "0.02"))
 
 app = FastAPI()
 
