@@ -47,7 +47,7 @@ PARTITION_SLEEP_SEC          = _float("PARTITION_SLEEP_SEC", 0.5)
 
 # Rate limiting
 RL_WINDOW_SEC                = _int("RL_WINDOW_SEC", 10)             # aligns with Retry-After header value
-RL_LIMIT                     = _int("RL_LIMIT", 50)                  # per-node; global ≈ RL_LIMIT × N_nodes
+RL_LIMIT                     = _int("RL_LIMIT", 50)                  # global limit per client_id via Redis
 RL_FALLBACK_LIMIT            = _int("RL_FALLBACK_LIMIT", 15)         # when Redis is down: per-node local sliding counter limit
 RL_LOCAL_MAX_KEYS            = _int("RL_LOCAL_MAX_KEYS", 10000)      # OOM guard for fallback dict
 # RL_ALGORITHM: "sliding" (default) or "fixed".
@@ -343,7 +343,6 @@ def _local_rate_limit(client_id: str, now: int, window_key: int) -> bool:
     check_rate_limit(), which runs exclusively on the asyncio event-loop thread.
     dict reads and writes are therefore non-concurrent and require no additional lock.
     """
-    # local_rate_limits maps key -> count.
     # Key format: "{client_id}:{window_key}" (no "rl:" prefix to avoid confusion).
     prev_key  = f"{client_id}:{window_key - 1}"
     curr_key  = f"{client_id}:{window_key}"
@@ -889,7 +888,6 @@ async def set_redis(state: str):
     new_nonce_script = new_redis.register_script(NONCE_LUA)
     new_rl_script    = new_redis.register_script(SLIDING_RL_LUA)
     
-    # Atomic swap
     async with redis_swap_lock:
         nonce_script = new_nonce_script
         rl_script    = new_rl_script

@@ -8,21 +8,19 @@ CONTROL_PLANE = "http://localhost:8080"
 
 async def test_rl_fallback():
     print("=== Rate Limit Fallback Test ===")
-    # 1. Redis Down (Implicitly down in local standalone run)
-    print("Assuming Redis is down/unreachable...")
-    # time.sleep(2)
     
-    # 2. Generate random spiffe_id
+    # Note: This test expects to be run in an environment where Redis is intentionally stopped
+    # (e.g. \docker stop aegis-sync-main-redis-1\).
+    # If run against a fully healthy cluster, it will hit the global Redis limit of 50.
+    
     spiffe_id = f"spiffe://example.org/attacker-{uuid.uuid4()}"
     print(f"Target SPIFFE ID: {spiffe_id}")
     
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # We need to bypass nonce check fail-closed to test rate limit.
-        # But wait, rate limit check happens BEFORE nonce check!
-        # So even if nonce check fails with 503, rate limit will return 429 if limit exceeded.
+        # Rate limit check happens BEFORE nonce check.
+        # So even if nonce check fails with 503 (Fail closed), rate limit will return 429 if limit exceeded.
         
         tasks = []
-        # Send 30 requests to each node (total 90)
         for i in range(90):
             node = GATEWAYS[i % 3]
             headers = {
@@ -43,12 +41,10 @@ async def test_rl_fallback():
                 status_codes[r.status_code] = status_codes.get(r.status_code, 0) + 1
                 
         print(f"Result Status Codes: {status_codes}")
-        # Expected:
+        # Expected if Redis is down:
         # Node fallback limit is 15. 3 nodes * 15 = 45 requests should pass RL.
-        # Passing RL means they go to nonce check, which will return 503 (since Redis is down).
-        # The remaining 90 - 45 = 45 requests should return 429 (Rate limited).
-        
-    print("Restoring Redis...")
+        # Passing RL means they go to nonce check, which returns 503.
+        # The remaining 90 - 45 = 45 requests should return 429.
 
 if __name__ == '__main__':
     asyncio.run(test_rl_fallback())

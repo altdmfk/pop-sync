@@ -77,3 +77,5 @@ desktop.ini
 docker-compose.override.yml
 # Backup files
 *.bak
+
+.venv*/
