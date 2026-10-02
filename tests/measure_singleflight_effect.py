@@ -12,7 +12,7 @@ async def measure():
         spiffe_id = f"spiffe://example.org/effect-test-{uuid.uuid4()}"
         nonce_base = str(uuid.uuid4())
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             # 1. Get metrics before
             before = (await client.get(f"{NODE_A}/metrics", headers={"X-Admin-Token": ADMIN_TOKEN})).json()["stats"]
             
@@ -28,7 +28,7 @@ async def measure():
                 tasks.append(client.get(f"{NODE_A}/auth", headers=headers))
                 
             start_time = time.time()
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             total_duration = time.time() - start_time
             
             # 3. Get metrics after
@@ -46,16 +46,22 @@ async def measure():
             
             # Calculate latencies
             latencies = []
+            exceptions = 0
             for r in results:
-                # Approximate latency per request by parsing custom response or just using httpx elapsed
-                latencies.append(r.elapsed.total_seconds() * 1000)
+                if isinstance(r, Exception):
+                    exceptions += 1
+                else:
+                    latencies.append(r.elapsed.total_seconds() * 1000)
                 
-            latencies.sort()
-            p50 = latencies[int(len(latencies) * 0.50)]
-            p95 = latencies[int(len(latencies) * 0.95)]
-            max_lat = latencies[-1]
+            if latencies:
+                latencies.sort()
+                p50 = latencies[int(len(latencies) * 0.50)]
+                p95 = latencies[int(len(latencies) * 0.95)]
+                max_lat = latencies[-1]
+            else:
+                p50 = p95 = max_lat = 0.0
             
-            print(f"Total Duration: {total_duration*1000:.1f}ms")
+            print(f"Total Duration: {total_duration*1000:.1f}ms (Exceptions: {exceptions})")
             print(f"Latencies: p50={p50:.1f}ms, p95={p95:.1f}ms, max={max_lat:.1f}ms")
             
             print(f"Increments:")
