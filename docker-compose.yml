@@ -34,6 +34,7 @@ services:
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
       - SINGLEFLIGHT_ENABLED=${SINGLEFLIGHT_ENABLED:-true}
       - RL_ALGORITHM=${RL_ALGORITHM:-sliding}
+      - POP_VERIFY_ENABLED=${POP_VERIFY_ENABLED:-false}
     depends_on:
       redis:
         condition: service_healthy
@@ -56,6 +57,7 @@ services:
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
       - SINGLEFLIGHT_ENABLED=${SINGLEFLIGHT_ENABLED:-true}
       - RL_ALGORITHM=${RL_ALGORITHM:-sliding}
+      - POP_VERIFY_ENABLED=${POP_VERIFY_ENABLED:-false}
     depends_on:
       redis:
         condition: service_healthy
@@ -78,6 +80,7 @@ services:
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
       - SINGLEFLIGHT_ENABLED=${SINGLEFLIGHT_ENABLED:-true}
       - RL_ALGORITHM=${RL_ALGORITHM:-sliding}
+      - POP_VERIFY_ENABLED=${POP_VERIFY_ENABLED:-false}
     depends_on:
       redis:
         condition: service_healthy

@@ -5,6 +5,7 @@ import os
 import httpx
 import logging
 import threading
+import base64
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -13,6 +14,12 @@ from redis.asyncio import Redis
 import uvicorn
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -48,6 +55,10 @@ RL_LOCAL_MAX_KEYS            = _int("RL_LOCAL_MAX_KEYS", 10000)      # OOM guard
 # Max approx error: ±1 count (integer weight truncation). Not exact sliding log.
 # Node-clock limit: sub-second skew between nodes acceptable (skew << RL_WINDOW_SEC).
 RL_ALGORITHM                 = os.getenv("RL_ALGORITHM", "sliding").lower()
+
+# PoP (Proof of Possession)
+POP_VERIFY_ENABLED           = os.getenv("POP_VERIFY_ENABLED", "false").lower() == "true"
+POP_EXECUTOR_WORKERS         = _int("POP_EXECUTOR_WORKERS", 4)
 
 # Nonce / L2 cache
 NONCE_TTL_SEC                = _int("NONCE_TTL_SEC", 60)             # replay window; must equal L2_CACHE_TTL_SEC
@@ -223,6 +234,8 @@ stats = {
     "requests": 0,
     "rate_limited": 0,
     "nonce_replays": 0,
+    "pop_rejected": 0,
+    "pop_verified": 0,
     "latency_sum": 0.0,
     "circuit_state": "CLOSED",
     "sync_lag": 0,
@@ -532,9 +545,10 @@ async def stream_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, stream_redis_client, sync_http_client, async_db_client, db_semaphore, db_executor, nonce_script, rl_script
+    global redis_client, stream_redis_client, sync_http_client, async_db_client, db_semaphore, db_executor, nonce_script, rl_script, pop_executor
     db_semaphore = asyncio.Semaphore(MAX_DB_WORKERS)
     db_executor = ThreadPoolExecutor(max_workers=MAX_DB_WORKERS)
+    pop_executor = ThreadPoolExecutor(max_workers=POP_EXECUTOR_WORKERS)
     redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
     nonce_script = redis_client.register_script(NONCE_LUA)
     rl_script    = redis_client.register_script(SLIDING_RL_LUA)
@@ -600,13 +614,44 @@ async def measure_latency(request: Request, call_next):
             stats["latency_sum"] += duration
     return response
 
+def generate_canonical_payload(method: str, path: str, spiffe_id: str, nonce: str) -> bytes:
+    # Scope B: Simplified request digest ECDSA signature
+    # Omitting Host, Query, Timestamp, Body (since /auth is GET and uses single-use nonce)
+    canonical_str = f"{method.upper()}\n{path}\n{spiffe_id}\n{nonce}"
+    return canonical_str.encode("utf-8")
+
+def verify_pop_signature(public_key_pem: str, signature: bytes, canonical_payload: bytes) -> bool:
+    try:
+        public_key = load_pem_public_key(public_key_pem.encode("utf-8"))
+        if not isinstance(public_key, ec.EllipticCurvePublicKey):
+            return False
+            
+        if len(signature) == 64:
+            r = int.from_bytes(signature[:32], byteorder="big")
+            s = int.from_bytes(signature[32:], byteorder="big")
+            signature = encode_dss_signature(r, s)
+            
+        public_key.verify(
+            signature,
+            canonical_payload,
+            ec.ECDSA(hashes.SHA256())
+        )
+        return True
+    except (ValueError, TypeError, UnsupportedAlgorithm, InvalidSignature):
+        return False
+    except Exception as e:
+        logging.warning(f"Signature verify error: {e}")
+        return False
+
 @app.get("/auth")
 async def auth(
+    request: Request,
     authorization: str = Header(None),
     x_nonce: str = Header(None),
     x_spiffe_id: str = Header(None),
     x_res: str = Header("resource"),
-    x_act: str = Header("read")
+    x_act: str = Header("read"),
+    x_pop_signature: str = Header(None)
 ):
     if not authorization or not x_nonce or not x_spiffe_id:
         raise HTTPException(status_code=401, detail="Missing Headers")
@@ -631,6 +676,86 @@ async def auth(
         if isinstance(e, HTTPException): raise e
         logging.warning(f"Nonce check failed (Redis down?): {e}")
         raise HTTPException(status_code=503, detail="Service Unavailable - Nonce Check Failed")
+
+    if POP_VERIFY_ENABLED:
+        if not x_pop_signature:
+            with stats_lock:
+                stats["pop_rejected"] += 1
+            raise HTTPException(status_code=400, detail="Missing PoP Signature")
+
+        # Fetch pubkey from L1/L2/DB
+        pubkey_key = f"pubkey:{x_spiffe_id}"
+        pubkey_pem = l1_cache.get(pubkey_key)
+        
+        if not pubkey_pem:
+            try:
+                l2_val = await redis_client.get(f"policy:{pubkey_key}")
+                if l2_val:
+                    pubkey_pem = l2_val.decode()
+                    l1_cache.set(pubkey_key, pubkey_pem)
+            except Exception:
+                pass
+                
+        if not pubkey_pem:
+            try:
+                if DB_MODE == "async":
+                    resp = await async_db_client.get(f"{db_url}/pubkey", params={"sid": x_spiffe_id}, timeout=DB_TIMEOUT_SEC)
+                    resp.raise_for_status()
+                    pubkey_pem = resp.json().get("public_key")
+                else:
+                    async with db_semaphore:
+                        resp = await asyncio.get_running_loop().run_in_executor(db_executor, lambda: sync_http_client.get(f"{db_url}/pubkey", params={"sid": x_spiffe_id}, timeout=DB_TIMEOUT_SEC))
+                        resp.raise_for_status()
+                        pubkey_pem = resp.json().get("public_key")
+                if pubkey_pem:
+                    l1_cache.set(pubkey_key, pubkey_pem)
+                    try:
+                        await redis_client.setex(f"policy:{pubkey_key}", L2_CACHE_TTL_SEC, pubkey_pem)
+                    except Exception:
+                        pass
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    with stats_lock:
+                        stats["pop_rejected"] += 1
+                    raise HTTPException(status_code=401, detail="Unknown Key ID")
+            except Exception as e:
+                logging.warning(f"Failed to fetch pubkey: {e}")
+                # Fallback on DB fail is unsafe for PoP, but we reject
+                with stats_lock:
+                    stats["pop_rejected"] += 1
+                raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
+        
+        if not pubkey_pem:
+            with stats_lock:
+                stats["pop_rejected"] += 1
+            raise HTTPException(status_code=401, detail="Unknown Key ID")
+
+        import binascii
+        try:
+            padding_needed = (4 - len(x_pop_signature) % 4) % 4
+            signature_bytes = base64.urlsafe_b64decode(x_pop_signature + "=" * padding_needed)
+        except (binascii.Error, ValueError):
+            with stats_lock:
+                stats["pop_rejected"] += 1
+            raise HTTPException(status_code=401, detail="Invalid PoP Signature Encoding")
+
+        canonical_payload = generate_canonical_payload(request.method, request.url.path, x_spiffe_id, x_nonce)
+        
+        is_valid = await asyncio.get_running_loop().run_in_executor(
+            pop_executor,
+            verify_pop_signature,
+            pubkey_pem,
+            signature_bytes,
+            canonical_payload
+        )
+        
+        if not is_valid:
+            with stats_lock:
+                stats["pop_rejected"] += 1
+            raise HTTPException(status_code=401, detail="Invalid PoP Signature")
+            
+        with stats_lock:
+            stats["pop_verified"] += 1
 
     token = authorization.replace("Aegis ", "").replace("Bearer ", "")
     comp_key = generate_composite_key(x_spiffe_id, token, x_res, x_act)
@@ -716,7 +841,7 @@ async def get_metrics():
         snapshot = dict(stats)
     async with partition_lock:
         current_partitioned = is_partitioned
-    return {"node": node_name, "db_mode": DB_MODE, "singleflight_enabled": SINGLEFLIGHT_ENABLED, "rl_algorithm": RL_ALGORITHM, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
+    return {"node": node_name, "db_mode": DB_MODE, "singleflight_enabled": SINGLEFLIGHT_ENABLED, "rl_algorithm": RL_ALGORITHM, "pop_verify_enabled": POP_VERIFY_ENABLED, "stats": snapshot, "is_partitioned": current_partitioned, "redis_ok": redis_ok}
 
 probe_semaphore = asyncio.Semaphore(1)
 

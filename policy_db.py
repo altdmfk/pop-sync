@@ -29,6 +29,20 @@ async def get_policy(key: str, sid: str = "", res: str = ""):
         
     return {"status": "allow", "role": "admin"}
 
+# Hardcoded test public key (P-256)
+TEST_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEK/FZtF232TXMUVkVdwFY/kwB5ixL
+NDFx4B1gvVh9I0AfzjCRSGCkMWJT2xWt6HJkqbUN7wNGdVbQIj0HQFQczA==
+-----END PUBLIC KEY-----"""
+
+@app.get("/pubkey")
+async def get_pubkey(sid: str = ""):
+    if sid.endswith("/nokey"):
+        raise HTTPException(status_code=404, detail="Key not found")
+    # Simulate DB latency
+    await asyncio.sleep(SIMULATED_DB_LATENCY_SEC)
+    return {"public_key": TEST_PUBLIC_KEY}
+
 @app.post("/chaos/db/{state}")
 async def set_db_state(state: str):
     global is_down
