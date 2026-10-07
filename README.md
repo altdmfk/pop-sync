@@ -1,4 +1,4 @@
-# Aegis-Sync
+# PoP-Sync
 
 네트워크 파티션, Redis 장애, 대규모 DDoS 상황에서 분산 게이트웨이의 복원력(Resilience)을 실시간으로 시연하는 카오스 엔지니어링 데모다.
 
@@ -32,8 +32,8 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
 - **mTLS 위임**: mTLS 인증은 상위 L4/L7 리버스 프록시(Envoy 등)에서 처리된다고 가정한다. 프록시가 클라이언트 인증서를 검증하고 X-SPIFFE-ID 헤더를 주입하는 구조다.
 - **데모 스코프**: 프록시 계층 구현과 mTLS 인증서 파싱은 본 게이트웨이에서는 구현하지 않으며 상위 프록시가 처리한다고 가정한다. 테스트 환경에는 단일 Demo Key만 등록되어 있다. 프록시가 Trust Boundary를 보장한다는 전제하에 분산 시스템 복원력에만 집중한다.
 
-### fido2-pop-gateway 및 aegis-mesh 대비 변경 사항
-| 계승 / 변경 / 미이식 | 원본 구현체 | 현재 코드베이스 (Aegis-Sync) |
+### fido2-pop-gateway 및 pop-mesh 대비 변경 사항
+| 계승 / 변경 / 미이식 | 원본 구현체 | 현재 코드베이스 (PoP-Sync) |
 | --- | --- | --- |
 | **언어/프레임워크** | Java / Reactor | Python / FastAPI |
 | **인메모리 캐시** | Caffeine | OrderedDict LRU (지연 만료, Lazy expiry) |
