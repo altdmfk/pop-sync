@@ -33,6 +33,9 @@ POLICY_DB = os.getenv("POLICY_DB", "http://policy_db:8000")
 
 async_http_client: Optional[httpx.AsyncClient] = None
 index_html_cache: Optional[str] = None
+subscribers: set[asyncio.Queue] = set()
+metrics_poller_task: Optional[asyncio.Task] = None
+latest_metrics_snapshot: Optional[dict] = None
 
 def get_async_http_client() -> httpx.AsyncClient:
     global async_http_client
@@ -43,9 +46,37 @@ def get_async_http_client() -> httpx.AsyncClient:
         )
     return async_http_client
 
+async def broadcast_metrics_loop():
+    global latest_metrics_snapshot
+    while True:
+        try:
+            metrics = await fetch_metrics()
+            latest_metrics_snapshot = metrics
+            payload = json.dumps(metrics)
+            for q in list(subscribers):
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                try:
+                    q.put_nowait(payload)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.warning(f"Error in metrics poller loop: {e}")
+        await asyncio.sleep(METRICS_STREAM_SLEEP_SEC)
+
+def ensure_poller_running():
+    global metrics_poller_task
+    if metrics_poller_task is None or metrics_poller_task.done():
+        metrics_poller_task = asyncio.create_task(broadcast_metrics_loop())
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global async_http_client, index_html_cache
+    global async_http_client, index_html_cache, metrics_poller_task
     async_http_client = httpx.AsyncClient(
         timeout=HTTP_TIMEOUT_SEC,
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
@@ -59,7 +90,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logging.error(f"Failed to load index.html: {e}")
 
+    ensure_poller_running()
     yield
+    if metrics_poller_task and not metrics_poller_task.done():
+        metrics_poller_task.cancel()
+        try:
+            await metrics_poller_task
+        except asyncio.CancelledError:
+            pass
     if async_http_client is not None and not async_http_client.is_closed:
         await async_http_client.aclose()
 
@@ -109,12 +147,28 @@ async def fetch_metrics():
     return results
 
 @app.get("/metrics/stream")
-async def metrics_stream():
+async def metrics_stream(request: Request):
+    ensure_poller_running()
+    q: asyncio.Queue = asyncio.Queue(maxsize=10)
+    if latest_metrics_snapshot is not None:
+        q.put_nowait(json.dumps(latest_metrics_snapshot))
+    subscribers.add(q)
+
     async def event_generator():
-        while True:
-            metrics = await fetch_metrics()
-            yield {"data": json.dumps(metrics)}
-            await asyncio.sleep(METRICS_STREAM_SLEEP_SEC)
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=METRICS_STREAM_SLEEP_SEC)
+                    yield {"data": data}
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            pass
+        finally:
+            subscribers.discard(q)
+
     return EventSourceResponse(event_generator())
 
 @app.post("/chaos/nonce")
