@@ -1,17 +1,21 @@
-import random
+import asyncio
+import hmac
 import json
 import logging
+import os
+import random
+from typing import Optional
+import uuid
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from sse_starlette.sse import EventSourceResponse
 import httpx
-import asyncio
-import os
+from sse_starlette.sse import EventSourceResponse
+
 ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN")
 if not ADMIN_SECRET_TOKEN:
     raise RuntimeError("ADMIN_SECRET_TOKEN environment variable is required")
-import uuid
-from contextlib import asynccontextmanager
 
 HTTP_TIMEOUT_SEC = 5.0
 METRICS_STREAM_SLEEP_SEC = 1.0
@@ -27,14 +31,26 @@ GATEWAYS = {
 }
 POLICY_DB = os.getenv("POLICY_DB", "http://policy_db:8000")
 
-async_http_client = None
-index_html_cache = None
+async_http_client: Optional[httpx.AsyncClient] = None
+index_html_cache: Optional[str] = None
+
+def get_async_http_client() -> httpx.AsyncClient:
+    global async_http_client
+    if async_http_client is None or (isinstance(async_http_client, httpx.AsyncClient) and async_http_client.is_closed):
+        async_http_client = httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT_SEC,
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+        )
+    return async_http_client
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global async_http_client, index_html_cache
-    async_http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC)
-    
+    async_http_client = httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT_SEC,
+        limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+    )
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(base_dir, "static", "index.html")
     try:
@@ -42,9 +58,10 @@ async def lifespan(app: FastAPI):
             index_html_cache = f.read()
     except Exception as e:
         logging.error(f"Failed to load index.html: {e}")
-        
+
     yield
-    await async_http_client.aclose()
+    if async_http_client is not None and not async_http_client.is_closed:
+        await async_http_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -52,11 +69,13 @@ app = FastAPI(lifespan=lifespan)
 async def admin_auth_middleware(request: Request, call_next):
     path = request.url.path
     if path.startswith("/chaos/") and path != "/chaos/auth_check":
-        if request.headers.get("X-Admin-Token") != ADMIN_SECRET_TOKEN:
+        admin_token = request.headers.get("X-Admin-Token")
+        # Constant-time comparison to prevent timing attacks
+        if not admin_token or not hmac.compare_digest(admin_token, ADMIN_SECRET_TOKEN):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
     elif path == "/metrics/stream":
         token = request.query_params.get("token") or request.headers.get("X-Admin-Token")
-        if token != ADMIN_SECRET_TOKEN:
+        if not token or not hmac.compare_digest(token, ADMIN_SECRET_TOKEN):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
     return await call_next(request)
 
@@ -74,12 +93,12 @@ async def get_index():
 async def auth_check():
     return {"status": "ok"}
 
-
 async def fetch_metrics():
+    client = get_async_http_client()
     results = {}
     for name, url in GATEWAYS.items():
         try:
-            resp = await async_http_client.get(
+            resp = await client.get(
                 f"{url}/metrics",
                 headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}
             )
@@ -110,62 +129,60 @@ async def chaos_nonce():
 
     metrics = await fetch_metrics()
     available_nodes = [name for name, data in metrics.items() if data.get('status') != 'offline' and not data.get('is_partitioned')]
-    
+
     if len(available_nodes) < 2:
         return {"nonce": nonce, "results": {}, "error": "Not enough available nodes (min 2) for parallel test."}
 
     target_nodes = available_nodes[:2]
-
+    client = get_async_http_client()
     reqs = [
-        async_http_client.get(f"{GATEWAYS[target_nodes[0]]}/auth", headers=headers),
-        async_http_client.get(f"{GATEWAYS[target_nodes[1]]}/auth", headers=headers)
+        client.get(f"{GATEWAYS[target_nodes[0]]}/auth", headers=headers),
+        client.get(f"{GATEWAYS[target_nodes[1]]}/auth", headers=headers)
     ]
     resps = await asyncio.gather(*reqs, return_exceptions=True)
     out = []
     for r in resps:
-        if isinstance(r, Exception): out.append("Error/Timeout")
-        else: out.append(f"Status: {r.status_code} ({r.json()})")
+        if isinstance(r, Exception):
+            out.append("Error/Timeout")
+        else:
+            out.append(f"Status: {r.status_code} ({r.json()})")
     return {"nonce": nonce, "results": {target_nodes[0]: out[0], target_nodes[1]: out[1]}}
-
 
 @app.post("/chaos/same_key_burst")
 async def chaos_same_key_burst(node: str, count: int = 50):
     if node not in GATEWAYS:
         return JSONResponse(status_code=400, content={"detail": f"Unknown node {node}"})
-    
-    # Generate unique SPIFFE-ID
+
+    client = get_async_http_client()
     spiffe_id = f"spiffe://example.org/burst_{uuid.uuid4()}"
     headers = {
         "Authorization": "Aegis test_token",
         "X-SPIFFE-ID": spiffe_id
     }
-    
-    # Metrics before
+
     try:
-        resp_before = await async_http_client.get(f"{GATEWAYS[node]}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        resp_before = await client.get(f"{GATEWAYS[node]}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         stats_before = resp_before.json().get("stats", {})
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
-    # Send requests
     reqs = []
     for _ in range(count):
         h = headers.copy()
         h["X-Nonce"] = str(uuid.uuid4())
-        reqs.append(async_http_client.get(f"{GATEWAYS[node]}/auth", headers=h))
-    
+        reqs.append(client.get(f"{GATEWAYS[node]}/auth", headers=h))
+
     await asyncio.gather(*reqs, return_exceptions=True)
-    
-    # Metrics after
+
     try:
-        resp_after = await async_http_client.get(f"{GATEWAYS[node]}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        resp_after = await client.get(f"{GATEWAYS[node]}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         stats_after = resp_after.json().get("stats", {})
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
-        
+
     delta_db = stats_after.get("db_queries_executed", 0) - stats_before.get("db_queries_executed", 0)
     delta_coal = stats_after.get("singleflight_coalesced", 0) - stats_before.get("singleflight_coalesced", 0)
-    
+
     return {
         "node": node,
         "delta_db_queries_executed": delta_db,
@@ -183,13 +200,14 @@ async def chaos_ddos():
     if not available_nodes:
         available_nodes = list(GATEWAYS.keys())
 
+    client = get_async_http_client()
     reqs = []
-    for i in range(DDOS_REQUEST_COUNT):
+    for _ in range(DDOS_REQUEST_COUNT):
         h = headers.copy()
         h["X-Nonce"] = str(uuid.uuid4())
         target_node = random.choice(available_nodes)
-        reqs.append(async_http_client.get(f"{GATEWAYS[target_node]}/auth", headers=h))
-    
+        reqs.append(client.get(f"{GATEWAYS[target_node]}/auth", headers=h))
+
     resps = await asyncio.gather(*reqs, return_exceptions=True)
     codes = {}
     for r in resps:
@@ -203,8 +221,9 @@ async def chaos_ddos():
 async def chaos_partition(node: str, state: str):
     if node not in GATEWAYS:
         return JSONResponse(status_code=400, content={"detail": f"Unknown node {node}"})
+    client = get_async_http_client()
     try:
-        resp = await async_http_client.post(f"{GATEWAYS[node]}/chaos/partition/{state}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        resp = await client.post(f"{GATEWAYS[node]}/chaos/partition/{state}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         resp.raise_for_status()
         return {"node": node, "state": state}
     except Exception as e:
@@ -213,9 +232,11 @@ async def chaos_partition(node: str, state: str):
 
 @app.post("/chaos/redis/{state}")
 async def chaos_redis(state: str):
-    reqs = []
-    for url in GATEWAYS.values():
-        reqs.append(async_http_client.post(f"{url}/chaos/redis/{state}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}))
+    client = get_async_http_client()
+    reqs = [
+        client.post(f"{url}/chaos/redis/{state}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        for url in GATEWAYS.values()
+    ]
     await asyncio.gather(*reqs, return_exceptions=True)
     return {"redis_cluster": state}
 
@@ -224,14 +245,15 @@ async def chaos_invalidate():
     test_key = TEST_INVALIDATE_KEY
     metrics = await fetch_metrics()
     available_nodes = [name for name, data in metrics.items() if data.get('status') != 'offline' and not data.get('is_partitioned')]
-    
+
     if not available_nodes:
         return JSONResponse(status_code=500, content={"detail": "No available nodes"})
-        
+
     target_node = random.choice(available_nodes)
-    
+    client = get_async_http_client()
+
     try:
-        resp = await async_http_client.post(f"{GATEWAYS[target_node]}/chaos/invalidate/{test_key}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        resp = await client.post(f"{GATEWAYS[target_node]}/chaos/invalidate/{test_key}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         resp.raise_for_status()
         return {"status": "invalidated", "node": target_node}
     except Exception as e:
@@ -241,8 +263,9 @@ async def chaos_invalidate():
 async def chaos_db(state: str):
     if state not in ["up", "down"]:
         return JSONResponse(status_code=400, content={"detail": f"Invalid db state: {state}"})
+    client = get_async_http_client()
     try:
-        resp = await async_http_client.post(
+        resp = await client.post(
             f"{POLICY_DB}/chaos/db/{state}",
             headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}
         )
@@ -252,26 +275,22 @@ async def chaos_db(state: str):
         return JSONResponse(status_code=500, content={"detail": f"Failed to change DB state: {e}"})
 
     results = {}
-    if state == "up":
-        tasks = [async_http_client.post(f"{url}/chaos/cb/force/CLOSED", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
-        resps = await asyncio.gather(*tasks, return_exceptions=True)
-        for name, r in zip(GATEWAYS.keys(), resps):
-            if isinstance(r, Exception) or (hasattr(r, "status_code") and r.status_code >= 400):
-                logging.warning(f"Failed to force CLOSED on {name}: {r}")
-                results[name] = "failed"
-            else:
-                results[name] = "success"
-    elif state == "down":
-        tasks = [async_http_client.post(f"{url}/chaos/cb/force/OPEN", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}) for url in GATEWAYS.values()]
-        resps = await asyncio.gather(*tasks, return_exceptions=True)
-        for name, r in zip(GATEWAYS.keys(), resps):
-            if isinstance(r, Exception) or (hasattr(r, "status_code") and r.status_code >= 400):
-                logging.warning(f"Failed to force OPEN on {name}: {r}")
-                results[name] = "failed"
-            else:
-                results[name] = "success"
+    target_state = "CLOSED" if state == "up" else "OPEN"
+    tasks = [
+        client.post(f"{url}/chaos/cb/force/{target_state}", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
+        for url in GATEWAYS.values()
+    ]
+    resps = await asyncio.gather(*tasks, return_exceptions=True)
+    for name, r in zip(GATEWAYS.keys(), resps):
+        if isinstance(r, Exception) or (hasattr(r, "status_code") and r.status_code >= 400):
+            logging.warning(f"Failed to force {target_state} on {name}: {r}")
+            results[name] = "failed"
+        else:
+            results[name] = "success"
+
     return {"db_state": state, "results": results}
 
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run("control_plane:app", host='0.0.0.0', port=8080)
+
