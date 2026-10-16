@@ -1,136 +1,87 @@
-## 아키텍처 설계 및 문제 해결 로그 (Development Log)
+# 아키텍처 설계 및 문제 해결 기록 (Development Log)
 
-극단적인 스트레스 테스트를 통해 발견한 설계 병목과 그 해결 과정을 기록한다.
-
----
-
-### 1. Control Plane 커넥션 풀 고갈로 인한 전체 병목 (결정 보류)
-
-**현상**  
-DDoS 시나리오를 반복 실행했을 때 부하를 받는 Gateway 자체는 매우 안정적이었다 (CPU 0.28%, 메모리 51.6MB 이하, 에러 없음). 문제는 부하 발생기 역할을 하는 `control_plane.py`의 `httpx.AsyncClient` 커넥션 풀(기본 100개 제한)이 고갈되면서, 1,200개의 비동기 요청을 모두 보내는 데 27초가 걸리고 전체 타임아웃 에러가 발생한 것이었다.
-
-**결론**  
-실제 프로덕션 서버(Gateway)의 문제가 아닌, 부하 발생 도구(Control Plane)의 설계 한계였다. 현재 데모 규모에 적합한 수준이므로 결정을 보류한다.
+분산 환경 부하 및 카오스 테스트 과정에서 식별된 병목, 결함, 리팩토링 내역을 기록한다.
 
 ---
 
-### 2. 비동기 I/O 오프로딩에서 발생한 연쇄 장애 및 Flapping 현상 (해결)
+## 1. 초기 아키텍처 결함 수정 내역
 
-**현상**  
-1. DB가 죽어 있는 동안 서킷 브레이커가 열리기 직전에 대량의 요청이 유입되면, Gateway는 DB 통신을 위해 `asyncio.to_thread`를 통해 Python 기본 스레드 풀로 작업을 내린다.
-2. 스레드 풀이 고갈되면 이미 들어간 스레드들은 DB 타임아웃(1초)을 기다리느라 막히고, 응답 지연(Latency)이 치솟는 연쇄 병목이 생긴다.
-3. 이후 DB를 복구(`UP`)해서 서킷 브레이커를 `CLOSED`로 되돌려도, 스레드 풀에 갇혀 있던 과거의 지연된 요청들이 뒤늦게 타임아웃 실패 신호를 보내면서 서킷이 즉시 다시 `OPEN` 상태로 내려앉는다. 이 때문에 `OPEN` <-> `CLOSED` 사이를 오락가락하는 **Flapping** 현상이 발생했다.
+### 1.1 DB 장애 복구 직후 서킷 브레이커 플래핑 (Flapping)
+- **현상**: DB 장애 시 스레드 풀에 진입한 요청들이 DB 타임아웃(1.0s) 동안 누적 대기. DB 복구 후 서킷 브레이커를 `CLOSED`로 전환해도, 스레드 풀에서 지연 처리된 이전 요청들이 뒤늦게 타임아웃 실패를 반환하여 서킷 브레이커가 즉시 다시 `OPEN`되는 플래핑 발생.
+- **수정**: 상태 전이 직후 지정 시간 동안 실패 집계를 무시하는 2.0s 디바운스(`CB_DEBOUNCE_SEC`) 적용. `DB_TIMEOUT_SEC`(1.0s) 및 컨텍스트 스위칭 시간을 상회하는 마진 확보.
 
-**해결 방안**  
-서킷 브레이커 로직에 **2.0초의 디바운스(Debounce)**를 도입했다. 상태 전환 직후 일정 시간 동안 들어오는 과거의 지연된 실패 신호를 무시한다. 디바운스 시간을 2.0초로 설정한 이유는 `DB_TIMEOUT_SEC`가 1.0초이므로, 스레드 풀에 갇혀 있던 과거 요청들이 모두 타임아웃 처리되어 실패를 반환하기까지 걸리는 물리적 시간(1.0초 + 컨텍스트 스위칭 오버헤드)을 넉넉히 덮을 수 있는 안전 마진을 확보하기 위함이다. 또한 `force_state()` 메서드도 강제 주입 시 논리적 모순이 없도록 개선했다.
+### 1.2 복합 캐시 키 해시 충돌 위험
+- **현상**: SPIFFE ID, 토큰, 리소스, 액션 문자열을 단순 결합할 경우 경계 문자열 구성에 따른 SHA-256 해시 충돌 위험 존재.
+- **수정**: `generate_composite_key`에 길이 접두사 포맷(`len:value`) 적용. 해시 충돌 원인 제거.
 
----
+### 1.3 비원자적 상태 스왑 및 관측 부작용
+- **현상**: `is_partitioned` 상태 플래그에 락이 없어 동시 읽기/쓰기 시 레이스 컨디션 발생. Redis 클라이언트 교체 시 관련 참조 객체들이 비원자적으로 갱신됨. `/metrics` 조회 시 `check_and_half_open()`을 호출하여 관측 행위가 서킷 브레이커 상태를 변이시키는 부작용 존재.
+- **수정**: `partition_lock` 및 `redis_swap_lock`(`asyncio.Lock`) 적용. `/metrics` 경로에서 상태 전이 호출 제거하고 현재 상태만 읽도록 수정.
 
-### 3. 해시 충돌 방지 및 보안 강화 (해결)
+### 1.4 Policy DB Deny 응답 인가 우회
+- **현상**: Policy DB가 `{"status": "deny"}`를 반환해도 `role` 필드만 참조하여 `allow`로 응답. 해당 결과가 L1/L2 캐시에 적재되어 후속 인가 검증이 무력화됨.
+- **수정**: DB 응답의 `status` 필드를 검증하여 `deny`일 경우 캐시에 `"DENY"` 적재 및 200 `status: "deny"` 반환.
 
-**현상**  
-여러 문자열 필드(ID, 세션 키 등)를 이어 붙여 SHA-256 해시를 만들 때, 단순 문자열 연결만 쓰면 해시 충돌이 발생할 수 있었다. 또한 관리자 인증 토큰이 HTML에 노출되는 문제가 있었다.
+### 1.5 파티션 복구 시 DB 헬스 체크 프로브 세마포어 우회
+- **현상**: 파티션 해소 시 호출되는 `probe_db_health()`가 `db_semaphore`를 거치지 않아 동시 호출 시 동시성 제한(`MAX_DB_WORKERS`) 초과 가능.
+- **수정**: `probe_semaphore = asyncio.Semaphore(1)` 적용. 단일 프로브만 실행되도록 제한.
 
-**해결 방안**  
-길이 접두사 방식(`len:value`)을 도입해 해시 충돌을 원천 차단했다. HTML 하드코딩 토큰은 제거하고 `sessionStorage` 저장과 Pre-flight API 체크를 도입해 프론트엔드 보안을 강화했다. 카오스 엔드포인트에도 파라미터 유효성 검증을 추가하고 `.env` 기반 설정 중앙화를 적용했다.
+### 1.6 Redis 핫스왑 시 인플라이트 커넥션 중단
+- **현상**: 카오스 테스트로 Redis 클라이언트 교체 시 기존 클라이언트를 즉시 `close()`하여 처리 중인 요청에서 500 에러 발생.
+- **수정**: 교체된 이전 클라이언트를 백그라운드 태스크에서 2.0s 대기 후 닫는 지연 종료(Graceful Drain) 적용.
 
----
+### 1.7 슬라이딩 윈도우 유량 제한 도입
+- **현상**: 고정 윈도우(Fixed Window) 방식에서 윈도우 경계 시점에 허용량의 2배 트래픽이 통과하는 경계 버스트 현상 관측.
+- **수정**: Lua 스크립트 기반 가중 합산 슬라이딩 카운터 근사 알고리즘 적용. 직전 윈도우 잔여 가중치를 반영하여 경계 스파이크 억제.
 
-### 4. 동시성 버그 수정 및 안정성 강화 (해결)
-
-**현상**  
-`is_partitioned` 전역 변수가 Lock 없이 여러 코루틴에서 동시에 읽히고 쓰였다. Redis 클라이언트 교체 시에도 `nonce_script`, `redis_client`, `stream_redis_client` 세 변수를 순차 재할당하는 비원자적 스왑이 존재했다. `/metrics` 조회가 서킷 브레이커 상태를 `HALF_OPEN`으로 전환하는 의도치 않은 부작용도 있었다.
-
-**해결 방안**  
-- `partition_lock = asyncio.Lock()`을 도입해 파티션 상태 읽기/쓰기를 모두 보호했다.
-- `redis_swap_lock = asyncio.Lock()`을 도입해 Redis 클라이언트 교체를 원자적으로 처리했다.
-- `/metrics`에서 `cb.check_and_half_open()` 호출을 제거하고 `cb._lock`으로 상태를 직접 읽는 방식으로 교체했다. 관측이 상태를 바꾸는 부작용을 없앴다.
-
----
-
-### 5. Deny 정책 인가 우회 버그 수정 (해결)
-
-**현상**  
-`policy_db`가 `{"status": "deny"}`를 반환해도, Gateway가 `status` 필드를 확인하지 않고 `role` 값만 추출한 뒤 항상 `allow`로 응답했다. 이 결과가 L1/L2 캐시에도 저장되어 이후 요청도 계속 통과하는 인가 우회 버그였다.
-
-**해결 방안**  
-DB 응답의 `status` 필드를 명시적으로 확인해 `deny`이면 `"DENY"` 문자열을 캐시에 저장하고 응답도 `"status": "deny"`로 반환하도록 수정했다. L1/L2 캐시 히트 경로에도 `DENY` 체크를 동일하게 적용했다.
+### 1.8 PoP 서명 검증과 Nonce 소비 순서 정립
+- **현상**: FIDO2 모델 기반 ECDSA P-256 서명 검증 도입 시, 고비용 암호학 연산으로 인한 CPU 고갈 DoS 공격 노출 위험.
+- **수정**: Nonce 원자적 소비(Redis Lua)를 서명 검증 선행 단계에 배치. 미등록/재사용 Nonce는 암호 연산 진입 전 차단하고, 공격자 요청 발생 시 해당 Nonce를 즉시 소진(Burn) 처리.
 
 ---
 
-### 6. probe_db_health 세마포어 우회 수정 (해결)
+## 2. 코드베이스 감사 및 동시성/보안 리팩토링 (2026-10-16)
 
-**현상**  
-파티션 heal 시 호출되는 `probe_db_health()`가 `db_semaphore`를 획득하지 않고 DB를 직접 호출했다. N개의 heal 이벤트가 동시에 발생하면 `MAX_DB_WORKERS` 제한 밖에서 스레드가 생성될 수 있었다.
+### 2.1 Single-Flight 태스크 취소 및 Future 라이프사이클 누수 수정
+- **대상**: `gateway.py:db_loader_task`, `auth`
+- **기존 문제**:
+  - `db_loader_task`가 `except Exception:`으로만 예외를 처리하여, 코루틴 취소 시 발생하는 `asyncio.CancelledError`(`BaseException` 상속)를 잡지 못함.
+  - Leader 태스크 취소 시 `fut`가 완료되지 않은 채 방치되어 `await asyncio.shield(fut)`로 대기하던 Follower 요청들이 영구 행(Hang) 상태에 빠짐.
+  - `finally: in_flight.pop(comp_key, None)`이 인스턴스 검증 없이 동작하여, 후속 요청이 등록한 동일 키의 신규 Future를 오삭제하는 맵 오염 가능.
+- **수정 내용 및 결과**:
+  - `except BaseException as e:`로 변경하고, `asyncio.CancelledError` 감지 시 `fut.cancel()`을 호출하여 Follower에 취소 상태를 즉시 전파.
+  - `finally` 블록에서 `if in_flight.get(comp_key) is fut: in_flight.pop(comp_key, None)`으로 인스턴스 일치 여부 확인 후 삭제하도록 수정. 동시성 데드락 및 맵 누수 제거.
 
-**해결 방안**  
-`probe_semaphore = asyncio.Semaphore(1)`을 도입해 heal probe가 동시에 하나만 실행되도록 보장했다. 이미 실행 중이면 즉시 반환한다.
+### 2.2 관리자 인증 토큰 타이밍 공격(Timing Attack) 방어
+- **대상**: `gateway.py:admin_auth_middleware`, `control_plane.py:admin_auth_middleware`
+- **기존 문제**: `X-Admin-Token` 헤더 검증 시 `admin_token != ADMIN_SECRET_TOKEN` 일반 문자열 비교 연산자 사용. 문자열 일치 바이트 수에 따라 비교 소요 시간이 달라져 사이드 채널 공격(Timing Attack)에 노출됨.
+- **수정 내용 및 결과**: `hmac.compare_digest(admin_token, ADMIN_SECRET_TOKEN)` 상수 시간 비교 함수 적용. 문자열 비교 타이밍 누출 차단.
 
----
+### 2.3 L1Cache 및 CircuitBreaker 캡슐화 개선
+- **대상**: `gateway.py:L1Cache`, `CircuitBreaker`
+- **기존 문제**:
+  - `L1Cache` 생성자에 매직 넘버(`1000`, `60`)가 하드코딩되었고 `clear()` 메서드가 없어 테스트 코드에서 내부 딕셔너리(`l1_cache.cache.clear()`)를 직접 조작함.
+  - `stream_listener`에서 `if key in l1_cache: l1_cache.delete(key)` 호출로 불필요한 2회 연속 락 획득 발생.
+  - `CircuitBreaker` 상태 관측 시 `with cb._lock: state = cb.state` 형태로 내부 락 객체에 직접 접근해야 했음.
+- **수정 내용 및 결과**:
+  - `L1Cache` 기본값을 모듈 전역 설정(`L1_MAX_SIZE`, `L1_TTL_SEC`)과 연동하고 스레드 세이프한 `clear()` 메서드 추가. `delete()`가 락 내부에서 단일 원자 연산으로 동작하도록 수정.
+  - `CircuitBreaker`에 `@property def current_state(self) -> str:` 프로퍼티를 추가하여 내부 락으로 보호된 읽기 경로 캡슐화.
 
-## 잔여 기술 부채 (Future Work & Tech Debt)
+### 2.4 HTTP 및 Redis 클라이언트 풀링 구조화 및 테스트 호환성 확보
+- **대상**: `gateway.py`, `control_plane.py`
+- **기존 문제**:
+  - 전역 클라이언트가 FastAPI `lifespan`에서만 초기화되어 `TestClient`나 단위 테스트 실행 시 `None` 참조 에러 발생.
+  - `control_plane.py`의 `httpx.AsyncClient` 커넥션 풀이 기본값(100)으로 제한되어 다중 노드 카오스 요청 발생 시 타임아웃 병목 유발.
+- **수정 내용 및 결과**:
+  - `get_async_db_client()`, `get_sync_http_client()`, `get_redis_client()`, `get_async_http_client()` 지연 초기화(Lazy Initialization) 팩토리 구현. `lifespan` 미실행 환경에서도 커넥션 풀을 반환하여 테스트 호환성 확보.
+  - `control_plane.py`의 `httpx.AsyncClient`에 `limits=httpx.Limits(max_connections=200, max_keepalive_connections=50)` 설정 적용. 소켓 고갈 방지.
 
-1. **동적 서비스 디스커버리 (Dynamic Service Discovery)**  
-   노드 이름(Node-A 등)과 URL이 소스 코드에 하드코딩되어 있다. Consul 같은 서비스 디스커버리를 도입하면 수평 확장이 가능해진다.
-
-2. **모놀리식 빌드 의존성 (Monolithic Build Dependency)**  
-   단일 Dockerfile을 모든 서비스가 공유한다. `sse-starlette` 같은 특정 서비스 전용 패키지가 모든 이미지에 포함된다. 멀티스테이지 빌드나 서비스별 Dockerfile 분리로 이미지를 경량화할 수 있다.
-
-3. **STREAM_NAME 환경변수화**  
-   `invalidation_stream` 스트림 이름이 하드코딩되어 있다. 동일 Redis 클러스터를 staging/prod가 공유하는 환경에서는 스트림 충돌이 발생할 수 있다.
-
----
-
-### 7. 데모 신뢰성 향상을 위한 결함 클린업 및 버그 수정 (해결)
-
-**현상**
-1. check_rate_limit와 consume_nonce 내부에 포괄적인 	ry-except가 있어 Redis 통신 에러가 상위로 전파되지 않고 조용히 묻히는(Fail-closed 붕괴) 데드 코드가 존재했다.
-2. Redis 클라이언트 교체 시 
-edis_swap_lock을 걸고 스왑하지만, 인플라이트 트래픽은 글로벌 객체를 참조하고 있어 교체 직후 곧바로 close() 시 크래시(500)가 발생했다.
-3. control_plane.py의 실시간 모니터링 스트림 /metrics/stream이 인증 필터를 누락해 보안 위협이 있었다.
-4. index.html 내 getAdminToken()이 무조건 빈 문자열을 리턴해 카오스 제어 버튼을 누를 때마다 401 에러가 발생했다.
-
-**해결 방안**
-- 불필요하게 에러를 삼키던 로직을 제거해 장애 시 즉각 503 에러로 변환하도록(Fail-closed) 개선했다.
-- Redis 핫스왑 직후 곧바로 닫지 않고, 백그라운드 태스크에서 2.0초 대기 후 안전하게 닫는(지연 종료 패턴) 방식으로 크래시를 방어했다.
-- /metrics/stream 라우트를 미들웨어의 인증 필수 경로에 추가하고 쿼리 파라미터 기반 토큰 추출(EventSource 대응) 로직을 적용했다.
-- sessionStorage와 네이티브 prompt() UI를 연동하여 안전하고 실용적으로 토큰을 입력받을 수 있도록 수정했다.
-
-### 8. 단일 비행(Single-flight) 도입 및 서킷 브레이커와의 상호작용 (해결 및 분석)
-
-**현상 및 분석**
-단일 비행(SINGLEFLIGHT_ENABLED)을 도입한 후 캐시 미스 시 동일 키에 대한 동시 DB 호출이 하나로 병합(Coalescing)되어 DB 부하가 크게 줄어들었다. 그러나 이로 인해 서킷 브레이커의 동작 방식에도 변화가 생겼다. 동일 키에 대한 대량의 요청(Burst)이 실패할 경우, 기존에는 N개의 실패가 동시다발적으로 누적되어 즉시 OPEN 상태로 전환되었으나, 단일 비행 적용 후에는 병합된 1회의 호출만 실패로 기록되므로 서킷 브레이커가 OPEN 되기까지 더 많은 시간(여러 번의 단일 비행 사이클)이 소요됨이 확인되었다.
-
-**교훈 (측정 실수)**
-초기 OFF 모드 측정 당시 docker-compose.yml에 환경 변수 매핑을 누락하고 --build 옵션 없이 이미지를 구동하여, 설정이 반영되지 않은 채(Fake-OFF) 측정되는 실수가 발생했다. 이는 분산 환경에서 테스트 시 환경 설정의 전파(Propagation)와 강제 빌드를 통한 최신화가 필수적임을 보여주었다.
-
----
-
-### 9. Sliding Window 전환 및 불확실성 검증 (해결)
-
-**결정 배경**
-기존 Fixed Window 방식에서는 경계 버스트가 구조상 가능하여 교체하였다. 성능을 고려하여 Sliding Window Log 대신 Redis Pipeline 기반 가중 합산(Weighted) 슬라이딩 카운터 근사 알고리즘을 도입했다.
-
-**검증 및 한계**
-Lua 스크립트를 실제 Redis에 주입하여 테스트한 결과 가중치 계산은 완벽히 동작했다 (docs/benchmarks/rate-limit-sliding.md 참조). 그러나 Redis 장애 시의 Fallback 검증(3회차)에서 503/429 차단 비율이 재현되지 않는 재현성(Reproducibility) 이슈가 발생하여, 원인은 미상(unconfirmed)이다.
-
----
-
-### 10. 통계 분류 Invariant의 강력한 증명 (해결)
-
-**현상**
-단일 비행 및 여러 기능이 추가되면서 지표 누락이 발생하지 않도록 강결합 검증이 필요했다.
-
-**해결 방안**
-Gateway의 메트릭 분류를 체계화하여 
-equests == rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks 라는 강력한 동치(Invariant) 방정식을 수립했다. 단위 테스트(	ests/test_pop.py) 및 실제 E2E 요청 단계에서 모든 예외 케이스(400, 401 헤더 누락 등)도 정확히 카운팅되어 위 등식이 완벽히 성립함을 증명했다.
-
----
-
-### 11. PoP 서명 검증 도입과 Nonce 소진(Burn) 위치 결정 (해결)
-
-**현상**
-FIDO2 기반의 경량화된 ECDSA P-256 서명 검증(PoP)을 도입하면서, 서명 검증과 Nonce 검사의 순서 배치가 중요해졌다. 본 프로젝트에서는 클라이언트가 직접 생성(Client-generated)한 uuid 기반 Nonce를 사용하고 있다.
-
-**해결 방안**
-Nonce 검사 완료 **이후**에 서명을 검증하도록 로직을 배치했다. 공격자가 노출된 타인의 Nonce를 알아내더라도 서명을 위조할 수는 없으며, 검증에 실패하는 즉시 해당 Nonce가 소진(Burn)된다. 따라서 원천적인 차단(Crypto-DoS 완전 방어)은 불가능하지만, 공격자는 같은 nonce로 서명 검증을 반복할 수 없다.
+### 2.5 예외 은폐(Silent Swallow) 제거 및 코드베이스 정돈
+- **대상**: `gateway.py:auth`, `policy_db.py`, `.env.example`
+- **기존 문제**:
+  - L2 캐시 조회 및 적재 시 `except Exception: pass` 구문으로 예외를 삼켜 Redis 이상 발생 시 로그 확인 불가.
+  - 라우트 핸들러 내부 인라인 `import binascii` 호출.
+  - 튜토리얼 주석(`# Step 1: ...`, `# NORMAL LOOP`), ASCII 배너 구분선(`# ===...===`) 산재.
+- **수정 내용 및 결과**:
+  - `except Exception: pass` 구문을 제거하고 `logging.warning`, `logging.debug`를 적용하여 장애 원인 추적 가능하도록 변경.
+  - 인라인 임포트 최상단 이동, ASCII 배너 제거, 아키텍처 의도(Nonce 선행 검증 사유, PEL 처리 목적 등) 중심 주석으로 교체.
