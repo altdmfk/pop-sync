@@ -678,6 +678,7 @@
                             <div>L1 DblChk: <span class="metric-val" id="l1-dbl-${n}">0</span></div>
                             <div>PoP Verif: <span class="metric-val" id="pop-ver-${n}">0</span></div>
                             <div>PoP Rej: <span class="metric-val" id="pop-rej-${n}">0</span></div>
+                            <div>Outage Blocked: <span class="metric-val" id="redis-out-${n}">0</span></div>
                         </div>
                     </details>
 
@@ -797,13 +798,15 @@
                     document.getElementById(`l1-dbl-${nodeName}`).innerText = stats.l1_double_check_hits;
                     document.getElementById(`pop-ver-${nodeName}`).innerText = stats.pop_verified;
                     document.getElementById(`pop-rej-${nodeName}`).innerText = stats.pop_rejected;
+                    const redisOutEl = document.getElementById(`redis-out-${nodeName}`);
+                    if (redisOutEl) redisOutEl.innerText = stats.redis_outage_blocked || 0;
                     document.getElementById(`cfg-rl-${nodeName}`).innerText = nodeData.rl_algorithm;
                     document.getElementById(`cfg-pop-${nodeName}`).innerText = nodeData.pop_verify_enabled ? "PoP: On" : "PoP: Off";
                     document.getElementById(`sf-en-${nodeName}`).innerText = nodeData.singleflight_enabled;
 
                     // Invariant badge
                     const lhs = stats.requests;
-                    const rhs = (stats.rate_limited || 0) + (stats.nonce_replays || 0) + (stats.pop_rejected || 0) + (stats.l1_hits || 0) + (stats.l2_hits || 0) + (stats.db_fallbacks || 0);
+                    const rhs = (stats.rate_limited || 0) + (stats.nonce_replays || 0) + (stats.pop_rejected || 0) + (stats.l1_hits || 0) + (stats.l2_hits || 0) + (stats.db_fallbacks || 0) + (stats.redis_outage_blocked || 0);
                     const invEl = document.getElementById(`inv-${nodeName}`);
                     const invContainer = invEl.parentElement;
                     
@@ -815,15 +818,9 @@
                     } else {
                         invariantDebounce[nodeName] = (invariantDebounce[nodeName] || 0) + 1;
                         if (invariantDebounce[nodeName] >= 2) {
-                            if (nodeData.redis_ok === false) {
-                                invEl.innerText = `Warning (${lhs} != ${rhs})`;
-                                invEl.className = "badge warning";
-                                invContainer.title = "Redis outage: 503 responses are not in classification counters; mismatch expected";
-                            } else {
-                                invEl.innerText = `Fail (${lhs} != ${rhs})`;
-                                invEl.className = "badge danger";
-                                invContainer.title = "Transient mismatches while requests are in flight may appear. Equality holds for finished requests.";
-                            }
+                            invEl.innerText = `Fail (${lhs} != ${rhs})`;
+                            invEl.className = "badge danger";
+                            invContainer.title = "Transient mismatches while requests are in flight may appear. Equality holds for finished requests.";
                         }
                     }
 

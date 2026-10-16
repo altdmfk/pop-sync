@@ -99,9 +99,9 @@ pytest tests/test_singleflight.py tests/test_rate_limit.py tests/test_pop.py -v
 - **PoP 테스트 구성**: PoP 기능(Toggle ON) 시나리오는 클라이언트가 실제로 서명을 생성해야 하므로 기존 	est_scenarios.py (서명 없이 전송) 환경과 분리되어 검증이 제한적이다.
 - **테스트 환경 제약**: 단위 테스트는 Redis/DB를 Mock으로 대체하며, 일부 기존 E2E 테스트(컨테이너명 하드코딩, Fixture 누락, pre-singleflight 비교 부재)가 실패하는 제약이 있다. 잘못된 "노드당 한도(per-node)" 주석 등은 현재 버전에서 수정되었다.
 
-- **Invariant 불일치**: Redis 장애 시 Nonce 검증 단계에서 503 에러로 조기 반환(Cancel)된 요청들은 Invariant 합산 지표(분류 카운터)에서 제외되어 불일치가 발생합니다.
+- **Invariant 정합성 (Phase 2 개선)**: Redis 장애 시 Nonce 검증 단계에서 503 에러로 조기 반환(Fail-Closed)된 요청을 `redis_outage_blocked` 전용 카운터로 집계하여, `requests == sum(classified_counters) + redis_outage_blocked` 불변식 방정식이 Redis 다운 상황에서도 100% 일치(PASS)하도록 개선되었다.
 
 ## 대시보드 기능 및 측정
-- **불변성(Invariant) 패널**: 요청 수가 각 처리 단계(L1/L2 Hit, DB 폴백, Rate Limit, Nonce 재전송, PoP 검증 실패)의 합과 일치하는지 실시간으로 모니터링하여 시스템의 정합성을 검증합니다.
+- **불변성(Invariant) 패널**: 요청 수가 각 처리 단계(L1/L2 Hit, DB 폴백, Rate Limit, Nonce 재전송, PoP 검증 실패, Redis 장애 차단)의 합과 일치하는지 실시간으로 모니터링하여 시스템의 정합성을 검증합니다.
 - **단일 비행(Single-flight) 패널 및 측정 데모**: 동일한 키에 대한 중복 요청 발송 시 백엔드 DB 호출이 감소하는 것을 시각화합니다. 대시보드의 'Same-key Burst' 버튼으로 50개의 중복 요청을 동시 발송하여 DB 실행 쿼리 및 병합(Coalesced) 수치를 비교합니다. (실제 DB 경로에 도달하는 요청 수는 런마다 달라지며, ON 시 DB 호출 1회(병합 4/10/8 등), OFF 시 DB 호출 3/11/11회를 관찰했으나 변동 원인은 미확인 상태입니다.)
 - **Config & DB Stats**: Rate-limit 알고리즘, PoP(Proof of Possession) 검증 활성화 여부 등 노드의 보안 설정을 확인할 수 있습니다.

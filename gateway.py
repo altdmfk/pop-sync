@@ -312,7 +312,8 @@ stats = {
     "db_queries_executed": 0,
     "singleflight_coalesced": 0,
     "circuit_blocked": 0,
-    "l1_double_check_hits": 0
+    "l1_double_check_hits": 0,
+    "redis_outage_blocked": 0
 }
 
 NONCE_LUA = """
@@ -786,6 +787,8 @@ async def auth(
         if isinstance(e, HTTPException):
             raise e
         logging.warning(f"Nonce check failed (Redis down?): {e}")
+        with stats_lock:
+            stats["redis_outage_blocked"] += 1
         raise HTTPException(status_code=503, detail="Service Unavailable - Nonce Check Failed")
 
     if POP_VERIFY_ENABLED:
