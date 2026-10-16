@@ -3,10 +3,14 @@ import httpx
 import uuid
 import time
 import subprocess
+import pytest
+
+pytestmark = pytest.mark.e2e
 
 CONTROL_PLANE = "http://localhost:8080"
 GATEWAY_A = "http://localhost:8001"
 
+@pytest.mark.e2e
 async def test_1_ddos_spam():
     print("=== TEST 1: DDoS Spam ===")
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -30,6 +34,7 @@ async def test_1_ddos_spam():
         stats = subprocess.check_output(["docker", "stats", "task_b-gateway-a-1", "--no-stream"]).decode("utf-8")
         print(stats)
 
+@pytest.mark.e2e
 async def test_2_rl_leak():
     print("\n=== TEST 2: Rate Limiter Memory Leak ===")
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -44,6 +49,7 @@ async def test_2_rl_leak():
         print("Check local_rl_size in metrics manually.")
         await client.post(f"{CONTROL_PLANE}/chaos/redis/up")
 
+@pytest.mark.e2e
 async def test_3_cb_stress():
     print("\n=== TEST 3: DB Down Concurrent Requests (CB Stress) ===")
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -72,6 +78,7 @@ async def test_3_cb_stress():
         print(f"Duration for 500 reqs: {duration:.2f}s")
         print(f"Result Status Codes: {status_codes}")
         
+@pytest.mark.e2e
 async def test_4_flapping():
     print("\n=== TEST 4: Flapping (Rapid DB Up + Burst) ===")
     async with httpx.AsyncClient(timeout=30.0) as client:

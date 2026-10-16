@@ -3,6 +3,9 @@ import asyncio
 import time
 import uuid
 import os
+import pytest
+
+pytestmark = pytest.mark.e2e
 
 ADMIN_SECRET_TOKEN = os.getenv("ADMIN_SECRET_TOKEN", "super-secret-admin")
 

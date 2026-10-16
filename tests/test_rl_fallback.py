@@ -2,10 +2,14 @@ import asyncio
 import httpx
 import uuid
 import time
+import pytest
+
+pytestmark = pytest.mark.e2e
 
 GATEWAYS = ["http://localhost:8001", "http://localhost:8002", "http://localhost:8003"]
 CONTROL_PLANE = "http://localhost:8080"
 
+@pytest.mark.e2e
 async def test_rl_fallback():
     print("=== Rate Limit Fallback Test ===")
     

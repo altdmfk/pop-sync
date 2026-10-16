@@ -4,8 +4,11 @@ import uuid
 import time
 import subprocess
 import os
+import pytest
 
-async def test_node(client, node_url, node_name, spiffe_id):
+pytestmark = pytest.mark.e2e
+
+async def _test_node(client, node_url, node_name, spiffe_id):
     tasks = []
     # Send 30 requests to the specific node
     for _ in range(30):
@@ -46,9 +49,9 @@ async def main():
     print(f"Target SPIFFE ID: {spiffe_id}\n")
     
     async with httpx.AsyncClient(timeout=60.0) as client:
-        await test_node(client, "http://127.0.0.1:8001", "Node-A", spiffe_id)
-        await test_node(client, "http://127.0.0.1:8002", "Node-B", spiffe_id)
-        await test_node(client, "http://127.0.0.1:8003", "Node-C", spiffe_id)
+        await _test_node(client, "http://127.0.0.1:8001", "Node-A", spiffe_id)
+        await _test_node(client, "http://127.0.0.1:8002", "Node-B", spiffe_id)
+        await _test_node(client, "http://127.0.0.1:8003", "Node-C", spiffe_id)
         
     # Cleanup
     p_a.terminate()

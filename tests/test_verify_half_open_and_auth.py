@@ -1,9 +1,13 @@
 import httpx
 import asyncio
 import os
+import pytest
+
+pytestmark = pytest.mark.e2e
 
 ADMIN_SECRET_TOKEN = os.getenv("ADMIN_SECRET_TOKEN", "super-secret-admin")
 
+@pytest.mark.e2e
 async def test_auth_and_half_open():
     async with httpx.AsyncClient() as client:
         print("=== 1. 인증 흐름 검증 ===")

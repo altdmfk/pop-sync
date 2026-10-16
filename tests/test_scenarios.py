@@ -2,6 +2,9 @@ import httpx
 import uuid
 import time
 import os
+import pytest
+
+pytestmark = pytest.mark.e2e
 
 BASE_URL = "http://localhost:8080"
 NODE_A = "http://localhost:8001"
@@ -13,6 +16,7 @@ ADMIN_SECRET_TOKEN = os.getenv("ADMIN_SECRET_TOKEN", "super-secret-admin")
 def print_header(title):
     print(f"\n{'='*50}\n{title}\n{'='*50}")
 
+@pytest.mark.e2e
 def test_nonce_atomicity():
     print_header("Scenario 1: Nonce Atomicity")
     resp = httpx.post(f"{BASE_URL}/chaos/nonce", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
@@ -27,6 +31,7 @@ def test_nonce_atomicity():
     assert "401" in node_a or "401" in node_b
     print("Nonce Atomicity verified.")
 
+@pytest.mark.e2e
 def test_rate_limiting():
     print_header("Scenario 2: O(1) Rate Limiting")
     resp = httpx.post(f"{BASE_URL}/chaos/ddos", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
@@ -35,6 +40,7 @@ def test_rate_limiting():
     assert "429" in data["responses"], "Expected 429 Too Many Requests"
     print("Rate Limiting verified.")
 
+@pytest.mark.e2e
 def test_circuit_breaker():
     print_header("Scenario 3: Circuit Breaker & Fallback Degradation")
     print("Bringing DB down...")
@@ -75,6 +81,7 @@ def test_circuit_breaker():
 
 import random
 
+@pytest.mark.e2e
 def test_partition_catchup():
     print_header("Scenario 4: Hard Partition & Stream Catch-up (Robustness Test)")
     

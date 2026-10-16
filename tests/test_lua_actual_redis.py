@@ -1,6 +1,9 @@
 import asyncio
 import time
 from redis.asyncio import Redis
+import pytest
+
+pytestmark = pytest.mark.e2e
 
 SLIDING_RL_LUA = """
 local prev = tonumber(redis.call('GET', KEYS[1])) or 0

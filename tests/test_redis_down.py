@@ -2,6 +2,9 @@ import asyncio
 import httpx
 import uuid
 import sys
+import pytest
+
+pytestmark = pytest.mark.e2e
 
 GATEWAY_URL = "http://localhost:8001/auth"
 client_id = f"spiffe://burst/{uuid.uuid4()}"
