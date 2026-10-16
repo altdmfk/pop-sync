@@ -248,7 +248,8 @@ async def test_stats_invariants(mock_dependencies):
             stats["nonce_replays"] + 
             stats["l1_hits"] + 
             stats["l2_hits"] + 
-            stats["db_fallbacks"]
+            stats["db_fallbacks"] +
+            stats.get("redis_outage_blocked", 0)
         )
         assert stats["requests"] == total_classified
 
@@ -295,3 +296,193 @@ async def test_unretrieved_future_exception(mock_dependencies):
         # Wait for background db_loader_task to finish and set exception
         await asyncio.sleep(0.15)
         # Without fix, garbage collection will complain. We can't easily assert on gc warnings directly in pytest without specific fixtures, but running pytest -W error will fail if there is a warning.
+
+
+def test_circuit_breaker_debounce_and_half_open_boundary(monkeypatch):
+    """
+    Boundary test for Circuit Breaker:
+    - 2.0s debounce boundary (CLOSED -> OPEN): failures within 2.0s are ignored.
+    - At/after 2.0s, failures increment count towards threshold and transition to OPEN.
+    - After reset_timeout expires, can_execute() transitions OPEN -> HALF_OPEN.
+    - In HALF_OPEN, a successful request transitions back to CLOSED.
+    """
+    import time
+    from gateway import CircuitBreaker
+    
+    current_time = 1000.0
+    monkeypatch.setattr(time, "time", lambda: current_time)
+    
+    cb_test = CircuitBreaker(max_failures=3, reset_timeout=10.0, debounce_sec=2.0)
+    cb_test.reset()
+    assert cb_test.current_state == "CLOSED"
+    
+    # 1. Failure at t=1001.0 (< 2.0s debounce window from reset at t=1000.0) -> Debounced
+    current_time = 1001.0
+    cb_test.record_failure()
+    assert cb_test.failures == 0, "Failure within debounce window must be debounced"
+    assert cb_test.current_state == "CLOSED"
+    
+    # 2. Failure at t=1001.99 (< 2.0s) -> Debounced
+    current_time = 1001.99
+    cb_test.record_failure()
+    assert cb_test.failures == 0
+    
+    # 3. Failure at t=1002.0 (>= 2.0s debounce window) -> Counted (1)
+    current_time = 1002.0
+    cb_test.record_failure()
+    assert cb_test.failures == 1
+    assert cb_test.current_state == "CLOSED"
+    
+    # Additional failures after debounce are counted
+    current_time = 1002.5
+    cb_test.record_failure()
+    assert cb_test.failures == 2
+    
+    current_time = 1003.0
+    cb_test.record_failure()  # 3rd failure reaches max_failures=3
+    assert cb_test.failures == 3
+    assert cb_test.current_state == "OPEN"
+    
+    # Transition to OPEN happened at t=1003.0. While OPEN:
+    can_exec, state = cb_test.can_execute()
+    assert can_exec is False
+    assert state == "OPEN"
+    
+    # Before reset_timeout (10s) expires:
+    current_time = 1012.9
+    can_exec, state = cb_test.can_execute()
+    assert can_exec is False
+    assert state == "OPEN"
+    
+    # After reset_timeout (10s) expires (> 1013.0):
+    current_time = 1013.1
+    can_exec, state = cb_test.can_execute()
+    assert can_exec is True
+    assert state == "HALF_OPEN"
+    assert cb_test.current_state == "HALF_OPEN"
+    
+    # In HALF_OPEN, trial success resets circuit to CLOSED
+    cb_test.record_success()
+    assert cb_test.current_state == "CLOSED"
+    assert cb_test.failures == 0
+
+
+@pytest.mark.asyncio
+async def test_singleflight_exception_propagation_and_map_cleanup(mock_dependencies):
+    """
+    Boundary test:
+    1. Single-Flight exception in db loader propagates to leader and followers.
+    2. in_flight map is cleaned up (popped) in finally block.
+    3. Subsequent request creates a fresh loader and executes without being stuck.
+    """
+    m_redis, m_db = mock_dependencies
+    
+    call_count = 0
+    async def failing_db_call(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0.05)
+        if call_count == 1:
+            raise RuntimeError("DB Temporary Outage")
+        return {"status": "allow", "role": "admin"}
+        
+    m_db.side_effect = failing_db_call
+    
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {
+            "Authorization": "Bearer token",
+            "X-SPIFFE-ID": "spiffe://test_cleanup",
+        }
+        
+        # 1 leader + 3 followers
+        tasks = [client.get("/auth", headers={**headers, "X-Nonce": f"nonce-err-{i}"}) for i in range(4)]
+        results = await asyncio.gather(*tasks)
+        
+        for r in results:
+            assert r.status_code == 200
+            assert r.json()["status"] == "degraded_allow"
+            
+        # Verify in_flight map is cleaned up
+        assert len(in_flight) == 0, f"in_flight map must be empty, but had: {in_flight}"
+        
+        # Subsequent request succeeds and also cleans up in_flight
+        cb.reset()
+        resp2 = await client.get("/auth", headers={**headers, "X-Nonce": "nonce-succ-1"})
+        assert resp2.status_code == 200
+        assert resp2.json()["policy"] == "admin"
+        assert len(in_flight) == 0
+
+
+@pytest.mark.asyncio
+async def test_singleflight_db_overload_exception_propagation(mock_dependencies):
+    """
+    Boundary test:
+    Verify DBOverloadError propagates as 503 to followers and cleans up in_flight.
+    """
+    from gateway import DBOverloadError
+    m_redis, m_db = mock_dependencies
+    
+    async def overload_db_call(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
+        
+    m_db.side_effect = overload_db_call
+    
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {
+            "Authorization": "Bearer token",
+            "X-SPIFFE-ID": "spiffe://test_overload",
+        }
+        
+        tasks = [client.get("/auth", headers={**headers, "X-Nonce": f"nonce-ov-{i}"}) for i in range(3)]
+        results = await asyncio.gather(*tasks)
+        
+        for r in results:
+            assert r.status_code == 503
+            assert r.json()["message"] == "Service Unavailable - DB Overload"
+            
+        assert len(in_flight) == 0
+
+
+@pytest.mark.asyncio
+async def test_invariant_equality_under_redis_503(mock_dependencies):
+    """
+    Boundary test:
+    Verify that simulated Redis outage during Nonce check in /auth
+    increments both 'requests' and 'redis_outage_blocked', maintaining
+    100% Invariant equality:
+    requests == (rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked)
+    """
+    m_redis, m_db = mock_dependencies
+    
+    import redis.exceptions
+    with patch("gateway.consume_nonce", new_callable=AsyncMock) as m_nonce:
+        m_nonce.side_effect = redis.exceptions.ConnectionError("Redis connection refused")
+        
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = {
+                "Authorization": "Bearer token",
+                "X-SPIFFE-ID": "spiffe://test_redis_outage",
+            }
+            
+            for i in range(5):
+                resp = await client.get("/auth", headers={**headers, "X-Nonce": f"nonce-outage-{i}"})
+                assert resp.status_code == 503
+                assert "Nonce Check Failed" in resp.json()["message"]
+                
+            assert stats["requests"] == 5
+            assert stats["redis_outage_blocked"] == 5
+            
+            classified_sum = (
+                stats["rate_limited"] +
+                stats["nonce_replays"] +
+                stats["pop_rejected"] +
+                stats["l1_hits"] +
+                stats["l2_hits"] +
+                stats["db_fallbacks"] +
+                stats["redis_outage_blocked"]
+            )
+            assert stats["requests"] == classified_sum

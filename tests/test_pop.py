@@ -22,11 +22,13 @@ def reset_globals():
         gateway.pop_executor = ThreadPoolExecutor(max_workers=1)
     l1_cache.cache.clear()
     with stats_lock:
-        for k in ["requests", "rate_limited", "nonce_replays", "pop_rejected", "pop_verified", "l1_hits", "l2_hits", "db_fallbacks"]:
-            if k in stats:
+        for k in stats:
+            if isinstance(stats[k], int):
                 stats[k] = 0
-            else:
-                stats[k] = 0
+            elif isinstance(stats[k], float):
+                stats[k] = 0.0
+    yield
+    gateway.POP_VERIFY_ENABLED = False
 
 @pytest.fixture
 def mock_dependencies():
