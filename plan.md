@@ -20,10 +20,10 @@
 ## 2. 버전별 구현 이력 및 로드맵 (Version Roadmap)
 
 ```
-[v0.1.0 ~ v0.6.0] ────────> [v0.7.0 (Current)] ────────> [v0.8.0 (Next)] ────────> [v1.0.0 (Backlog)]
- 기반 파이프라인 및 코어         1차 코드베이스 감사 및         2차 정밀 개선 백로그           프로덕션 인프라 고도화
+[v0.1.0 ~ v0.6.0] ────────> [v0.7.0] ────────> [v0.8.0 (Current)] ────────> [v1.0.0 (Backlog)]
+ 기반 파이프라인 및 코어         1차 코드베이스 감사 및         2차 리팩토링 및 격리           프로덕션 인프라 고도화
  복원력/관측성 구현 완료         동시성/보안 리팩토링 완료      (Invariant/테스트/SSE)         (디스커버리/컨테이너)
- (완료 [x])                     (완료 [x])                    (계획 [ ])                    (계획 [ ])
+ (완료 [x])                     (완료 [x])                    (완료 [x])                    (계획 [ ])
 ```
 
 ---
@@ -122,19 +122,26 @@
 
 ---
 
-### v0.8.0: 2차 정밀 개선 백로그 (Next) [계획]
-- [ ] **Redis 장애 503 응답 Invariant 카운터 정렬**
-  - 현상: Redis 다운 시 Nonce 검증에서 503으로 조기 반환되는 요청이 Invariant 합산 분류에 집계되지 않아 대시보드 방정식 오차 발생
-  - 작업: `stats["redis_outage_blocked"]` 카운터를 신설하고 `requests == sum(counters) + redis_outage_blocked` 수식으로 대시보드 및 게이트웨이 정합성 정렬
-- [ ] **pytest 테스트 스위트 격리 및 E2E 마커 분리**
-  - 현상: `test_scenarios.py`, `test_rl_fallback.py`가 도커 컨테이너 미구동 로컬 환경에서 실행 시 타임아웃 대기 발생
-  - 작업: 통합/E2E 테스트 파일에 `@pytest.mark.e2e`를 지정하고 `pytest.ini`에 기본 단위 테스트(`unit`)와 `e2e` 실행 프로파일 분리
-- [ ] **Control Plane SSE 브로드캐스트 아키텍처 개선**
-  - 현상: SSE 클라이언트 연결마다 1초 주기 폴링 태스크가 독립 실행되어 대시보드 다중 접속 시 게이트웨이 부하 중복 유발
-  - 작업: 백그라운드 단일 폴러 태스크가 상태를 수집하고 `asyncio.Queue` 기반 브로드캐스트 팬아웃 방식으로 구조 전환
-- [ ] **Scope B PoP 서명 필드 바인딩 강화**
-  - 현상: 현재 PoP 서명이 고정 문자열(`pop_signature`) 검증에 머무름
-  - 작업: 타임스탬프 허용 오차(예: 30초) 및 HTTP Body SHA-256 해시 바인딩을 추가하여 리플레이 및 변조 방어 심화
+### v0.8.0: 2차 정밀 개선 및 테스트 격리 (Current) [완료]
+- [x] **Redis 장애 503 응답 Invariant 카운터 정렬**
+  - `gateway.py`에 `stats["redis_outage_blocked"]` 신설, Nonce 검증 실패(503 Fail-Closed) 시 증가 처리
+  - `static/index.html` Invariant RHS 방정식에 `stats.redis_outage_blocked` 합산 추가하여 Redis 다운 시에도 `Pass (LHS == RHS)` 평가되도록 수정
+  - `test_invariant_equality_under_redis_503` 단위 테스트 검증 완료
+- [x] **pytest 테스트 스위트 격리 및 E2E 마커 분리**
+  - `pytest.ini`에 `markers = e2e` 및 `addopts = -m "not e2e"` 등록
+  - 외부 도커 클러스터 의존 테스트 모듈/함수에 `@pytest.mark.e2e` 및 `pytestmark = pytest.mark.e2e` 부여
+  - `pytest -v` 실행 시 단위 테스트 29건만 2.1초 내 실행 완료, `pytest -m e2e`로 E2E 스위트(10건) 타겟팅 분리
+- [x] **Control Plane SSE 브로드캐스트 아키텍처 개선 (Single-Poller Fan-Out)**
+  - `control_plane.py`의 클라이언트별 독립 폴링 루프를 제거하고 백그라운드 단일 폴러 태스크(`broadcast_metrics_loop`)로 전환
+  - 게이트웨이 폴링 트래픽을 $N$배에서 1회로 고정하고, `subscribers` 집합 내 `asyncio.Queue`로 논블로킹 팬아웃 브로드캐스팅
+  - 클라이언트 연결 종료 시 `finally` 블록에서 큐 제거(`discard`)로 메모리 누수 방지
+  - `test_control_plane.py` 단위 테스트 검증 완료
+- [x] **단위 테스트 전역 상태 격리 및 고가치 경계 테스트 구축**
+  - `conftest.py`에 `clean_gateway_state` autouse 픽스처 및 `mock_common_dependencies`를 구축하여 `POP_VERIFY_ENABLED` 누수 방지
+  - 서킷 브레이커 2.0초 디바운스 경계 테스트(`CLOSED` -> `OPEN` -> `HALF_OPEN`) 추가
+  - Single-Flight 예외 전파 및 `in_flight` 맵 정리(`finally: pop`) 경계 테스트 추가
+- [x] **Scope B PoP 서명 필드 바인딩 범위 유지 (아키텍처 경계 명시)**
+  - Scope B 규격에 따라 `/auth`는 GET 요청이며 일회용 Nonce 원자적 소진을 전제하므로 Timestamp/Body 비결합(Unbound) 상태를 유지함. (향후 Scope C/POST 확장 시 바인딩 검토 대상)
 
 ---
 
@@ -150,14 +157,15 @@
 
 ## 3. 마일스톤 검증 기준 (Acceptance Criteria)
 
-| 검증 영역 | 기준 | 현재 상태 (v0.7.0) |
+| 검증 영역 | 기준 | 현재 상태 (v0.8.0) |
 | :--- | :--- | :---: |
 | **코어 파이프라인** | 게이트웨이 3개 노드, Control Plane, Policy DB, Redis 정상 기동 및 통신 | **PASS** |
 | **다단계 캐시** | L1 미스 -> L2 미스 -> DB 조회 순 동작 및 파티션 해소 시 PEL 동기화 | **PASS** |
 | **단일 비행** | 동일 키 50개 동시 요청 시 DB 조회가 1회로 병합 처리 및 태스크 취소 안전성 확보 | **PASS** |
 | **보안 및 유량 제어** | 슬라이딩 윈도우 유량 제한, Nonce 소진, 상수 시간 토큰 비교(`hmac.compare_digest`) | **PASS** |
 | **서킷 브레이커** | DB 다운 시 OPEN 전이, degraded 응답, 2.0s 디바운스 플래핑 방지, 프로퍼티 캡슐화 | **PASS** |
-| **단위 테스트** | `test_singleflight.py`, `test_rate_limit.py`, `test_pop.py` 전체 통과 (23 passed) | **PASS** |
-| **통계 불변성** | 정상 구동 시 Invariant 방정식 일치 (Redis 장애 시 503 집계 분리는 v0.8.0 과제) | **PASS (v0.8.0 연계)** |
-| **E2E 테스트 격리** | 단위 테스트와 E2E 테스트 마커 분리 | **TODO (v0.8.0)** |
+| **단위 테스트** | 단위/경계 테스트 스위트 전체 통과 (`pytest -v` 기준 29 passed) | **PASS** |
+| **통계 불변성** | 정상 및 Redis 다운 시 Invariant 방정식 100% 일치 (`redis_outage_blocked` 반영) | **PASS** |
+| **E2E 테스트 격리** | 단위 테스트와 E2E 테스트 마커 분리 (`addopts = -m "not e2e"`, 10 deselected) | **PASS** |
+| **SSE 아키텍처** | Control Plane 단일 폴러 메트릭 수집 및 `asyncio.Queue` 팬아웃 브로드캐스팅 | **PASS** |
 | **프로덕션 인프라** | 동적 서비스 디스커버리 및 멀티스테이지 Dockerfile 분리 | **TODO (v1.0.0)** |

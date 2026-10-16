@@ -85,3 +85,27 @@
 - **수정 내용 및 결과**:
   - `except Exception: pass` 구문을 제거하고 `logging.warning`, `logging.debug`를 적용하여 장애 원인 추적 가능하도록 변경.
   - 인라인 임포트 최상단 이동, ASCII 배너 제거, 아키텍처 의도(Nonce 선행 검증 사유, PEL 처리 목적 등) 중심 주석으로 교체.
+
+---
+
+## 3. 2차 리팩토링 및 테스트 격리 (v0.8.0, 2026-10-16)
+
+### 3.1 Redis 503 장애 시 Invariant 카운터 정합성 정렬
+- **대상 파일 및 함수**: `gateway.py:auth`, `stats`, `static/index.html`
+- **기존 문제**: Redis 다운 시 Nonce 검증(`consume_nonce`)에서 503(Fail-Closed)으로 조기 반환된 요청이 `stats["requests"]`에는 반영되었으나 세부 분류 카운터에 집계되지 않아, 대시보드 Invariant 방정식(`requests == sum(classified)`)에 불일치 및 경고 발생.
+- **수정 내용 및 결과**: `stats["redis_outage_blocked"]` 카운터를 신설하고 Nonce 검증 실패 예외 블록에서 이를 증가시킴. `static/index.html`의 Invariant RHS 계산식에 `stats.redis_outage_blocked`를 합산하여 Redis 장애 상황에서도 Invariant 방정식이 일치(`PASS`)하도록 수정. 단위 테스트(`test_invariant_equality_under_redis_503`)로 검증함.
+
+### 3.2 Pytest Runner와 E2E 테스트 스위트 격리
+- **대상 파일 및 함수**: `pytest.ini`, `tests/test_scenarios.py`, `tests/test_flapping.py`, `tests/test_verify_half_open_and_auth.py`, `tests/stress_test.py`, `tests/test_rl_fallback.py`, `tests/test_rl_node_fallback.py`
+- **기존 문제**: 외부 Docker 클러스터 구동을 전제하는 E2E 및 스트레스 테스트가 기본 테스트 스위트에 포함되어, 로컬 환경에서 `pytest` 실행 시 다수의 연결 실패(`ConnectError`) 및 타임아웃 발생.
+- **수정 내용 및 결과**: `pytest.ini`에 `e2e` 마커를 등록하고 기본 실행 옵션으로 `addopts = -m "not e2e"` 설정. 라이브 HTTP/클러스터 의존 테스트 파일 및 함수에 `@pytest.mark.e2e` 데코레이터를 적용. `pytest -v` 실행 시 E2E 10건이 자동 제외되고 순수 단위 테스트 29건만 2.1초 내에 통과하며, `pytest -m e2e`로 E2E 스위트만 별도 타겟팅 가능하도록 분리함.
+
+### 3.3 Control Plane SSE 단일 폴러 팬아웃(Fan-Out) 전환
+- **대상 파일 및 함수**: `control_plane.py:metrics_stream`, `broadcast_metrics_loop`, `lifespan`, `tests/test_control_plane.py`
+- **기존 문제**: SSE 클라이언트(`/metrics/stream`) 연결마다 별도 폴링 루프가 실행되어, 대시보드 접속자 수가 $N$명일 때 게이트웨이 3개 노드를 향한 내부 HTTP 폴링 트래픽이 $3 \times N$건으로 중복 가중됨.
+- **수정 내용 및 결과**: `broadcast_metrics_loop` 백그라운드 단일 폴러 태스크를 도입하여 1초 간격으로 게이트웨이 메트릭을 1회만 수집하고 최신 스냅샷을 갱신하도록 변경. 활성 구독자 큐(`subscribers: set[asyncio.Queue]`)로 논블로킹 팬아웃 브로드캐스팅을 수행함. 클라이언트 연결 종료 시 `finally` 블록에서 큐를 제거(`discard`)하여 메모리 누수를 차단함. `test_control_plane.py` 단위 테스트 추가.
+
+### 3.4 단위 테스트 전역 상태 격리 및 경계값 테스트 보강
+- **대상 파일 및 함수**: `tests/conftest.py`, `tests/test_pop.py`, `tests/test_singleflight.py`
+- **기존 문제**: `test_pop.py` 실행 시 설정된 `POP_VERIFY_ENABLED = True` 플래그가 테스트 종료 후 원복되지 않아 후속 `test_singleflight.py` 실행 시 서명 누락(400 Bad Request)으로 연쇄 실패함. 서킷 브레이커 디바운스 및 Single-Flight 예외 시 맵 정리 경계 테스트 부재.
+- **수정 내용 및 결과**: `conftest.py`에 `clean_gateway_state` autouse 픽스처 및 `mock_common_dependencies`를 구축하여 전역 설정/캐시/카운터를 매 테스트 전후로 초기화함. 서킷 브레이커 2.0초 디바운스 전이 경계(`CLOSED` -> `OPEN` -> `HALF_OPEN`), Single-Flight 예외 전파 및 `in_flight` 맵 정리, Redis 장애 503 Invariant 일치성 단위 테스트를 추가함.
