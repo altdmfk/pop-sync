@@ -368,6 +368,134 @@ async def chaos_db(state: str):
 
     return {"db_state": state, "results": results}
 
+@app.get("/chaos/audit")
+async def chaos_audit():
+    """Cluster-wide Invariant & Resilience Audit Endpoint for technical demonstrations.
+    
+    Concurrently polls all gateway nodes, mathematically verifies both core Invariants
+    (Request Classification & Strong DB Fallback), and computes cache hit, Single-Flight
+    coalescing, and DB load reduction ratios.
+    """
+    metrics = await fetch_metrics()
+    audit_nodes = {}
+    online_count = 0
+    all_pass = True
+
+    for name, data in metrics.items():
+        if data.get("status") == "offline" or not data.get("stats"):
+            audit_nodes[name] = {
+                "node": name,
+                "status": "offline",
+                "invariant_pass": None,
+                "note": "Node offline or unreachable"
+            }
+            continue
+
+        online_count += 1
+        stats = data.get("stats", {})
+        circuit_state = stats.get("circuit_state", data.get("circuit_state", "CLOSED"))
+
+        requests = stats.get("requests", 0)
+        rate_limited = stats.get("rate_limited", 0)
+        nonce_replays = stats.get("nonce_replays", 0)
+        pop_rejected = stats.get("pop_rejected", 0)
+        l1_hits = stats.get("l1_hits", 0)
+        l2_hits = stats.get("l2_hits", 0)
+        db_fallbacks = stats.get("db_fallbacks", 0)
+        redis_outage_blocked = stats.get("redis_outage_blocked", 0)
+
+        db_queries_executed = stats.get("db_queries_executed", 0)
+        singleflight_coalesced = stats.get("singleflight_coalesced", 0)
+        l1_double_check_hits = stats.get("l1_double_check_hits", 0)
+        circuit_blocked = stats.get("circuit_blocked", 0)
+
+        # Invariant 1: Request Classification
+        inv1_lhs = requests
+        inv1_rhs = (
+            rate_limited +
+            nonce_replays +
+            pop_rejected +
+            l1_hits +
+            l2_hits +
+            db_fallbacks +
+            redis_outage_blocked
+        )
+        inv1_pass = (inv1_lhs == inv1_rhs)
+
+        # Invariant 2: Strong DB Fallback
+        inv2_lhs = db_fallbacks
+        inv2_rhs = (
+            db_queries_executed +
+            singleflight_coalesced +
+            l1_double_check_hits +
+            circuit_blocked
+        )
+        inv2_pass = (inv2_lhs == inv2_rhs)
+
+        node_pass = inv1_pass and inv2_pass
+        if not node_pass:
+            all_pass = False
+
+        saved_db = singleflight_coalesced + l1_double_check_hits + circuit_blocked
+        db_load_reduction_ratio = round(saved_db / db_fallbacks, 4) if db_fallbacks > 0 else 0.0
+        db_load_reduction_percentage = round((saved_db / db_fallbacks) * 100.0, 2) if db_fallbacks > 0 else 0.0
+
+        total_cache_hits = l1_hits + l2_hits
+        cache_hit_ratio = round(total_cache_hits / requests, 4) if requests > 0 else 0.0
+        cache_hit_ratio_pct = round((total_cache_hits / requests) * 100.0, 2) if requests > 0 else 0.0
+
+        sf_coalescing_ratio = round(singleflight_coalesced / db_fallbacks, 4) if db_fallbacks > 0 else 0.0
+        sf_coalescing_ratio_pct = round((singleflight_coalesced / db_fallbacks) * 100.0, 2) if db_fallbacks > 0 else 0.0
+
+        audit_nodes[name] = {
+            "node": name,
+            "status": "online",
+            "circuit_state": circuit_state,
+            "invariant_pass": node_pass,
+            "invariant_1": {
+                "pass": inv1_pass,
+                "equation": f"requests ({inv1_lhs}) == sum ({inv1_rhs})",
+                "requests": inv1_lhs,
+                "classified_sum": inv1_rhs,
+                "details": {
+                    "rate_limited": rate_limited,
+                    "nonce_replays": nonce_replays,
+                    "pop_rejected": pop_rejected,
+                    "l1_hits": l1_hits,
+                    "l2_hits": l2_hits,
+                    "db_fallbacks": db_fallbacks,
+                    "redis_outage_blocked": redis_outage_blocked,
+                }
+            },
+            "invariant_2": {
+                "pass": inv2_pass,
+                "equation": f"db_fallbacks ({inv2_lhs}) == sum ({inv2_rhs})",
+                "db_fallbacks": inv2_lhs,
+                "resolved_sum": inv2_rhs,
+                "details": {
+                    "db_queries_executed": db_queries_executed,
+                    "singleflight_coalesced": singleflight_coalesced,
+                    "l1_double_check_hits": l1_double_check_hits,
+                    "circuit_blocked": circuit_blocked,
+                }
+            },
+            "db_load_reduction_ratio": db_load_reduction_ratio,
+            "db_load_reduction_percentage": db_load_reduction_percentage,
+            "cache_hit_ratio": cache_hit_ratio,
+            "cache_hit_ratio_pct": cache_hit_ratio_pct,
+            "singleflight_coalescing_ratio": sf_coalescing_ratio,
+            "singleflight_coalescing_ratio_pct": sf_coalescing_ratio_pct,
+        }
+
+    overall_pass = (online_count > 0) and all_pass
+
+    return {
+        "overall_invariant_pass": overall_pass,
+        "online_nodes_count": online_count,
+        "total_nodes_count": len(metrics),
+        "nodes": audit_nodes,
+    }
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run("control_plane:app", host='0.0.0.0', port=8080)
