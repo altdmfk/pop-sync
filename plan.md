@@ -20,10 +20,10 @@
 ## 2. 버전별 구현 이력 및 로드맵 (Version Roadmap)
 
 ```
-[v0.1.0 ~ v0.6.0] ────────> [v0.7.0] ────────> [v0.8.0 (Current)] ────────> [v1.0.0 (Backlog)]
- 기반 파이프라인 및 코어         1차 코드베이스 감사 및         2차 리팩토링 및 격리           프로덕션 인프라 고도화
- 복원력/관측성 구현 완료         동시성/보안 리팩토링 완료      (Invariant/테스트/SSE)         (디스커버리/컨테이너)
- (완료 [x])                     (완료 [x])                    (완료 [x])                    (계획 [ ])
+[v0.1.0 ~ v0.6.0] ────> [v0.7.0] ────> [v0.8.0] ────> [v0.9.0 (Current)] ────> [v1.0.0 (Backlog)]
+ 기반 파이프라인 및      1차 코드베이스   2차 리팩토링     3차 감사 백로그 반영       프로덕션 인프라 고도화
+ 복원력/관측성 구현      동시성/보안      (Invariant/SSE/  (CB/PEL/RL/라이프사이클/   (디스커버리/컨테이너/
+ (완료 [x])              (완료 [x])       테스트 격리 [x])  픽스처/문서 복구 [x])      부하 도구 계획 [ ])
 ```
 
 ---
@@ -103,7 +103,7 @@
 
 ---
 
-### v0.7.0: 1차 코드베이스 감사 및 동시성/보안 리팩토링 (Current) [완료]
+### v0.7.0: 1차 코드베이스 감사 및 동시성/보안 리팩토링 [완료]
 - [x] **Single-Flight 취소 및 Future 라이프사이클 누수 수정**
   - `db_loader_task` 예외 처리를 `BaseException`으로 확장하여 `asyncio.CancelledError` 감지 시 Follower Future 취소 전파
   - `finally` 블록에서 `in_flight.get(comp_key) is fut` 검증 후 삭제하도록 수정하여 신규 Future 오삭제 방지
@@ -122,7 +122,7 @@
 
 ---
 
-### v0.8.0: 2차 정밀 개선 및 테스트 격리 (Current) [완료]
+### v0.8.0: 2차 정밀 개선 및 테스트 격리 [완료]
 - [x] **Redis 장애 503 응답 Invariant 카운터 정렬**
   - `gateway.py`에 `stats["redis_outage_blocked"]` 신설, Nonce 검증 실패(503 Fail-Closed) 시 증가 처리
   - `static/index.html` Invariant RHS 방정식에 `stats.redis_outage_blocked` 합산 추가하여 Redis 다운 시에도 `Pass (LHS == RHS)` 평가되도록 수정
@@ -130,7 +130,7 @@
 - [x] **pytest 테스트 스위트 격리 및 E2E 마커 분리**
   - `pytest.ini`에 `markers = e2e` 및 `addopts = -m "not e2e"` 등록
   - 외부 도커 클러스터 의존 테스트 모듈/함수에 `@pytest.mark.e2e` 및 `pytestmark = pytest.mark.e2e` 부여
-  - `pytest -v` 실행 시 단위 테스트 29건만 2.1초 내 실행 완료, `pytest -m e2e`로 E2E 스위트(10건) 타겟팅 분리
+  - `pytest -v` 실행 시 단위 테스트만 실행하고 `pytest -m e2e`로 E2E 스위트 타겟팅 분리
 - [x] **Control Plane SSE 브로드캐스트 아키텍처 개선 (Single-Poller Fan-Out)**
   - `control_plane.py`의 클라이언트별 독립 폴링 루프를 제거하고 백그라운드 단일 폴러 태스크(`broadcast_metrics_loop`)로 전환
   - 게이트웨이 폴링 트래픽을 $N$배에서 1회로 고정하고, `subscribers` 집합 내 `asyncio.Queue`로 논블로킹 팬아웃 브로드캐스팅
@@ -145,6 +145,29 @@
 
 ---
 
+### v0.9.0: 3차 리팩토링 — 감사 백로그 반영 (Current) [완료]
+- [x] **서킷 브레이커 HALF_OPEN 즉시 재개방 및 `/pubkey` 연동 (B-01, B-05)**
+  - `CircuitBreaker.record_failure()`에서 `HALF_OPEN` 상태일 때 2.0초 디바운스를 우회하여 실패 즉시 `OPEN`으로 재개방하도록 수정
+  - PoP 활성화 시 `/pubkey` DB 폴백 경로에 `cb.can_execute()`, `cb.record_success()`, `cb.record_failure()` 및 `sync` 모드 세마포어 타임아웃(`DB_SEMAPHORE_ACQUIRE_TIMEOUT`) 적용
+- [x] **로컬 Rate Limit 슬라이딩 윈도우 보존 및 LRU 축출 (B-03)**
+  - `cleanup_local_rl`이 직전 윈도우(`now_window - 1`)를 유지하고 `now_window - 2` 이하만 삭제하도록 수정
+  - `local_rate_limits`를 `OrderedDict`로 전환하고 `RL_LOCAL_MAX_KEYS` 도달 시 전체 `clear()` 대신 가장 오래된 항목만 `popitem(last=False)`로 축출하도록 개선
+- [x] **Stream PEL 전량 드레인, 메시지 헬퍼 통합 및 스트림 상한 설정 (B-02)**
+  - 파티션 복구 시 `XREADGROUP ... "0"` 호출을 `while True:` 루프로 감싸 100건 초과 PEL도 전량 드레인한 뒤 `">"`로 전환
+  - `stream_listener` 내 3곳의 중복 메시지 처리 루프를 `_process_stream_messages` 헬퍼로 통합하고 `invalidate_cache`의 `xadd`에 `maxlen=10000, approximate=True` 적용
+- [x] **백그라운드 태스크 참조 보관 및 안전한 종료 순서 보장 (B-04)**
+  - 모듈 전역 `background_tasks` 집합에 모든 백그라운드 태스크를 등록·자동 해제(`discard`)하도록 구성
+  - `lifespan` 종료 시 백그라운드 태스크 완료를 먼저 대기한 뒤 HTTP/Redis 클라이언트를 닫고 스레드 풀을 `shutdown(wait=False, cancel_futures=True)`로 종료하도록 수정
+- [x] **Redis 스크립트 지연 등록 및 관리자 토큰 검증 강화 (B-07, B-08)**
+  - `get_redis_client()`에서 `nonce_script`/`rl_script`를 지연 등록하고 `check_rate_limit`의 `"fixed"` 분기에서도 `get_redis_client().pipeline(...)`을 사용하도록 수정
+  - `ADMIN_SECRET_TOKEN` 공백 문자열 거부, Control Plane `fetch_metrics` 동시 폴링(`asyncio.gather`) 및 `raise_for_status()` 적용, `/chaos/auth_check` 및 `policy_db.py:/chaos/db/{state}` 토큰 검증 추가
+- [x] **Invariant 카운터 보완, 중복 DOM ID 제거, 픽스처 통합 및 문서 복구 (B-10, B-11, B-12)**
+  - `check_rate_limit` 503 예외 시 `redis_outage_blocked` 증가 및 `static/index.html` 중복 DOM ID 제거
+  - `conftest.py`의 `mock_common_dependencies`로 테스트 픽스처 일원화, `test_flapping`/`test_rl_node_fallback` E2E 함수 추가(`41 passed, 12 deselected`)
+  - 마크다운 제어 문자 오염 복구 및 벤치마크·개발 로그 정합성 현행화 (B-06, B-09는 동작 영향이 없고 변경 범위가 커서 의도적 제외)
+
+---
+
 ### v1.0.0: 인프라 고도화 및 운영 환경 준비 (Backlog) [계획]
 - [ ] **동적 서비스 디스커버리 (Service Discovery)**
   - 하드코딩된 게이트웨이 노드 목록(Node-A 등) 및 IP를 Consul 또는 DNS 기반 동적 디스커버리로 전환
@@ -152,20 +175,22 @@
   - 게이트웨이, Control Plane, Policy DB 단일 빌드 이미지 분리 및 최종 런타임 이미지 경량화
 - [ ] **전용 부하 생성 도구 분리**
   - Control Plane 내장 부하 생성기 대신 k6 스크립트 기반 고부하 분산 테스트 환경 구축
+- [ ] **분산 고도화 잔여 과제**
+  - 서킷 브레이커 `HALF_OPEN` 동시 시험 요청 1건 제한, 클러스터 전역 Single-Flight, Redis Streams `XAUTOCLAIM` 및 미사용 컨슈머 그룹 정리
 
 ---
 
 ## 3. 마일스톤 검증 기준 (Acceptance Criteria)
 
-| 검증 영역 | 기준 | 현재 상태 (v0.8.0) |
+| 검증 영역 | 기준 | 현재 상태 (v0.9.0) |
 | :--- | :--- | :---: |
 | **코어 파이프라인** | 게이트웨이 3개 노드, Control Plane, Policy DB, Redis 정상 기동 및 통신 | **PASS** |
-| **다단계 캐시** | L1 미스 -> L2 미스 -> DB 조회 순 동작 및 파티션 해소 시 PEL 동기화 | **PASS** |
-| **단일 비행** | 동일 키 50개 동시 요청 시 DB 조회가 1회로 병합 처리 및 태스크 취소 안전성 확보 | **PASS** |
-| **보안 및 유량 제어** | 슬라이딩 윈도우 유량 제한, Nonce 소진, 상수 시간 토큰 비교(`hmac.compare_digest`) | **PASS** |
-| **서킷 브레이커** | DB 다운 시 OPEN 전이, degraded 응답, 2.0s 디바운스 플래핑 방지, 프로퍼티 캡슐화 | **PASS** |
-| **단위 테스트** | 단위/경계 테스트 스위트 전체 통과 (`pytest -v` 기준 29 passed) | **PASS** |
-| **통계 불변성** | 정상 및 Redis 다운 시 Invariant 방정식 100% 일치 (`redis_outage_blocked` 반영) | **PASS** |
-| **E2E 테스트 격리** | 단위 테스트와 E2E 테스트 마커 분리 (`addopts = -m "not e2e"`, 10 deselected) | **PASS** |
-| **SSE 아키텍처** | Control Plane 단일 폴러 메트릭 수집 및 `asyncio.Queue` 팬아웃 브로드캐스팅 | **PASS** |
-| **프로덕션 인프라** | 동적 서비스 디스커버리 및 멀티스테이지 Dockerfile 분리 | **TODO (v1.0.0)** |
+| **다단계 캐시** | L1 미스 -> L2 미스 -> DB 조회 순 동작, 파티션 해소 시 PEL 전량 드레인 및 `xadd maxlen` 적용 | **PASS** |
+| **단일 비행** | 동일 키 50개 동시 요청 시 DB 조회가 1회로 병합 처리 및 태스크 취소·종료 안전성 확보 | **PASS** |
+| **보안 및 유량 제어** | 슬라이딩 윈도우(직전 윈도우 보존·LRU 축출), Nonce 소진, 전 컴포넌트 `hmac.compare_digest` 인증 | **PASS** |
+| **서킷 브레이커** | DB 다운 시 OPEN 전이, `HALF_OPEN` 실패 즉시 재개방, 2.0s 디바운스, `/pubkey` 서킷 연동 | **PASS** |
+| **단위 테스트** | 단위/경계 테스트 스위트 전체 통과 (`pytest -v` 기준 41 passed) | **PASS** |
+| **통계 불변성** | 정상 및 Rate Limit/Nonce 503 장애 시 Invariant 방정식 100% 일치 (`redis_outage_blocked` 반영) | **PASS** |
+| **E2E 테스트 격리** | 단위 테스트와 E2E 테스트 마커 분리 (`addopts = -m "not e2e"`, 12 deselected) | **PASS** |
+| **SSE 아키텍처** | Control Plane 동시 폴링(`asyncio.gather`) 메트릭 수집 및 `asyncio.Queue` 팬아웃 브로드캐스팅 | **PASS** |
+| **프로덕션 인프라** | 동적 서비스 디스커버리, 멀티스테이지 Dockerfile 분리 및 분산 잔여 과제 | **TODO (v1.0.0)** |

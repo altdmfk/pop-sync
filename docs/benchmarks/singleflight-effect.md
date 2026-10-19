@@ -16,7 +16,7 @@
 | 요청 분산 방식 | 스크립트가 gateway-a/b/c에 라운드로빈 |
 | Rate Limit (per client) | 50 req/10s (L1 캐시 없는 키는 최대 50개가 DB 경로 진입) |
 | `DB_TIMEOUT_SEC` | 1.0초 (gateway.py 하드코딩) |
-| `MAX_DB_WORKERS` | 10 (gateway.py 하드코딩) |
+| `MAX_DB_WORKERS` | 5 (gateway.py 하드코딩) |
 | `DB_SEMAPHORE_ACQUIRE_TIMEOUT` | 0.1초 |
 | 클라이언트 타임아웃 | 30.0초 (`httpx.AsyncClient`) |
 | 측정 스크립트 | `tests/measure_singleflight_effect.py` |
@@ -137,7 +137,7 @@ db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_h
 5. **L1 캐시 타이밍 의존성**: l1_hits 수는 100개 요청이 도착하는 타이밍과 첫 DB 응답 시점에 따라 회차마다 다름. 결정론적 재현 불가.
 6. **0.02초 조건에서 ON/OFF 차이 불분명**: DB 지연이 짧아 coalesced 기회가 적고, L1 캐시가 빠르게 채워져 DB 경로 진입 자체가 적음.
 7. **1.0초 조건 제외**: `DB_TIMEOUT_SEC=1.0`과 동일하여 타임아웃 경합 발생, 유효 조건 아님.
-8. **단일 비행 OFF 시 취소(Cancellation) 동작 차이**: OFF 모드이더라도 DB 조회는 syncio.shield로 감싸진 백그라운드 태스크에서 실행되므로, 클라이언트 연결이 끊겨도 DB 호출이 취소되지 않는 차이점이 존재한다 (pre-singleflight 버전과 다름).
+8. **단일 비행 OFF 시 취소(Cancellation) 동작 차이**: OFF 모드이더라도 DB 조회는 asyncio.shield로 감싸진 백그라운드 태스크에서 실행되므로, 클라이언트 연결이 끊겨도 DB 호출이 취소되지 않는 차이점이 존재한다 (pre-singleflight 버전과 다름).
 
 ---
 

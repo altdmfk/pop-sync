@@ -64,7 +64,7 @@
   - `stream_listener`에서 `if key in l1_cache: l1_cache.delete(key)` 호출로 불필요한 2회 연속 락 획득 발생.
   - `CircuitBreaker` 상태 관측 시 `with cb._lock: state = cb.state` 형태로 내부 락 객체에 직접 접근해야 했음.
 - **수정 내용 및 결과**:
-  - `L1Cache` 기본값을 모듈 전역 설정(`L1_MAX_SIZE`, `L1_TTL_SEC`)과 연동하고 스레드 세이프한 `clear()` 메서드 추가. `delete()`가 락 내부에서 단일 원자 연산으로 동작하도록 수정.
+  - `L1Cache` 기본값을 모듈 전역 설정(`L1_MAX_SIZE`, `L1_TTL_SEC`)과 연동하고 스레드 세이프한 `clear()` 메서드 추가. `delete()`가 락 내부에서 단일 원자 연산으로 동작하도록 수정. (단, 테스트 코드의 `l1_cache.cache.clear()` 직접 호출은 일부 남아 있었으며 4.9에서 정정)
   - `CircuitBreaker`에 `@property def current_state(self) -> str:` 프로퍼티를 추가하여 내부 락으로 보호된 읽기 경로 캡슐화.
 
 ### 2.4 HTTP 및 Redis 클라이언트 풀링 구조화 및 테스트 호환성 확보
@@ -73,7 +73,7 @@
   - 전역 클라이언트가 FastAPI `lifespan`에서만 초기화되어 `TestClient`나 단위 테스트 실행 시 `None` 참조 에러 발생.
   - `control_plane.py`의 `httpx.AsyncClient` 커넥션 풀이 기본값(100)으로 제한되어 다중 노드 카오스 요청 발생 시 타임아웃 병목 유발.
 - **수정 내용 및 결과**:
-  - `get_async_db_client()`, `get_sync_http_client()`, `get_redis_client()`, `get_async_http_client()` 지연 초기화(Lazy Initialization) 팩토리 구현. `lifespan` 미실행 환경에서도 커넥션 풀을 반환하여 테스트 호환성 확보.
+  - `get_async_db_client()`, `get_sync_http_client()`, `get_redis_client()`, `get_async_http_client()` 지연 초기화(Lazy Initialization) 팩토리 구현. `lifespan` 미실행 환경에서도 커넥션 풀을 반환하여 테스트 호환성 확보. (단, `nonce_script`/`rl_script` 지연 등록과 `check_rate_limit`의 `"fixed"` 분기 팩토리 적용은 누락되어 있었으며 4.5에서 정정)
   - `control_plane.py`의 `httpx.AsyncClient`에 `limits=httpx.Limits(max_connections=200, max_keepalive_connections=50)` 설정 적용. 소켓 고갈 방지.
 
 ### 2.5 예외 은폐(Silent Swallow) 제거 및 코드베이스 정돈
@@ -98,7 +98,7 @@
 ### 3.2 Pytest Runner와 E2E 테스트 스위트 격리
 - **대상 파일 및 함수**: `pytest.ini`, `tests/test_scenarios.py`, `tests/test_flapping.py`, `tests/test_verify_half_open_and_auth.py`, `tests/stress_test.py`, `tests/test_rl_fallback.py`, `tests/test_rl_node_fallback.py`
 - **기존 문제**: 외부 Docker 클러스터 구동을 전제하는 E2E 및 스트레스 테스트가 기본 테스트 스위트에 포함되어, 로컬 환경에서 `pytest` 실행 시 다수의 연결 실패(`ConnectError`) 및 타임아웃 발생.
-- **수정 내용 및 결과**: `pytest.ini`에 `e2e` 마커를 등록하고 기본 실행 옵션으로 `addopts = -m "not e2e"` 설정. 라이브 HTTP/클러스터 의존 테스트 파일 및 함수에 `@pytest.mark.e2e` 데코레이터를 적용. `pytest -v` 실행 시 E2E 10건이 자동 제외되고 순수 단위 테스트 29건만 2.1초 내에 통과하며, `pytest -m e2e`로 E2E 스위트만 별도 타겟팅 가능하도록 분리함.
+- **수정 내용 및 결과**: `pytest.ini`에 `e2e` 마커를 등록하고 기본 실행 옵션으로 `addopts = -m "not e2e"` 설정. 라이브 HTTP/클러스터 의존 테스트 파일 및 함수에 `@pytest.mark.e2e` 데코레이터를 적용. `pytest -v` 실행 시 E2E 10건이 자동 제외되고 순수 단위 테스트 29건만 2.1초 내에 통과하며, `pytest -m e2e`로 E2E 스위트만 별도 타겟팅 가능하도록 분리함. (단, `test_flapping.py`와 `test_rl_node_fallback.py`에는 `test_*` 함수가 없어 pytest 수집 대상에서 빠져 있었으며 4.9에서 정정)
 
 ### 3.3 Control Plane SSE 단일 폴러 팬아웃(Fan-Out) 전환
 - **대상 파일 및 함수**: `control_plane.py:metrics_stream`, `broadcast_metrics_loop`, `lifespan`, `tests/test_control_plane.py`
@@ -108,4 +108,68 @@
 ### 3.4 단위 테스트 전역 상태 격리 및 경계값 테스트 보강
 - **대상 파일 및 함수**: `tests/conftest.py`, `tests/test_pop.py`, `tests/test_singleflight.py`
 - **기존 문제**: `test_pop.py` 실행 시 설정된 `POP_VERIFY_ENABLED = True` 플래그가 테스트 종료 후 원복되지 않아 후속 `test_singleflight.py` 실행 시 서명 누락(400 Bad Request)으로 연쇄 실패함. 서킷 브레이커 디바운스 및 Single-Flight 예외 시 맵 정리 경계 테스트 부재.
-- **수정 내용 및 결과**: `conftest.py`에 `clean_gateway_state` autouse 픽스처 및 `mock_common_dependencies`를 구축하여 전역 설정/캐시/카운터를 매 테스트 전후로 초기화함. 서킷 브레이커 2.0초 디바운스 전이 경계(`CLOSED` -> `OPEN` -> `HALF_OPEN`), Single-Flight 예외 전파 및 `in_flight` 맵 정리, Redis 장애 503 Invariant 일치성 단위 테스트를 추가함.
+- **수정 내용 및 결과**: `conftest.py`에 `clean_gateway_state` autouse 픽스처 및 `mock_common_dependencies`를 구축하여 전역 설정/캐시/카운터를 매 테스트 전후로 초기화함. 서킷 브레이커 2.0초 디바운스 전이 경계(`CLOSED` -> `OPEN` -> `HALF_OPEN`), Single-Flight 예외 전파 및 `in_flight` 맵 정리, Redis 장애 503 Invariant 일치성 단위 테스트를 추가함. (단, 당시 `mock_common_dependencies`는 실제 테스트 함수에서 참조되지 않았고 파일별 중복 픽스처가 남아 있었으며 4.9에서 정정)
+
+---
+
+## 4. 3차 리팩토링: 감사 백로그 반영 (v0.9.0, 2026-10-19)
+
+### 4.1 B-01 서킷 브레이커 HALF_OPEN 실패 즉시 재개방
+- **대상 파일 및 함수**: `gateway.py:CircuitBreaker.record_failure`, `tests/test_singleflight.py:test_circuit_breaker_debounce_and_half_open_boundary`
+- **기존 문제**: `can_execute()` 또는 `check_and_half_open()`를 통해 `OPEN`에서 `HALF_OPEN`으로 전환될 때 `last_transition_time`이 현재 시각으로 갱신되면서, 전환 후 2.0초(`CB_DEBOUNCE_SEC`) 이내에 발생한 `HALF_OPEN` 시험 요청의 실패가 디바운스 조건에 걸려 무시되고 서킷이 `HALF_OPEN` 상태에 머무르는 문제가 있었다.
+- **수정 내용 및 결과**: `record_failure()` 진입 시 디바운스 검사 이전에 `self.state == "HALF_OPEN"` 분기를 우선 처리하여, `HALF_OPEN` 상태에서는 디바운스를 우회하고 즉시 `failures`를 증가시킨 뒤 `OPEN`으로 재개방(`last_transition_time`, `last_failure_time` 갱신)하도록 수정했다(`CLOSED` 상태의 2.0초 디바운스는 유지). `test_circuit_breaker_debounce_and_half_open_boundary` 단위 테스트로 검증했으며, 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.2 B-03 로컬 Rate Limit 정리 윈도우/키 축출
+- **대상 파일 및 함수**: `gateway.py:cleanup_local_rl`, `gateway.py:_local_rate_limit`, `gateway.py:local_rate_limits`, `tests/test_rate_limit.py`
+- **기존 문제**: `cleanup_local_rl`이 `w < now_window` 조건으로 직전 윈도우(`now_window - 1`) 버킷까지 삭제하여 슬라이딩 윈도우 로컬 폴백(`_local_rate_limit`)의 이전 윈도우 가중치 계산이 소실되었고, `_local_rate_limit`에서 `RL_LOCAL_MAX_KEYS` 도달 시 `local_rate_limits.clear()`로 전체 맵을 비워 기존에 제한 중이던 클라이언트의 카운트까지 초기화되는 문제가 있었다.
+- **수정 내용 및 결과**: `cleanup_local_rl`의 삭제 조건을 `w < now_window - 1`로 변경하여 현재 윈도우(`now_window`)와 직전 윈도우(`now_window - 1`)를 유지하고 `now_window - 2` 이하만 삭제하도록 수정했다. 또한 `local_rate_limits`를 `OrderedDict`로 변경하고 조회·갱신 시 `move_to_end`를 호출하며, `RL_LOCAL_MAX_KEYS` 도달 시 `popitem(last=False)`로 가장 오래된 키만 축출하도록 수정했다. `test_cleanup_local_rl_compatible_with_new_key_format` 및 `test_local_rl_max_keys_does_not_reset_existing_client` 테스트로 검증했으며, 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.3 B-02 Stream PEL 전량 드레인 및 xadd maxlen
+- **대상 파일 및 함수**: `gateway.py:stream_listener`, `gateway.py:_process_stream_messages`, `gateway.py:invalidate_cache`, `tests/test_stream_listener.py`
+- **기존 문제**: 파티션 복구 시 `stream_listener`가 `XREADGROUP` ID `"0"`(PEL)을 `count=STREAM_CATCHUP_COUNT`(100)로 1회만 호출하여 미확인 메시지가 100건을 초과할 경우 잔여 PEL이 남아 있는 상태에서 `">"` 읽기로 전환되는 문제가 있었다. 또한 `stream_listener` 내 3개 구간에 메시지 처리 루프가 중복되어 있었고, `invalidate_cache`의 `xadd` 호출에 스트림 길이 상한이 없었다.
+- **수정 내용 및 결과**: 파티션 복구 시 `XREADGROUP ... {STREAM_NAME: "0"}` 호출을 `while True:` 루프로 감싸 빈 배치가 반환될 때까지 PEL을 전량 드레인한 뒤 `">"` 읽기로 전환하도록 수정했다. 3곳의 중복 메시지 처리 루프는 `_process_stream_messages` 헬퍼 함수로 통합했으며, `invalidate_cache`의 `xadd`에 `maxlen=10000, approximate=True`를 적용했다(단, 컨슈머의 L2 캐시 삭제 `active_redis_client.delete(f"policy:{key}")` 제거 항목은 기존 동작 유지를 위해 미적용하고 `_process_stream_messages` 내 기존 삭제 호출을 유지함). `test_pel_recovery_drains_all_batches_and_switches_to_live`, `test_stream_listener_deduplicated_message_helper`, `test_invalidate_cache_xadd_maxlen_approximate` 테스트로 검증했으며, 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.4 B-04 백그라운드 태스크 참조 보관 및 종료 순서
+- **대상 파일 및 함수**: `gateway.py:background_tasks`, `gateway.py:lifespan`, `gateway.py:auth`, `gateway.py:set_partition`, `gateway.py:set_redis`, `tests/test_stream_listener.py`
+- **기존 문제**: `asyncio.create_task`로 생성된 백그라운드 태스크(`db_loader_task`, `probe_db_health`, `close_old_clients` 등)의 강한 참조(strong reference)를 보관하지 않아 가비지 컬렉션에 의한 조기 소멸 위험이 있었고, `lifespan` 종료 시 백그라운드 태스크 완료를 대기하기 전에 HTTP/Redis 클라이언트를 닫거나 스레드 풀 `shutdown(wait=True)`로 지연될 수 있었다.
+- **수정 내용 및 결과**: 모듈 전역 `background_tasks: set[asyncio.Task] = set()`를 도입하고 모든 `asyncio.create_task` 호출부에 `background_tasks.add(task)` 및 `task.add_done_callback(background_tasks.discard)`를 적용했다. `lifespan` 종료 시 `stream_listener`와 `cleanup_local_rl`을 취소한 후 `await asyncio.gather(*tasks, *background_tasks, return_exceptions=True)`로 모든 백그라운드 태스크가 종료될 때까지 대기한 뒤 HTTP/Redis 클라이언트를 닫고, `db_executor`와 `pop_executor`는 `shutdown(wait=False, cancel_futures=True)`로 종료하도록 수정했다. `test_lifespan_awaits_background_tasks_before_closing_clients` 테스트로 검증했으며, 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.5 B-08 Redis 스크립트 지연 등록 및 ADMIN_SECRET_TOKEN 공백 검증
+- **대상 파일 및 함수**: `gateway.py:get_redis_client`, `gateway.py:check_rate_limit`, `gateway.py:consume_nonce`, `tests/test_rate_limit.py`
+- **기존 문제**: `lifespan`을 거치지 않는 테스트 환경에서 `get_redis_client()` 호출 시 `nonce_script`와 `rl_script`가 등록되지 않아 `NoneType` 호출 에러가 발생했고, `check_rate_limit`의 `"fixed"` 분기에서 `get_redis_client()` 대신 전역 `redis_client.pipeline(...)`을 직접 참조했다. 또한 `ADMIN_SECRET_TOKEN`이 공백 문자로만 이루어진 경우 시작 시점 검증을 통과하는 문제가 있었다.
+- **수정 내용 및 결과**: `get_redis_client()`에서 Redis 클라이언트 생성 시 `nonce_script`와 `rl_script`를 함께 등록하도록 수정하고, `check_rate_limit`(`"sliding"` 분기 `if rl_script is None: get_redis_client()`, `"fixed"` 분기 `get_redis_client().pipeline(transaction=True)`)와 `consume_nonce`(`if nonce_script is None: get_redis_client()`)가 지연 초기화된 리소스를 사용하도록 보완했다. 또한 모듈 로드 시 `if not ADMIN_SECRET_TOKEN or not ADMIN_SECRET_TOKEN.strip():` 조건으로 공백 전용 토큰을 거부하도록 수정했다. `test_lazy_redis_init_without_lifespan` 테스트로 검증했으며, 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.6 B-05 /pubkey 서킷 브레이커 연동
+- **대상 파일 및 함수**: `gateway.py:auth`, `tests/test_pop.py`
+- **기존 문제**: `POP_VERIFY_ENABLED=True`일 때 L1/L2 캐시 미스 후 Policy DB의 `/pubkey` 엔드포인트를 조회하는 경로가 서킷 브레이커(`cb`)와 연동되지 않아, 서킷이 `OPEN` 상태여도 DB 요청이 전송되고 `/pubkey` 타임아웃이나 5xx 에러가 서킷 실패 카운트에 기록되지 않았다. 또한 `sync` 모드의 `/pubkey` 조회에서 세마포어 획득 타임아웃(`DB_SEMAPHORE_ACQUIRE_TIMEOUT`)이 적용되지 않았다.
+- **수정 내용 및 결과**: `/pubkey` L1/L2 미스 시 `cb.can_execute()`를 먼저 확인하여 차단 상태이면 DB 호출 없이 `stats["circuit_state"]`, `stats["circuit_blocked"]`, `stats["pop_rejected"]`를 갱신하고 503(Fail-Closed, 선행 단계에서 Nonce는 이미 소진됨)을 반환하도록 수정했다. DB 조회 성공 시 `cb.record_success()`를 호출하고, 404(401 반환)나 `DBOverloadError`가 아닌 실패 발생 시 `cb.record_failure()`를 호출한 뒤 503을 반환하도록 연동했으며, `sync` 모드에는 `asyncio.wait_for(sem.acquire(), timeout=DB_SEMAPHORE_ACQUIRE_TIMEOUT)`을 적용했다. `test_pop_pubkey_circuit_breaker_and_timeout` 테스트로 검증했으며, 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.7 B-07 Control Plane 동시 폴링 및 auth_check 검증
+- **대상 파일 및 함수**: `control_plane.py:fetch_metrics`, `control_plane.py:broadcast_metrics_loop`, `control_plane.py:auth_check`, `control_plane.py:chaos_db`, `policy_db.py:set_db_state`, `docker-compose.yml`, `tests/test_control_plane.py`
+- **기존 문제**: `fetch_metrics()`가 게이트웨이 노드를 순차 폴링하여 응답 지연이 누적되었고 `resp.raise_for_status()` 호출이 누락되어 있었다. `broadcast_metrics_loop`에서 큐 적재 실패 시 경고 없이 예외를 무시했으며, `/chaos/auth_check`와 `policy_db.py`의 `/chaos/db/{state}` 엔드포인트에 `X-Admin-Token` 검증이 없었다.
+- **수정 내용 및 결과**: `fetch_metrics()`가 `asyncio.gather(*reqs, return_exceptions=True)`로 게이트웨이를 동시 폴링하고 `resp.raise_for_status()`를 호출하여 비정상 노드를 `offline` 상태로 격리하도록 수정했다. `broadcast_metrics_loop`에서 `q.put_nowait` 실패 시 `logging.warning` 출력 후 해당 큐를 `subscribers.discard(q)`로 제거하도록 개선했다. 또한 `/chaos/auth_check`와 `policy_db.py:set_db_state`에 `hmac.compare_digest` 기반 `X-Admin-Token` 검증(실패 시 401)을 추가하고, `control_plane.py:chaos_db` 요청 헤더와 `docker-compose.yml`의 `policy_db` 환경변수에 `ADMIN_SECRET_TOKEN`을 연동했다. `test_fetch_metrics_concurrent_and_error_handling`, `test_chaos_auth_check`, `test_policy_db_chaos_auth`, `test_broadcast_metrics_loop_drops_failed_subscriber` 테스트로 검증했으며, 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.8 B-10 Invariant 카운터 보완 및 중복 DOM ID 제거
+- **대상 파일 및 함수**: `gateway.py:auth`, `static/index.html`, `tests/test_singleflight.py`
+- **기존 문제**: `/auth`에서 `check_rate_limit` 호출 중 예외가 발생해 503을 반환할 때 `stats["redis_outage_blocked"]`가 증가하지 않아 `requests`와 분류 카운터 합계 간의 Invariant가 어긋날 수 있었고, `consume_nonce` 블록에서 401 리플레이 예외가 Redis 장애 `try/except` 블록 내부에 섞여 있었다. 또한 `static/index.html`의 노드 카드 템플릿에 중복된 메트릭 DOM ID(`lat-${n}`, `l1-${n}`, `l2-${n}`, `cb-${n}`)와 닫는 `</div>` 태그가 남아 있었다.
+- **수정 내용 및 결과**: `check_rate_limit` 예외 블록(503 반환)에서 `stats["redis_outage_blocked"] += 1`을 증가시키고, `consume_nonce`의 Redis 예외 처리(503)와 리플레이 판정(`if not nonce_ok:` -> 401 `nonce_replays += 1`)을 분리했다. `static/index.html`에서는 중복된 메트릭 DOM 요소 및 불필요한 `</div>` 6줄을 제거했다. `test_invariant_equality_under_rate_limit_503` 테스트로 검증했으며, 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.9 B-11 테스트 픽스처 통합
+- **대상 파일 및 함수**: `tests/conftest.py:clean_gateway_state`, `tests/conftest.py:mock_common_dependencies`, `tests/test_pop.py`, `tests/test_singleflight.py`, `tests/test_flapping.py:test_flapping`, `tests/test_rl_node_fallback.py:test_rl_node_fallback`
+- **기존 문제**: `tests/conftest.py`의 `mock_common_dependencies`가 사용되지 않고 `test_pop.py`와 `test_singleflight.py`에 파일별 중복 픽스처와 `l1_cache.cache.clear()` 직접 호출이 남아 있었다. 또한 `test_flapping.py`와 `test_rl_node_fallback.py`에는 `test_*` 함수가 정의되지 않아 `pytest -m e2e` 실행 시 수집되지 않았다.
+- **수정 내용 및 결과**: `conftest.py`의 `clean_gateway_state`와 `mock_common_dependencies`로 상태 초기화(`l1_cache.clear()` 등) 및 공통 Mock 구성을 통합하고, `test_pop.py`(`test_pop_valid_signature` 등)와 `test_singleflight.py`(`test_singleflight_100_requests` 등)가 이를 직접 사용하도록 정리했다. 또한 `test_flapping.py`에 `test_flapping`, `test_rl_node_fallback.py`에 `test_rl_node_fallback` 함수를 추가하여 E2E 수집 대상에 포함시켰다. 최종 `pytest -v` 실행 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.10 B-12 문서 오염 복구
+- **대상 파일 및 함수**: `README.md`, `docs/benchmarks/singleflight-effect.md`, `DEVELOPMENT_LOG.md`
+- **기존 문제**: `README.md`와 `docs/benchmarks/singleflight-effect.md`에 제어 문자(`0x07`, `0x08`, `0x09`)가 혼입되어 코드 펜스 및 식별자(`test_scenarios.py`, `test_rl_fallback.py`, `asyncio.shield`)가 손상되어 있었고, `singleflight-effect.md`의 `MAX_DB_WORKERS` 표기(`10`)가 `gateway.py`의 실제 기본값(`5`)과 달랐다. 또한 `DEVELOPMENT_LOG.md`의 기존 섹션 일부에 실제 코드와 다른 서술이 있었다.
+- **수정 내용 및 결과**: 마크다운 파일의 제어 문자 오염을 전수 제거하고 코드 펜스(` ```bash `)와 식별자를 복구했으며, `README.md`의 단위 테스트 명령을 `pytest -v`, E2E 명령을 `pytest -m e2e`로 갱신했다. `singleflight-effect.md`의 `MAX_DB_WORKERS`를 `5`로 수정하고, `DEVELOPMENT_LOG.md`에 3차 리팩토링 내역과 정정 주석을 반영했다. 기존 테스트 스위트(`test_circuit_breaker_debounce_and_half_open_boundary` 포함 전체)를 실행하여 최종 `pytest -v` 결과 41 passed(12 deselected)를 확인했다.
+
+### 4.11 의도적 미적용 항목
+- **B-06 (`DB_MODE` sync 기본값)**: 동작 영향이 없고 변경 범위가 커서 이번 범위에서 제외한다.
+- **B-09 (이중 락 구조 및 미사용 반환값)**: 동작 영향이 없고 변경 범위가 커서 이번 범위에서 제외한다.
+
+### 4.12 알려진 잔여 과제
+- **HALF_OPEN 동시 시험 요청 1건 제한 미구현**: `CircuitBreaker.can_execute()`는 `HALF_OPEN` 상태에서 별도의 단일 프로브 세마포어나 카운터를 두지 않으므로, 첫 시험 요청의 결과가 기록되기 전에 동시 유입된 다수의 요청이 함께 통과할 수 있다.
+- **클러스터 전역 Single-Flight 미지원**: `in_flight` 맵은 각 게이트웨이 프로세스 내부 메모리에만 존재하므로, 동일 키 요청이 서로 다른 게이트웨이 노드로 분산 유입될 경우 노드별로 각각 1회씩 DB 호출이 발생한다.
+- **XAUTOCLAIM/미사용 컨슈머 그룹 정리 미구현**: `stream_listener()`는 노드 고유의 컨슈머 그룹(`gateway_group_{node_name}`)에 대해 자신의 PEL(`"0"`)만 재처리하며, 영구 이탈한 다른 컨슈머의 미확인 메시지를 인계받는 `XAUTOCLAIM`이나 미사용 컨슈머 그룹 삭제 로직은 구현되어 있지 않다.
+

@@ -65,27 +65,28 @@ Control Plane의 /chaos/* 엔드포인트는 X-Admin-Token 헤더로 보호된�
 ## 빠른 시작
 
 1. 환경 변수 파일 생성:
-`ash
+```bash
 cp .env.example .env
-`
+```
 2. .env 파일 내부의 ADMIN_SECRET_TOKEN 값을 설정한다. 단, 테스트 스크립트와 conftest 등은 기본적으로 super-secret-admin 토큰을 사용하므로 스크립트 구동 시에는 해당 값으로 설정해야 한다.
 3. 클러스터 빌드 및 구동:
-`ash
+```bash
 docker-compose up -d --build
-`
+```
 4. **접속 정보**:
    - 대시보드(Control Plane): http://localhost:8080
    - 게이트웨이(Gateway) 노드: http://localhost:8001, 8002, 8003
 
 ### 단위 테스트 실행 방법
-`ash
+```bash
 python -m venv .venv
 source .venv/bin/activate  # (Windows: .\.venv\Scripts\activate)
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
-pytest tests/test_singleflight.py tests/test_rate_limit.py tests/test_pop.py -v
-`
-> E2E 테스트 스크립트(	est_scenarios.py, 	est_rl_fallback.py 등)는 실제 도커 클러스터 구동이 필요하다.
+pytest -v
+```
+> E2E 테스트 스크립트(test_scenarios.py, test_rl_fallback.py 등)는 실제 도커 클러스터 구동이 필요하다.
+> E2E 테스트 실행: `pytest -m e2e`
 
 ---
 
@@ -93,10 +94,10 @@ pytest tests/test_singleflight.py tests/test_rate_limit.py tests/test_pop.py -v
 
 - **근사 알고리즘 오차**: Sliding Window는 단순 가중 합산 근사치이므로 이상값이 발생할 수 있으며, 차단된 429 요청도 카운트에 포함된다.
 - **노드 간 시각차 (Clock Skew)**: 노드 간 시각차가 클 경우 윈도우 경계 계산에서 불일치가 발생할 수 있다.
-- **단일 비행 취소(Cancellation) 동작 차이**: OFF 모드라도 백그라운드 태스크(syncio.shield)에서 DB 조회가 계속 진행되므로, 클라이언트 연결이 끊겨도 DB 호출이 취소되지 않는 차이점이 존재한다 (pre-singleflight 버전과 다름).
+- **단일 비행 취소(Cancellation) 동작 차이**: OFF 모드라도 백그라운드 태스크(asyncio.shield)에서 DB 조회가 계속 진행되므로, 클라이언트 연결이 끊겨도 DB 호출이 취소되지 않는 차이점이 존재한다 (pre-singleflight 버전과 다름).
 - **성능 실측의 한계**: Single-flight 성능 검증은 단일 노드에서 DB 지연을 시뮬레이션하여 3회 반복한 제한적 조건에서 수행되었다.
 - **PoP 서명의 한계**: 검증 필드에 Timestamp, Body, Query, Host가 결합되지 않으며(Unbound fields), kid(Key-ID) 헤더 지원 및 하드웨어 Attestation 파싱 기능이 없다. 테스트에는 단일 Demo Key만 사용된다.
-- **PoP 테스트 구성**: PoP 기능(Toggle ON) 시나리오는 클라이언트가 실제로 서명을 생성해야 하므로 기존 	est_scenarios.py (서명 없이 전송) 환경과 분리되어 검증이 제한적이다.
+- **PoP 테스트 구성**: PoP 기능(Toggle ON) 시나리오는 클라이언트가 실제로 서명을 생성해야 하므로 기존 test_scenarios.py (서명 없이 전송) 환경과 분리되어 검증이 제한적이다.
 - **테스트 환경 제약**: 단위 테스트는 Redis/DB를 Mock으로 대체하며, 일부 기존 E2E 테스트(컨테이너명 하드코딩, Fixture 누락, pre-singleflight 비교 부재)가 실패하는 제약이 있다. 잘못된 "노드당 한도(per-node)" 주석 등은 현재 버전에서 수정되었다.
 
 - **Invariant 정합성 (Phase 2 개선)**: Redis 장애 시 Nonce 검증 단계에서 503 에러로 조기 반환(Fail-Closed)된 요청을 `redis_outage_blocked` 전용 카운터로 집계하여, `requests == sum(classified_counters) + redis_outage_blocked` 불변식 방정식이 Redis 다운 상황에서도 100% 일치(PASS)하도록 개선되었다.
