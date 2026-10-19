@@ -97,11 +97,11 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
 | # | 시나리오명 | 트리거 (API / 설정) | 핵심 방어 메커니즘 | 기대 HTTP 응답 및 상태 | 핵심 관측 메트릭 |
 | :-: | :--- | :--- | :--- | :--- | :--- |
 | **1** | **중복 요청 및 리플레이 방어** | `POST /chaos/nonce` | Redis Lua 원자적 Nonce 소진 (`NONCE_LUA`) | 1개 노드 `200 OK`, 다른 노드 `401 Replay Detected` (Redis 장애 시 양쪽 `503`) | `nonce_replays +1` (장애 시 `redis_outage_blocked +1`) |
-| **2** | **대규모 DDoS 및 경계 버스트 방어** | `POST /chaos/ddos` (60건 동시 폭주) | 클러스터 전역 O(1) 가중 합산 슬라이딩 윈도우 (`50 req / 10s`) | 첫 실행 `200` 50건 / `429` 10건, 연속 실행 시 `429` 60건 (100% 차단) | `rate_limited` 증가, `Retry-After: 10` 헤더 |
+| **2** | **대규모 DDoS 및 경계 버스트 방어** | `POST /chaos/ddos` (60건 동시 폭주) | 비오염 Check-Before-Increment O(1) 가중 합산 슬라이딩 윈도우 (`50 req / 10s`) | 첫 실행 `200` 50건 / `429` 10건, 연속 실행 시 `429` 60건 (100% 차단) | `rate_limited` 증가, `Retry-After: 10` 헤더 |
 | **3** | **동일 키 폭주 및 단일 비행 병합** | `POST /chaos/same_key_burst` (`count=50`) | In-Flight Future 병합 (`asyncio.shield`) 및 L1 재활용 | 50건 모두 `200 OK`, **실제 DB 쿼리는 단 1회만 실행** (부하 98% 절감) | `db_queries_executed +1`, `singleflight_coalesced + delta_l1_hits = 49` |
-| **4** | **백엔드 DB 장애 격리 및 서킷 브레이커** | `POST /chaos/db/down` → `/chaos/db/up` | 3-State 서킷 브레이커, 2.0s 디바운스, 세마포어 벌크헤드 | 캐시 히트는 `200 OK(L1/L2)`, 캐시 미스는 `200 OK(degraded_allow)` 폴백 | `circuit_state: OPEN`, `circuit_blocked` 증가 |
+| **4** | **백엔드 DB 장애 격리 및 서킷 브레이커** | `POST /chaos/db/down` → `/chaos/db/up` | 3-State 서킷 브레이커, HALF_OPEN 단일 프로브 원자적 게이팅, 2.0s 디바운스 | 캐시 히트는 `200 OK(L1/L2)`, 캐시 미스는 `200 OK(degraded_allow)` 폴백 | `circuit_state: OPEN`, `circuit_blocked` 증가 |
 | **5** | **중앙 Redis 장애 및 로컬 생존 모드** | `POST /chaos/redis/down` → `/chaos/redis/up` | 로컬 Rate Limit 폴백(`15 req / 10s`) + Nonce `503 Fail-Closed` | 노드당 한도(15건) 초과분은 `429`, 통과분(15건)은 Nonce 단계에서 `503` 차단 | `local_rl_size` 활성화, `redis_outage_blocked` 증가, Invariant `PASS` |
-| **6** | **네트워크 파티션 및 PEL 긴급 복구** | `POST /chaos/partition/Node-B/isolate` → `heal` | 고립 노드 `503` 차단(Split-Brain 방어) + 복구 시 Stream PEL(`"0"`) 전량 드레인 | 단절 중 `/auth`는 `503 Node Isolated`, 복구 즉시 누락 무효화 일괄 반영 | `is_partitioned: true→false`, `last_catchup.pending_count` 기록 |
+| **6** | **네트워크 파티션 및 PEL 긴급 복구** | `POST /chaos/partition/Node-B/isolate` → `heal` | 고립 노드 `503` 차단(Split-Brain 방어) + 복구 시 Stream PEL(`"0"`) 전량 드레인 및 XAUTOCLAIM 유휴 회수 | 단절 중 `/auth`는 `503 Node Isolated`, 복구 즉시 누락 무효화 일괄 반영 | `is_partitioned: true→false`, `last_catchup` 상세 지표 기록 |
 | **7** | **실시간 캐시 무효화 스트림 전파** | `POST /chaos/invalidate` | Redis Streams `XADD` (`maxlen~10000`) + 노드별 `XREADGROUP` | 전 노드의 L1 및 L2 캐시에서 대상 정책 키 즉시 삭제 및 `XACK` | 전 노드 `l1_cache_size` 감소 후 재조회 시 `source: "DB"` |
 | **8** | **ECDSA P-256 PoP 서명 검증** | `POP_VERIFY_ENABLED=true` | Nonce 선행 소진 후 ECDSA 서명 검증 및 `/pubkey` 서킷 연동 | 정상 `200`, 서명 누락 `400`, 위변조/미등록 키 `401`, DB 서킷 OPEN 시 `503` | `pop_verified` / `pop_rejected` 분리 집계 |
 | **9** | **정책 거부(DENY) 인가 검증** | `X-Res: restricted` 또는 `.../deny` | DB `status: "deny"` 명시적 판별 및 `"DENY"` 캐싱 | `200 OK` (`{"status": "deny", "policy": "DENY"}`) 반환 및 L1/L2 캐싱 | 후속 요청 시 L1/L2에서 `"DENY"` 즉시 반환 |
@@ -157,6 +157,8 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
     - 10초 윈도우가 바뀌기 **0.5초 전에 50건**, 바뀐 직후 **0.5초 후에 50건**(총 1초간 100건)을 전송했을 때:
     - **`fixed` 모드**: 윈도우가 리셋되면서 직전 50건 + 직후 50건 = **총 100건 통과** (한도의 2배 스파이크 허용).
     - **`sliding` 모드 (기본값)**: 직후 시점에 이전 윈도우 가중치(약 95%)가 유지되어 직전 50건 통과 + 직후 50건 전량 `429` 차단 = **총 50건만 통과** (경계 스파이크 완벽 방어).
+  - **429 차단 요청 카운터 비오염 (Check-Before-Increment)**:
+    `SLIDING_RL_LUA` 및 로컬 폴백(`_local_rate_limit`)은 카운터를 사전 증가시키지 않고, 이전 및 현재 윈도우 가중 합산치(`estimated`)를 먼저 검사하여 `estimated < limit`인 경우에만 원자적으로 `INCR` 및 만료 시간을 설정한다. 이를 통해 수백~수천 건의 DDoS 버스트 공격이 발생하여 `429`로 전량 차단되더라도 윈도우 카운터가 비대해지지 않아, 공격 종료 직후 다음 윈도우($W_1$)에서 정상 트래픽이 기아 상태(Starvation) 없이 즉시 수용된다.
 
 ---
 
@@ -195,9 +197,11 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
      - **L1 / L2 캐시 히트 요청**: 이미 캐싱된 정책이 있으므로 DB 장애와 무관하게 `200 OK` (`source: "L1" | "L2"`)로 1ms 미만 정상 처리된다.
      - **일반 정책 조회 캐시 미스 (`/auth`)**: `cb.can_execute()`가 `False`를 반환하므로 DB를 호출하지 않고(`circuit_blocked += 1`), 서비스 가용성 유지를 위해 즉시 **`200 OK` (`{"status": "degraded_allow", "source": "Fallback_Degradation"}`)**를 반환한다. (서킷이 열리기 직전 실제 DB 호출을 시도했다가 실패한 요청은 `source: "Fallback_Degradation_PostFail"`을 반환한다.)
      - **PoP 공개키 조회 캐시 미스 (`/pubkey`, `POP_VERIFY_ENABLED=true`)**: 공개키 없이는 암호학적 신원 확인이 불가능하므로 `degraded_allow`를 허용하지 않고 즉시 **`503 Service Unavailable - Key Fetch Failed` (Fail-Closed)**로 차단한다(`circuit_blocked += 1`, `pop_rejected += 1`).
-  3. **10초 경과 후 `HALF_OPEN` 및 자동 복구 (`CB_RESET_TIMEOUT_SEC = 10s`)**:
+  3. **10초 경과 후 `HALF_OPEN` 원자적 단일 프로브 및 자동 복구 (`CB_RESET_TIMEOUT_SEC = 10s`)**:
      - DB가 복구된 후 마지막 실패 시점으로부터 **10초**가 지나면, 다음 캐시 미스 요청에서 서킷이 `OPEN` → `HALF_OPEN`으로 전환되어 DB 호출을 허용한다.
-     - **성공 시**: `cb.record_success()`가 호출되어 즉시 `CLOSED` 상태로 완전 복구(`failures = 0`)되고, 정상 응답(`{"status": "allow", "source": "DB", "policy": "admin"}`)을 반환한다.
+     - **원자적 단일 프로브 게이팅 (`_half_open_probe_in_flight`)**: `HALF_OPEN` 전이 시 동시 유입된 다수의 캐시 미스 요청 중 **오직 단 1건의 시험 요청만 원자적으로 프로브 슬롯을 획득**하여 백엔드 DB를 검증하며, 프로브 진행 중 유입되는 다른 동시 요청들은 `circuit_blocked`로 안전하게 차단되어 복구 중인 DB에 트래픽 쇄도(Thundering Herd)가 발생하는 것을 원천 방지한다.
+     - **취소 및 세마포어 과부하 데드락 방어**: 시험 프로브가 세마포어 타임아웃(`DBOverloadError`)이나 클라이언트 코루틴 취소(`asyncio.CancelledError`)를 겪더라도 `release_half_open_probe_if_unrecorded()`를 통해 프로브 슬롯이 즉시 반환되어 데드락 없이 다음 요청이 재시도할 수 있다.
+     - **성공 시**: `cb.record_success()`가 호출되어 즉시 `CLOSED` 상태로 완전 복구(`failures = 0`, 프로브 슬롯 반환)되고, 정상 응답(`{"status": "allow", "source": "DB", "policy": "admin"}`)을 반환한다.
      - **실패 시**: `HALF_OPEN` 상태에서는 디바운스를 우회하여 **단 1회 실패만으로도 즉시 다시 `OPEN` 상태로 재개방**된다.
   4. **플래핑(Flapping) 방지 2.0초 디바운스 (`CB_DEBOUNCE_SEC = 2.0s`)**:
      - DB 다운 상태에서 200개의 동시 요청이 유입된 직후 DB를 복구(`CLOSED` 전환)하더라도, 이미 스레드 풀에 들어가 있던 이전 요청들이 뒤늦게 타임아웃 실패를 기록할 수 있다.
@@ -241,16 +245,20 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
   3. **고립 중 정책 무효화 발생 (`POST /chaos/invalidate` 4회 실행)**:
      - 가용 노드(`Node-A` 또는 `Node-C`)가 Redis Stream(`invalidation_stream`)에 무효화 이벤트 4건을 발행한다.
      - `Node-A`, `Node-C`는 즉시 수신하여 L1 캐시를 비우지만, 고립된 `Node-B`는 수신하지 못해 `l1_cache_size`가 이전 값 그대로 남아 있는다(Stale 상태).
-  4. **네트워크 복구 (`heal`) 및 2단계 전량 드레인**:
+  4. **네트워크 복구 (`heal`) 및 3단계 전량 동기화 (Catch-up)**:
      - `/chaos/partition/Node-B/heal` 호출 시 `is_partitioned = False`로 해제되고, DB 상태를 확인하는 `probe_db_health()`가 백그라운드로 1회 실행된다.
      - `stream_listener`가 복구를 감지하고 일반 루프 진입 전에 **긴급 Catch-up 루프**를 실행한다:
-       - **Step A — PEL(미확인 메시지) 전량 드레인 (`ID = "0"`)**: 단절 직전 컨슈머에게 배달되었으나 아직 `XACK`하지 못해 Pending Entries List(PEL)에 남아 있는 메시지들을 `XREADGROUP ... COUNT 100`으로 **빈 배치가 반환될 때까지(`while True`) 반복 조회**하여 L1/L2 캐시를 삭제하고 `XACK`한다(100건 초과 시에도 누락 없이 전량 처리).
-       - **Step B — 단절 기간 중 누적된 신규 메시지 전량 드레인 (`ID = ">"`)**: 단절 동안 스트림에 새로 쌓여 아직 이 컨슈머 그룹에 전달되지 않은 메시지들을 `XREADGROUP ... COUNT 100`으로 **빈 배치가 반환될 때까지 반복 조회**하여 캐시 삭제 및 `XACK`를 완료한다.
+       - **Step A — 자체 PEL(미확인 메시지) 전량 드레인 (`ID = "0"`)**: 단절 직전 컨슈머에게 배달되었으나 아직 `XACK`하지 못해 Pending Entries List(PEL)에 남아 있는 메시지들을 `XREADGROUP ... COUNT 100`으로 **빈 배치가 반환될 때까지(`while True`) 반복 조회**하여 L1/L2 캐시를 삭제하고 `XACK`한다(100건 초과 시에도 누락 없이 전량 처리).
+       - **Step B — 장기 유휴 메시지 자동 회수 (`XAUTOCLAIM`)**: 다른 컨슈머 또는 이전 프로세스에서 장시간(`STREAM_CLAIM_MIN_IDLE_MS`, 기본 60,000ms) 미확인 상태로 방치된 메시지를 `XAUTOCLAIM`으로 자동 인계받아 캐시 삭제 및 `XACK`를 수행한다.
+       - **Step C — 단절 기간 중 누적된 신규 메시지 전량 드레인 (`ID = ">"`)**: 단절 동안 스트림에 새로 쌓여 아직 이 컨슈머 그룹에 전달되지 않은 메시지들을 `XREADGROUP ... COUNT 100`으로 **빈 배치가 반환될 때까지 반복 조회**하여 캐시 삭제 및 `XACK`를 완료한다.
 - **실행하지 않고 확인하는 결과**:
-  - 복구 후 1초 이내에 `Node-B`의 `/metrics`를 조회하면 `stats.last_catchup`에 동기화 결과가 기록된다:
+  - 복구 후 1초 이내에 `Node-B`의 `/metrics`를 조회하면 `stats.last_catchup`에 동기화 결과가 상세히 기록된다:
     ```json
     "last_catchup": {
       "pending_count": 4,
+      "pel_drained": 2,
+      "autoclaimed": 1,
+      "new_drained": 1,
       "duration_ms": 8,
       "timestamp": 1729320123.456
     }
@@ -331,6 +339,7 @@ Control Plane의 `/chaos/*` 엔드포인트와 `/metrics/stream` SSE 스트림, 
 - `.env.example`을 `.env`로 복사한 뒤, `ADMIN_SECRET_TOKEN`의 값을 보안 환경에 맞게 강한 토큰으로 교체하거나 로컬 데모 시 그대로 사용한다(공백 전용 토큰은 기동 시 거부됨).
 - **프론트엔드**: 브라우저 탭 종료 시 자동 소멸되는 `sessionStorage`에 저장되며 EventSource 연결 및 카오스 명령 호출 시 검증을 거친다.
 - **SSE 단일 폴러 팬아웃**: Control Plane은 대시보드 접속자 수와 무관하게 백그라운드 단일 폴러(`broadcast_metrics_loop`)가 1초 간격으로 3개 게이트웨이의 `/metrics`를 동시 폴링(`asyncio.gather`)하여 구독자 큐(`subscribers`)로 팬아웃 브로드캐스팅한다.
+- **클러스터 불변식 감사 (`GET /chaos/audit`)**: Control Plane의 `GET /chaos/audit` 엔드포인트(`X-Admin-Token` 인증)는 모든 게이트웨이 노드의 2대 불변식(요청 분류 및 강한 DB 폴백) 일치성과 캐시 히트율, Single-Flight 병합율, DB 부하 절감 비율을 종합 감사하여 구조화된 JSON 리포트(`overall_invariant_pass: bool`)를 즉시 반환한다.
 
 ---
 
@@ -357,7 +366,7 @@ source .venv/bin/activate  # (Windows: .\.venv\Scripts\activate)
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
 
-# 단위 및 경계 테스트 실행 (Docker 불필요, Mock 기반으로 41개 테스트 즉시 실행)
+# 단위 및 경계 테스트 실행 (Docker 불필요, Mock 기반으로 51개 테스트 즉시 실행)
 pytest -v
 
 # E2E 시나리오 테스트 실행 (실제 Docker 클러스터 구동 필요)
@@ -368,11 +377,10 @@ pytest -m e2e
 
 ## 알려진 한계점 (Known Limitations & Future Work)
 
-- **근사 알고리즘 오차**: Sliding Window는 단순 가중 합산 근사치이므로 트래픽 분포에 따라 미세한 오차가 발생할 수 있으며, 차단된 429 요청도 `INCR` 카운트에 포함된다.
+- **근사 알고리즘 오차**: Sliding Window는 단순 가중 합산 근사치이므로 트래픽 분포에 따라 미세한 오차가 발생할 수 있다.
 - **노드 간 시각차 (Clock Skew)**: 게이트웨이 로컬 `time.time()`을 기준으로 윈도우 키를 계산하므로, 노드 간 시각차가 클 경우 윈도우 경계 계산에서 불일치가 발생할 수 있다.
 - **단일 비행 취소(Cancellation) 동작 차이**: OFF 모드라도 백그라운드 태스크(`asyncio.shield`)에서 DB 조회가 계속 진행되므로, 클라이언트 연결이 끊겨도 DB 호출이 취소되지 않는 차이점이 존재한다 (pre-singleflight 버전과 다름).
 - **클러스터 전역 Single-Flight 미지원**: `in_flight` 맵은 각 게이트웨이 프로세스 로컬 메모리에만 존재하므로, 동일 키 요청이 서로 다른 게이트웨이 노드로 분산 유입될 경우 노드별로 각각 1회씩 DB 호출이 발생한다.
-- **서킷 브레이커 HALF_OPEN 동시 프로브**: `HALF_OPEN` 상태에서 별도의 단일 프로브 세마포어를 두지 않으므로, 첫 시험 요청의 결과가 기록되기 전에 동시 유입된 다수의 요청이 함께 통과할 수 있다.
 - **성능 실측의 한계**: Single-flight 성능 검증은 단일 노드에서 DB 지연을 시뮬레이션하여 3회 반복한 제한적 조건에서 수행되었다 (`docs/benchmarks/singleflight-effect.md`).
 - **PoP 서명의 한계**: Scope B 규격에 따라 검증 필드에 Timestamp, Body, Query, Host가 결합되지 않으며(Unbound fields), `kid`(Key-ID) 헤더 지원 및 하드웨어 Attestation 파싱 기능이 없다. 데모 환경에는 단일 Demo Key만 등록되어 있다.
 - **PoP 테스트 구성**: PoP 기능(Toggle ON) 시나리오는 클라이언트가 실제로 ECDSA 서명을 생성해야 하므로 기본 `test_scenarios.py`(서명 없이 전송) 환경과 분리되어 `tests/test_pop.py`에서 검증된다.

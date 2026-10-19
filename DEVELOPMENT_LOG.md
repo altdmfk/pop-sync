@@ -169,7 +169,65 @@
 - **B-09 (이중 락 구조 및 미사용 반환값)**: 동작 영향이 없고 변경 범위가 커서 이번 범위에서 제외한다.
 
 ### 4.12 알려진 잔여 과제
-- **HALF_OPEN 동시 시험 요청 1건 제한 미구현**: `CircuitBreaker.can_execute()`는 `HALF_OPEN` 상태에서 별도의 단일 프로브 세마포어나 카운터를 두지 않으므로, 첫 시험 요청의 결과가 기록되기 전에 동시 유입된 다수의 요청이 함께 통과할 수 있다.
+- **서킷 브레이커 HALF_OPEN 동시 시험 요청 1건 제한 미구현**: `HALF_OPEN` 상태에서 별도의 단일 프로브 세마포어를 두지 않아 동시 캐시 미스 요청이 함께 DB를 조회하는 문제가 있었다. (→ 5.1(v1.0.0)에서 원자적 단일 프로브 게이트 `_half_open_probe_in_flight`로 해결 완료)
+- **XAUTOCLAIM/미사용 컨슈머 그룹 정리 미구현**: `stream_listener()`는 노드 고유의 컨슈머 그룹(`gateway_group_{node_name}`)에 대해 자신의 PEL(`"0"`)만 재처리하며, 영구 이탈한 다른 컨슈머의 미확인 메시지를 인계받는 `XAUTOCLAIM`이나 미사용 컨슈머 그룹 삭제 로직은 구현되어 있지 않았다. (→ `XAUTOCLAIM`은 5.3(v1.0.0)에서 구현 완료됨; 미사용 컨슈머 그룹 정리는 고정 노드 클러스터 특성상 현행 유지)
 - **클러스터 전역 Single-Flight 미지원**: `in_flight` 맵은 각 게이트웨이 프로세스 내부 메모리에만 존재하므로, 동일 키 요청이 서로 다른 게이트웨이 노드로 분산 유입될 경우 노드별로 각각 1회씩 DB 호출이 발생한다.
-- **XAUTOCLAIM/미사용 컨슈머 그룹 정리 미구현**: `stream_listener()`는 노드 고유의 컨슈머 그룹(`gateway_group_{node_name}`)에 대해 자신의 PEL(`"0"`)만 재처리하며, 영구 이탈한 다른 컨슈머의 미확인 메시지를 인계받는 `XAUTOCLAIM`이나 미사용 컨슈머 그룹 삭제 로직은 구현되어 있지 않다.
+
+---
+
+## 5. 4차 리팩토링: 시나리오 기반 동시성 제어 및 복원력 고도화 (v1.0.0, 2026-10-19)
+
+### 5.1 서킷 브레이커 HALF_OPEN 단일 프로브(Single-Probe) 원자적 게이팅 및 취소 데드락 방어
+- **대상 파일 및 함수**: `gateway.py:CircuitBreaker`, `gateway.py:auth`, `gateway.py:db_loader_task`, `gateway.py:get_metrics`, `tests/test_singleflight.py`
+- **기존 문제**:
+  - `CircuitBreaker.can_execute()`가 `OPEN`에서 `HALF_OPEN`으로 전이된 후, 첫 번째 시험 요청이 DB 결과를 기록하기 전에 유입된 다수의 캐시 미스 요청들이 모두 `can_execute()`를 통과하여 복구 중인 Policy DB에 트래픽이 쇄도하는 문제가 있었다.
+- **수정 내용 및 결과**:
+  - `CircuitBreaker`에 스레드 세이프 단일 프로브 상태 추적 플래그(`_half_open_probe_in_flight: bool = False`, `is_probe_active` 프로퍼티)를 도입했다.
+  - `can_execute()` 내부에서 `OPEN` -> `HALF_OPEN` 전이 시 또는 기존 `HALF_OPEN` 상태에서 `_half_open_probe_in_flight == False`일 때, `self._lock` 보호 아래 원자적으로 `_half_open_probe_in_flight = True`를 마킹하고 단 1건의 시험 요청만 `True`를 반환하도록 게이팅했다.
+  - 프로브 실행 중 유입된 후속 동시 요청에는 `(False, "HALF_OPEN")`을 반환하여 Policy DB 호출을 차단하고 `stats["circuit_blocked"]` 및 `stats["db_fallbacks"]`를 증가시켜 기존 강한 DB Fallback Invariant 및 대시보드 Invariant 방정식을 100% 보존했다.
+  - `record_success()`, `record_failure()`, `force_state()`, `force_open()`, `force_close()`, `reset()` 시 `_half_open_probe_in_flight`를 `False`로 초기화하도록 보장했다.
+  - 시험 프로브가 `DBOverloadError`(세마포어 타임아웃) 또는 코루틴 취소(`asyncio.CancelledError`)를 겪어 성공/실패가 기록되지 않은 채 중단되더라도 데드락이 발생하지 않도록 `finally` 블록에서 `release_half_open_probe_if_unrecorded()`를 호출하여 슬롯을 즉시 반환하도록 구현했다.
+  - `test_half_open_allows_strictly_single_probe_under_concurrency`, `test_half_open_probe_slot_released_on_cancellation_or_overload`, `test_circuit_breaker_single_probe_direct_unit` 단위 테스트로 검증했다.
+
+### 5.2 슬라이딩 윈도우 Rate Limiter 429 카운터 오염 방지 (Check-Before-Increment)
+- **대상 파일 및 함수**: `gateway.py:SLIDING_RL_LUA`, `gateway.py:check_rate_limit`, `gateway.py:_local_rate_limit`, `gateway.py:stats`, `gateway.py:auth`, `tests/conftest.py:clean_gateway_state`, `tests/test_rate_limit.py`, `tests/test_singleflight.py`
+- **기존 문제**:
+  - 기존 Sliding Window Rate Limiter는 429 Too Many Requests로 차단되는 요청에 대해서도 `INCR`를 실행하거나 사후 검사 방식으로 동작하여, DDoS 공격이나 대량 버스트 유입 시 현재 윈도우 카운터가 비정상적으로 비대해졌다. 이로 인해 다음 윈도우($W_1$)의 가중 합산 추정치 $\lfloor \text{prev} \times \frac{10 - \text{elapsed}}{10} \rfloor$가 장시간 제한치를 초과 상태로 유지되어 공격이 중단된 후에도 정상 트래픽이 기아 상태(Starvation)에 빠지는 카운터 오염 문제가 존재했다.
+  - Single-Flight 메커니즘에서 백엔드 리더(Leader) 쿼리 발생 빈도와 팔로워(Follower) 병합 효율을 직관적으로 검증할 수 있는 세부 관측성 메트릭이 부재했다.
+- **수정 내용 및 결과**:
+  - `SLIDING_RL_LUA` 스크립트를 **Check-Before-Increment** 방식으로 전면 개편했다. `prev`와 `curr`를 먼저 읽고 예상 트래픽 `math.floor(prev * ((window - elapsed) / window)) + curr`를 산출하여, `estimated >= limit`인 경우 `INCR` 없이 즉시 `0`(거부)을 반환하고 `estimated < limit`일 때만 `INCR` 및 `EXPIRE`를 수행하고 `1`(허용)을 반환하도록 개선했다. 인자 키 순서 호환을 위해 윈도우 타임스탬프 접미사 자동 판별 로직을 내장했다.
+  - 인메모리 로컬 폴백(`_local_rate_limit`) 및 Fixed 윈도우 분기에도 동일한 Check-Before-Increment 방식을 적용하여 Redis 장애/폴백 상황에서도 거부된 요청이 로컬 윈도우 카운터를 오염시키지 않도록 보장했다.
+  - Single-Flight 관측성 강화를 위해 `stats`에 `singleflight_leader_queries` 메트릭을 추가하고, `/auth`에서 `db_loader_task`를 기동하는 Leader 요청 시점에 원자적으로 카운트를 증가시켰다 (`conftest.py:clean_gateway_state` 리셋 연동).
+  - 2대 수학적 불변식 (`requests == rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked`, `db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + circuit_blocked`)을 100% 온전히 유지했다.
+  - `test_sliding_window_rejected_requests_do_not_pollute_next_window` 및 `test_singleflight_leader_follower_efficiency_observability` 단위 테스트로 검증했다.
+
+### 5.3 Redis Streams XAUTOCLAIM 통합 및 Catch-up 세부 관측 지표 확장
+- **대상 파일 및 함수**: `gateway.py:stream_listener`, `gateway.py:STREAM_CLAIM_MIN_IDLE_MS`, `gateway.py:stats`, `tests/test_stream_listener.py`
+- **기존 문제**:
+  - `stream_listener`가 파티션 복구 시 자신의 노드 컨슈머 PEL(`"0"`)만 드레인하고, 컨슈머 재시작이나 장시간 유휴(Idle) 상태로 방치된 미확인 메시지를 회수하는 `XAUTOCLAIM` 로직이 부재했다.
+  - 파티션 복구 완료 후 `stats["last_catchup"]` 메트릭이 총 처리 건수(`pending_count`)만 제공하여 자체 PEL 드레인, 회수 메시지, 신규 메시지 간 세부 구분을 알 수 없었다.
+- **수정 내용 및 결과**:
+  - `gateway.py`의 `stream_listener` 파티션 복구 시퀀스에 Step B `XAUTOCLAIM`을 신규 통합하여 **3단계 Catch-up 파이프라인**을 구축했다:
+    - **Step A**: 자체 PEL 전량 드레인 (`ID = "0"`, `pel_drained`)
+    - **Step B**: `STREAM_CLAIM_MIN_IDLE_MS`(기본 60,000ms) 이상 방치된 미확인 메시지 유계 자동 회수 (`XAUTOCLAIM`, `autoclaimed`)
+    - **Step C**: 단절 기간 동안 누적된 미전달 신규 메시지 전량 드레인 (`ID = ">"`, `new_drained`)
+  - 레거시 Redis 클라이언트 및 Mock 환경과의 호환성을 위해 `AttributeError`, `ResponseError`에 대한 안전 폴백 처리를 적용했다.
+  - `stats["last_catchup"]` 텔레메트리를 고도화하여 기존 키(`pending_count`, `duration_ms`, `timestamp`)를 유지하면서 `pel_drained`, `autoclaimed`, `new_drained` 세부 카운트를 추가 제공하도록 개선했다.
+  - `test_stream_listener_xautoclaim_and_enriched_catchup_telemetry` 및 `test_stream_listener_xautoclaim_graceful_fallback_without_xautoclaim` 단위 테스트로 검증했다.
+
+### 5.4 클러스터 불변식(Invariant) 자동 감사 엔드포인트 (GET /chaos/audit) 추가
+- **대상 파일 및 함수**: `control_plane.py:chaos_audit`, `tests/test_control_plane.py`
+- **기존 문제**:
+  - 기술 데모 시연 및 자동 검증 시 클러스터 내 모든 게이트웨이 노드의 불변식 일치 여부와 성능 절감 지표(캐시 히트율, Single-Flight 병합율, DB 부하 절감율, 서킷 브레이커 상태)를 단일 호출로 통합 검증할 수 있는 감사 엔드포인트가 부재했다.
+- **수정 내용 및 결과**:
+  - `control_plane.py`에 `GET /chaos/audit` 엔드포인트를 구현했다(`admin_auth_middleware`에 의해 `X-Admin-Token` 인증 적용).
+  - 전 게이트웨이 노드의 `/metrics`를 동시 조회(`fetch_metrics()`)하여 온라인 노드별로 아래 항목을 수학적으로 엄격 검증했다:
+    - **Invariant 1 (요청 분류 불변식)**: `requests == rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked`
+    - **Invariant 2 (강한 DB 폴백 불변식)**: `db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + circuit_blocked`
+    - **부하 절감 및 관측 지표**: `db_load_reduction_percentage`(Single-Flight + L1 Double-Check + 서킷 차단 절감 비율), `cache_hit_ratio_pct`, `singleflight_coalescing_ratio_pct`, `circuit_state`
+  - 전체 온라인 노드가 불변식을 통과했는지 여부를 최상위 `overall_invariant_pass: bool` 필드로 즉시 반환하도록 구현했다.
+  - `test_chaos_audit_auth_protection`, `test_chaos_audit_healthy_and_degraded_nodes`, `test_chaos_audit_invariant_mismatch_failure` 단위 테스트로 검증했다.
+  - 최종 `pytest -v` 실행 결과 51 passed(12 deselected)를 달성했다.
+
+
 
