@@ -439,3 +439,126 @@ async def test_lazy_redis_init_without_lifespan(monkeypatch):
         ok_nonce = await gateway.consume_nonce("lazy-nonce-1")
         assert ok_nonce is True
         fake_nonce_script.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sliding_window_rejected_requests_do_not_pollute_next_window():
+    """
+    Verify Non-Polluting Check-Before-Increment:
+    1. In Local in-memory fallback path (_local_rate_limit):
+       - Window W0: 15 requests allowed (up to RL_FALLBACK_LIMIT=15), followed by 200 rejected requests.
+       - The 200 rejected requests must NOT increment local_rate_limits.
+       - Advance time to Window W1 at 5.0s (50% weight of prev = 7).
+       - In W1, exactly 8 new requests must be allowed (15 - 7 = 8).
+    2. In Redis Lua path (SLIDING_RL_LUA / check_rate_limit):
+       - Window W0: 50 requests allowed (up to RL_LIMIT=50), followed by 200 rejected requests.
+       - The rejected requests must NOT increment the current window counter in Redis.
+       - Advance time to Window W1 at 5.0s (50% weight of prev = 25).
+       - In W1, exactly 25 new requests must be allowed before reaching limit (50 - 25 = 25).
+       - If the 200 rejected requests had polluted the counter (prev=250), 0 requests would be allowed.
+    """
+    # -------------------------------------------------------------
+    # 1. Local fallback path (_local_rate_limit) non-polluting test
+    # -------------------------------------------------------------
+    _reset_local_rl()
+    W = RL_WINDOW_SEC
+    client_local = "spiffe://test/non-pollute-local"
+    w0 = 1000
+    w1 = 1001
+
+    # W0, elapsed = 0.0s: send 15 allowed requests
+    t_w0 = float(W * w0 + 0)
+    for i in range(RL_FALLBACK_LIMIT):
+        assert _local_rate_limit(client_local, int(t_w0), w0) is True, f"Request {i+1} in W0 should pass"
+
+    # Send 200 rejected requests in W0
+    for i in range(200):
+        assert _local_rate_limit(client_local, int(t_w0 + 1), w0) is False, f"Rejected request {i+1} in W0 must be False"
+
+    # Verify W0 count in local_rate_limits is strictly RL_FALLBACK_LIMIT (15), NOT 215!
+    assert local_rate_limits[f"{client_local}:{w0}"] == RL_FALLBACK_LIMIT
+
+    # Advance to W1 at elapsed = 5.0s (mid-window, 50% weight of prev):
+    # prev_count = 15, weight = 0.5 -> int(15 * 0.5) = 7.
+    # Remaining capacity = 15 - 7 = 8 requests.
+    t_w1 = float(W * w1 + 5)
+    passed_w1_local = 0
+    blocked_w1_local = 0
+    for _ in range(15):
+        if _local_rate_limit(client_local, int(t_w1), w1):
+            passed_w1_local += 1
+        else:
+            blocked_w1_local += 1
+
+    assert passed_w1_local == (RL_FALLBACK_LIMIT - int(RL_FALLBACK_LIMIT * 0.5)), (
+        f"Expected exactly 8 requests allowed in W1, got {passed_w1_local}"
+    )
+    assert blocked_w1_local == 7
+
+    # -------------------------------------------------------------
+    # 2. Redis Lua execution non-polluting test
+    # -------------------------------------------------------------
+    client_redis = "spiffe://test/non-pollute-redis"
+    redis_store: dict[str, int] = {}
+    redis_ttl: dict[str, int] = {}
+
+    async def lua_eval_mock(keys, args):
+        key1, key2 = keys[0], keys[1]
+        curr_key, prev_key = key1, key2
+        w_part1 = int(key1.split(":")[-1]) if key1.split(":")[-1].isdigit() else 0
+        w_part2 = int(key2.split(":")[-1]) if key2.split(":")[-1].isdigit() else 0
+        if w_part1 < w_part2:
+            curr_key, prev_key = key2, key1
+
+        prev = redis_store.get(prev_key, 0)
+        curr = redis_store.get(curr_key, 0)
+        weight = float(args[1])
+        if weight > 1:
+            weight = weight / 1000.0
+        limit = int(args[2]) if len(args) > 2 else RL_LIMIT
+
+        estimated = int(prev * weight) + curr
+        if estimated >= limit:
+            return 0
+        else:
+            redis_store[curr_key] = curr + 1
+            if curr == 0:
+                redis_ttl[curr_key] = int(args[0])
+            return 1
+
+    with patch("gateway.rl_script", side_effect=lua_eval_mock), \
+         patch("gateway.RL_ALGORITHM", "sliding"):
+
+        # In W0 (elapsed = 0.0s): Send 50 allowed requests
+        with patch("gateway.time.time", return_value=float(W * w0)):
+            for i in range(RL_LIMIT):
+                ok = await gateway.check_rate_limit(client_redis)
+                assert ok is True, f"Request {i+1} in W0 should be allowed"
+
+            # Send 200 rejected requests in W0
+            for i in range(200):
+                ok = await gateway.check_rate_limit(client_redis)
+                assert ok is False, f"Request {50+i+1} in W0 should be 429 rejected"
+
+        # Check that Redis counter for W0 is strictly 50 (NOT 250!)
+        curr_key_w0 = f"rl:{client_redis}:{w0}"
+        assert redis_store.get(curr_key_w0) == RL_LIMIT, (
+            f"W0 counter in Redis should be exactly {RL_LIMIT}, but was {redis_store.get(curr_key_w0)}"
+        )
+
+        # Advance to W1 at elapsed = 5.0s (mid-window, 50% weight of prev=50 -> 25):
+        # Remaining capacity = 50 - 25 = 25 requests.
+        passed_w1 = 0
+        blocked_w1 = 0
+        with patch("gateway.time.time", return_value=float(W * w1 + 5)):
+            for _ in range(50):
+                ok = await gateway.check_rate_limit(client_redis)
+                if ok:
+                    passed_w1 += 1
+                else:
+                    blocked_w1 += 1
+
+        assert passed_w1 == 25, f"Expected exactly 25 requests allowed in W1, got {passed_w1}"
+        assert blocked_w1 == 25, f"Expected 25 requests blocked in W1, got {blocked_w1}"
+        assert redis_store.get(f"rl:{client_redis}:{w1}") == 25
+

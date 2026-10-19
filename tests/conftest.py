@@ -31,6 +31,8 @@ def clean_gateway_state():
         gateway.stats["circuit_blocked"] = 0
         gateway.stats["l1_double_check_hits"] = 0
         gateway.stats["redis_outage_blocked"] = 0
+        gateway.stats["half_open_probe_active"] = False
+        gateway.stats["singleflight_leader_queries"] = 0
 
     yield
 

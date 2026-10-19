@@ -260,3 +260,174 @@ async def test_lifespan_awaits_background_tasks_before_closing_clients():
 
     mock_db_exec.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
     mock_pop_exec.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_stream_listener_xautoclaim_and_enriched_catchup_telemetry(monkeypatch):
+    """
+    Verify XAUTOCLAIM Step B during partition catchup and enriched last_catchup telemetry:
+    1. Step A drains own PEL ("0") -> pel_drained.
+    2. Step B claims idle pending messages from other/stale consumers via xautoclaim -> autoclaimed.
+    3. Step C drains newly accumulated messages (">") -> new_drained.
+    4. All messages are invalidated from L1 and L2, and XACKed.
+    5. stats["last_catchup"] contains all 6 fields:
+       pending_count, pel_drained, autoclaimed, new_drained, duration_ms, timestamp.
+    """
+    monkeypatch.setattr(gateway, "PARTITION_SLEEP_SEC", 0.01)
+    monkeypatch.setattr(gateway, "STREAM_CLAIM_MIN_IDLE_MS", 30000)
+
+    # Populate L1 cache for keys to be invalidated
+    gateway.l1_cache.set("pel_k0", "allow")
+    gateway.l1_cache.set("pel_k1", "allow")
+    gateway.l1_cache.set("claim_k0", "allow")
+    gateway.l1_cache.set("claim_k1", "allow")
+    gateway.l1_cache.set("new_k0", "allow")
+
+    acked_ids = []
+    pel_calls = 0
+    new_calls = 0
+    claim_calls = 0
+
+    mock_stream_client = AsyncMock()
+    mock_redis_client = AsyncMock()
+    mock_stream_client.xgroup_create = AsyncMock(return_value=True)
+    mock_redis_client.delete = AsyncMock(return_value=1)
+
+    async def mock_xack(stream, group, msg_id):
+        acked_ids.append(msg_id)
+        return 1
+
+    mock_stream_client.xack = AsyncMock(side_effect=mock_xack)
+
+    async def mock_xreadgroup(group, consumer, streams, count=None, block=None):
+        nonlocal pel_calls, new_calls
+        stream_id = streams[gateway.STREAM_NAME]
+
+        if stream_id == "0":
+            pel_calls += 1
+            if pel_calls == 1:
+                return [[gateway.STREAM_NAME.encode(), [
+                    (b"pel-0", {b"key": b"pel_k0"}),
+                    (b"pel-1", {b"key": b"pel_k1"}),
+                ]]]
+            return [[gateway.STREAM_NAME.encode(), []]]
+
+        if stream_id == ">":
+            if block is None:
+                # Catchup phase (Step C)
+                new_calls += 1
+                if new_calls == 1:
+                    return [[gateway.STREAM_NAME.encode(), [
+                        (b"new-0", {b"key": b"new_k0"}),
+                    ]]]
+                return [[gateway.STREAM_NAME.encode(), []]]
+            # Live phase: stop listener
+            raise asyncio.CancelledError()
+
+    mock_stream_client.xreadgroup = AsyncMock(side_effect=mock_xreadgroup)
+
+    async def mock_xautoclaim(name, group, consumer, min_idle_time, start_id="0-0", count=None):
+        nonlocal claim_calls
+        claim_calls += 1
+        assert min_idle_time == 30000
+        assert group == gateway.STREAM_GROUP
+        if claim_calls == 1:
+            assert start_id == "0-0"
+            return ("100-1", [(b"claim-0", {b"key": b"claim_k0"})])
+        elif claim_calls == 2:
+            assert start_id == "100-1"
+            return ("0-0", [(b"claim-1", {b"key": b"claim_k1"})])
+        return ("0-0", [])
+
+    mock_stream_client.xautoclaim = AsyncMock(side_effect=mock_xautoclaim)
+
+    monkeypatch.setattr(gateway, "stream_redis_client", mock_stream_client)
+    monkeypatch.setattr(gateway, "redis_client", mock_redis_client)
+
+    gateway.is_partitioned = True
+    task = asyncio.create_task(gateway.stream_listener())
+    await asyncio.sleep(0.03)
+    gateway.is_partitioned = False
+
+    await asyncio.wait_for(task, timeout=2.0)
+
+    # Verify telemetry in last_catchup
+    catchup = gateway.stats["last_catchup"]
+    assert catchup["pending_count"] == 5
+    assert catchup["pel_drained"] == 2
+    assert catchup["autoclaimed"] == 2
+    assert catchup["new_drained"] == 1
+    assert catchup["duration_ms"] >= 0
+    assert catchup["timestamp"] > 0
+
+    # Verify all 5 messages were acknowledged
+    assert acked_ids == [b"pel-0", b"pel-1", b"claim-0", b"claim-1", b"new-0"]
+
+    # Verify all 5 keys were cleared from L1 cache
+    assert gateway.l1_cache.get("pel_k0") is None
+    assert gateway.l1_cache.get("pel_k1") is None
+    assert gateway.l1_cache.get("claim_k0") is None
+    assert gateway.l1_cache.get("claim_k1") is None
+    assert gateway.l1_cache.get("new_k0") is None
+
+    # Verify L2 deletes were called for all keys
+    deleted_keys = [call.args[0] for call in mock_redis_client.delete.await_args_list]
+    for expected_key in ["policy:pel_k0", "policy:pel_k1", "policy:claim_k0", "policy:claim_k1", "policy:new_k0"]:
+        assert expected_key in deleted_keys
+
+
+@pytest.mark.asyncio
+async def test_stream_listener_xautoclaim_graceful_fallback_without_xautoclaim(monkeypatch):
+    """
+    Verify graceful degradation if the active Redis client or mock does NOT support xautoclaim
+    (AttributeError or ResponseError):
+    - Stream listener completes catchup without crashing.
+    - stats['last_catchup']['autoclaimed'] is 0.
+    - pel_drained and new_drained are correctly tracked.
+    """
+    monkeypatch.setattr(gateway, "PARTITION_SLEEP_SEC", 0.01)
+
+    mock_stream_client = AsyncMock()
+    mock_redis_client = AsyncMock()
+    mock_stream_client.xgroup_create = AsyncMock(return_value=True)
+    mock_stream_client.xack = AsyncMock(return_value=1)
+    mock_redis_client.delete = AsyncMock(return_value=1)
+
+    # Simulate older Redis client raising ResponseError or client lacking xautoclaim
+    mock_stream_client.xautoclaim.side_effect = AttributeError("'AsyncMock' object has no attribute 'xautoclaim'")
+
+    pel_done = False
+    new_done = False
+    async def mock_xreadgroup(group, consumer, streams, count=None, block=None):
+        nonlocal pel_done, new_done
+        stream_id = streams[gateway.STREAM_NAME]
+        if stream_id == "0":
+            if not pel_done:
+                pel_done = True
+                return [[gateway.STREAM_NAME.encode(), [(b"pel-x", {b"key": b"key_x"})]]]
+            return [[gateway.STREAM_NAME.encode(), []]]
+        if stream_id == ">":
+            if block is None:
+                if not new_done:
+                    new_done = True
+                    return [[gateway.STREAM_NAME.encode(), [(b"new-y", {b"key": b"key_y"})]]]
+                return [[gateway.STREAM_NAME.encode(), []]]
+            raise asyncio.CancelledError()
+
+    mock_stream_client.xreadgroup = AsyncMock(side_effect=mock_xreadgroup)
+
+    monkeypatch.setattr(gateway, "stream_redis_client", mock_stream_client)
+    monkeypatch.setattr(gateway, "redis_client", mock_redis_client)
+
+    gateway.is_partitioned = True
+    task = asyncio.create_task(gateway.stream_listener())
+    await asyncio.sleep(0.03)
+    gateway.is_partitioned = False
+
+    await asyncio.wait_for(task, timeout=2.0)
+
+    catchup = gateway.stats["last_catchup"]
+    assert catchup["autoclaimed"] == 0
+    assert catchup["pel_drained"] == 1
+    assert catchup["new_drained"] == 1
+    assert catchup["pending_count"] == 2

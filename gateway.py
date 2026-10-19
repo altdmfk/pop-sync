@@ -44,6 +44,7 @@ STREAM_CATCHUP_COUNT         = _int("STREAM_CATCHUP_COUNT", 100)
 STREAM_NORMAL_COUNT          = _int("STREAM_NORMAL_COUNT", 10)
 STREAM_BLOCK_MS              = _int("STREAM_BLOCK_MS", 500)
 PARTITION_SLEEP_SEC          = _float("PARTITION_SLEEP_SEC", 0.5)
+STREAM_CLAIM_MIN_IDLE_MS     = _int("STREAM_CLAIM_MIN_IDLE_MS", 60000)
 
 # Rate limiting
 RL_WINDOW_SEC                = _int("RL_WINDOW_SEC", 10)
@@ -207,6 +208,7 @@ class CircuitBreaker:
     Protects downstream Policy DB from cascading failures under sustained outage.
     Incorporates a 2.0s debounce window to prevent flapping caused by delayed in-flight
     timeouts arriving after state transitions.
+    Provides atomic single-probe gating during HALF_OPEN to restrict trial requests to strictly 1.
     """
     def __init__(
         self,
@@ -221,6 +223,7 @@ class CircuitBreaker:
         self.debounce_sec: float = debounce_sec
         self.last_failure_time: float = 0.0
         self.last_transition_time: float = time.time()
+        self._half_open_probe_in_flight: bool = False
         self._lock = threading.Lock()
 
     @property
@@ -228,16 +231,23 @@ class CircuitBreaker:
         with self._lock:
             return self.state
 
+    @property
+    def is_probe_active(self) -> bool:
+        with self._lock:
+            return self._half_open_probe_in_flight
+
     def check_and_half_open(self) -> str:
         with self._lock:
             if self.state == "OPEN" and time.time() - self.last_failure_time > self.reset_timeout:
                 self.state = "HALF_OPEN"
+                self._half_open_probe_in_flight = False
                 self.last_transition_time = time.time()
             return self.state
 
     def reset(self) -> str:
         with self._lock:
             self.failures = 0
+            self._half_open_probe_in_flight = False
             if self.state != "CLOSED":
                 self.state = "CLOSED"
                 self.last_transition_time = time.time()
@@ -246,6 +256,7 @@ class CircuitBreaker:
 
     def record_failure(self) -> Tuple[None, str]:
         with self._lock:
+            self._half_open_probe_in_flight = False
             if self.state == "HALF_OPEN":
                 self.failures += 1
                 self.state = "OPEN"
@@ -267,6 +278,7 @@ class CircuitBreaker:
     def record_success(self) -> Tuple[None, str]:
         with self._lock:
             self.failures = 0
+            self._half_open_probe_in_flight = False
             if self.state != "CLOSED":
                 self.state = "CLOSED"
                 self.last_transition_time = time.time()
@@ -280,17 +292,37 @@ class CircuitBreaker:
                 if time.time() - self.last_failure_time > self.reset_timeout:
                     self.state = "HALF_OPEN"
                     self.last_transition_time = time.time()
+                    self._half_open_probe_in_flight = True
                     return (True, self.state)
                 return (False, self.state)
             if self.state == "HALF_OPEN":
-                return (True, self.state)
+                if not self._half_open_probe_in_flight:
+                    self._half_open_probe_in_flight = True
+                    return (True, self.state)
+                return (False, self.state)
             return (False, self.state)
+
+    def release_half_open_probe(self) -> None:
+        """Release the in-flight half-open probe slot if unrecorded or cancelled."""
+        with self._lock:
+            self._half_open_probe_in_flight = False
+
+    def release_half_open_probe_if_unrecorded(self) -> None:
+        """Alias for release_half_open_probe."""
+        self.release_half_open_probe()
+
+    def force_open(self) -> str:
+        return self.force_state("OPEN")
+
+    def force_close(self) -> str:
+        return self.force_state("CLOSED")
 
     def force_state(self, state: str) -> str:
         if state not in VALID_CB_STATES:
             raise ValueError(f"Invalid state: {state}")
         with self._lock:
             self.state = state
+            self._half_open_probe_in_flight = False
             self.last_transition_time = time.time() - self.debounce_sec - CB_FORCE_STATE_MARGIN_SEC
             if state == "OPEN":
                 self.failures = self.max_failures
@@ -320,9 +352,11 @@ stats = {
     "sync_lag": 0,
     "db_queries_executed": 0,
     "singleflight_coalesced": 0,
+    "singleflight_leader_queries": 0,
     "circuit_blocked": 0,
     "l1_double_check_hits": 0,
-    "redis_outage_blocked": 0
+    "redis_outage_blocked": 0,
+    "half_open_probe_active": False
 }
 
 NONCE_LUA = """
@@ -337,22 +371,47 @@ else
 end
 """
 
-# Lua sliding-window rate-limit script.
-# KEYS[1] = prev window key  "rl:{client_id}:{window-1}"
-# KEYS[2] = curr window key  "rl:{client_id}:{window}"
+# Non-polluting Check-Before-Increment Lua sliding-window rate-limit script.
+# KEYS[1] = curr window key  "rl:{client_id}:{window}"
+# KEYS[2] = prev window key  "rl:{client_id}:{window-1}"
+# (Auto-detects and handles if keys are passed in reverse order [prev_key, curr_key])
 # ARGV[1] = TTL seconds (integer)
-# ARGV[2] = weight*1000 (integer) = floor((1 - elapsed/W) * 1000)
-# Returns estimated count (integer). Caller compares to RL_LIMIT.
-# prev_key TTL is NOT reset here: it was set when that window was created
-# (by a prior INCR call) and will expire naturally. Resetting it here would
-# extend its lifetime by up to W seconds, causing stale counts.
+# ARGV[2] = weight (integer 0..1000 or float 0..1)
+# ARGV[3] = limit (integer, default 50)
+# Returns 1 if allowed (and increments curr), 0 if rejected (without incrementing).
 SLIDING_RL_LUA = """
-local prev = tonumber(redis.call('GET', KEYS[1])) or 0
-local curr = redis.call('INCR', KEYS[2])
-redis.call('EXPIRE', KEYS[2], ARGV[1])
-local weight = tonumber(ARGV[2])
-local estimated = math.floor(prev * weight / 1000) + curr
-return estimated
+local key1 = KEYS[1]
+local key2 = KEYS[2]
+local curr_key = key1
+local prev_key = key2
+
+local w1 = tonumber(string.match(key1, ":(%d+)$"))
+local w2 = tonumber(string.match(key2, ":(%d+)$"))
+if w1 and w2 and w1 < w2 then
+    curr_key = key2
+    prev_key = key1
+end
+
+local prev = tonumber(redis.call('GET', prev_key)) or 0
+local curr = tonumber(redis.call('GET', curr_key)) or 0
+
+local weight = tonumber(ARGV[2]) or 0
+if weight > 1 then
+    weight = weight / 1000
+end
+
+local limit = tonumber(ARGV[3]) or 50
+
+local estimated = math.floor(prev * weight) + curr
+if estimated >= limit then
+    return 0
+else
+    local new_curr = redis.call('INCR', curr_key)
+    if curr == 0 or new_curr == 1 then
+        redis.call('EXPIRE', curr_key, ARGV[1])
+    end
+    return 1
+end
 """
 
 local_rate_limits = OrderedDict()
@@ -379,7 +438,7 @@ async def cleanup_local_rl():
 async def check_rate_limit(client_id: str) -> bool:
     """Return True if request is within rate limit, False if it should be 429-ed.
 
-    Redis path (normal): uses RL_ALGORITHM ("sliding" or "fixed").
+    Redis path (normal): uses RL_ALGORITHM ("sliding" or "fixed") with Check-Before-Increment.
     Local fallback path (Redis down): always uses sliding approximation with
     RL_FALLBACK_LIMIT as the threshold.  Errors from this path are re-raised so
     the caller can decide (currently: 503 for Redis failure, 429 for RL exceeded).
@@ -395,18 +454,24 @@ async def check_rate_limit(client_id: str) -> bool:
             weight     = int((1 - elapsed / RL_WINDOW_SEC) * 1000)  # 0..1000
             prev_key   = f"rl:{client_id}:{window_key - 1}"
             curr_key   = f"rl:{client_id}:{window_key}"
-            estimated  = await rl_script(
-                keys=[prev_key, curr_key],
-                args=[str(RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER), str(weight)],
+            res        = await rl_script(
+                keys=[curr_key, prev_key],
+                args=[str(RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER), str(weight), str(RL_LIMIT)],
             )
-            return int(estimated) <= RL_LIMIT
+            return int(res) == 1 or (int(res) <= RL_LIMIT and int(res) != 0)
         else:  # "fixed"
             key = f"rl:{client_id}:{window_key}"
             async with get_redis_client().pipeline(transaction=True) as pipe:
                 pipe.incr(key)
                 pipe.expire(key, RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER)
                 results = await pipe.execute()
-            return results[0] <= RL_LIMIT
+            if results[0] > RL_LIMIT:
+                try:
+                    await get_redis_client().decr(key)
+                except Exception:
+                    pass
+                return False
+            return True
 
     except Exception:
         # Redis unavailable — fall back to per-node in-memory sliding counter.
@@ -419,7 +484,7 @@ async def check_rate_limit(client_id: str) -> bool:
 def _local_rate_limit(client_id: str, now: int, window_key: int) -> bool:
     """In-memory sliding-window fallback used when Redis is unavailable.
 
-    Uses two integer buckets (prev/curr) per client.
+    Uses two integer buckets (prev/curr) per client with Check-Before-Increment.
     Threshold: RL_FALLBACK_LIMIT (default 15, i.e. per-node).
 
     Thread-safety: this is an await-free synchronous function called only from
@@ -433,7 +498,17 @@ def _local_rate_limit(client_id: str, now: int, window_key: int) -> bool:
     prev_count = local_rate_limits.get(prev_key, 0)
     if prev_key in local_rate_limits:
         local_rate_limits.move_to_end(prev_key)
-    curr_count = local_rate_limits.get(curr_key, 0) + 1
+
+    curr_count = local_rate_limits.get(curr_key, 0)
+
+    elapsed   = now % RL_WINDOW_SEC
+    weight    = 1.0 - (elapsed / RL_WINDOW_SEC)
+    estimated = int(prev_count * weight) + curr_count
+
+    if estimated >= RL_FALLBACK_LIMIT:
+        return False
+
+    curr_count += 1
     if curr_key in local_rate_limits:
         local_rate_limits.move_to_end(curr_key)
     else:
@@ -442,10 +517,7 @@ def _local_rate_limit(client_id: str, now: int, window_key: int) -> bool:
             local_rate_limits.popitem(last=False)
     local_rate_limits[curr_key] = curr_count
 
-    elapsed   = now % RL_WINDOW_SEC
-    weight    = 1.0 - (elapsed / RL_WINDOW_SEC)
-    estimated = prev_count * weight + curr_count
-    return estimated <= RL_FALLBACK_LIMIT
+    return True
 
 async def consume_nonce(nonce: str, ttl: int = NONCE_TTL_SEC, act: str = "read") -> bool:
     if nonce_script is None:
@@ -541,6 +613,7 @@ async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future,
         if isinstance(e, asyncio.CancelledError):
             raise
     finally:
+        cb.release_half_open_probe_if_unrecorded()
         if in_flight.get(comp_key) is fut:
             in_flight.pop(comp_key, None)
 
@@ -582,34 +655,75 @@ async def stream_listener():
             active_redis_client = redis_client or get_redis_client()
 
             if was_partitioned:
-                # Partition resolution phase: drain unacknowledged entries from the Pending Entries List (PEL)
-                # using ID '0' before processing new stream messages with '>', ensuring strict invalidation ordering.
+                # Partition resolution phase:
+                # Step A: Drain unacknowledged entries from own Pending Entries List (PEL) using ID '0'
+                # Step B: Reclaim long-idle pending messages via XAUTOCLAIM (if supported)
+                # Step C: Catch up on un-delivered messages using ID '>'
                 start_time = time.time()
                 total_pending = 0
+                pel_drained = 0
+                autoclaimed = 0
+                new_drained = 0
 
+                # Step A: Drain all batches of own PEL (ID "0")
                 while True:
                     pending = await active_stream_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: "0"}, count=STREAM_CATCHUP_COUNT)
                     if not pending or not pending[0][1]:
                         break
                     messages = pending[0][1]
-                    total_pending += len(messages)
+                    pel_drained += len(messages)
                     await _process_stream_messages(messages, active_stream_client, active_redis_client)
 
-                # Catch up on messages accumulated during partition that were never delivered to this consumer group
+                # Step B: Attempt XAUTOCLAIM on idle pending messages (gracefully handle older Redis / mocks)
+                try:
+                    if hasattr(active_stream_client, "xautoclaim"):
+                        claim_start_id = "0-0"
+                        max_claim_rounds = 100
+                        for _ in range(max_claim_rounds):
+                            claim_res = await active_stream_client.xautoclaim(
+                                STREAM_NAME,
+                                STREAM_GROUP,
+                                node_name,
+                                min_idle_time=STREAM_CLAIM_MIN_IDLE_MS,
+                                start_id=claim_start_id,
+                                count=STREAM_CATCHUP_COUNT,
+                            )
+                            if not isinstance(claim_res, (list, tuple)) or len(claim_res) < 2:
+                                break
+                            next_start_id = claim_res[0]
+                            claimed_msgs = claim_res[1]
+                            if isinstance(claimed_msgs, (list, tuple)) and claimed_msgs:
+                                autoclaimed += len(claimed_msgs)
+                                await _process_stream_messages(claimed_msgs, active_stream_client, active_redis_client)
+                            else:
+                                break
+
+                            next_id_str = next_start_id.decode() if isinstance(next_start_id, bytes) else str(next_start_id)
+                            if next_id_str in ("0-0", "0") or next_start_id == claim_start_id:
+                                break
+                            claim_start_id = next_start_id
+                except (AttributeError, Exception) as e:
+                    logging.warning(f"XAUTOCLAIM skipped or failed: {e}")
+
+                # Step C: Catch up on messages accumulated during partition that were never delivered to this consumer group (ID ">")
                 while True:
                     new_msgs = await active_stream_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: ">"}, count=STREAM_CATCHUP_COUNT)
                     if not new_msgs or not new_msgs[0][1]:
                         break
                     messages = new_msgs[0][1]
-                    total_pending += len(messages)
+                    new_drained += len(messages)
                     await _process_stream_messages(messages, active_stream_client, active_redis_client)
 
+                total_pending = pel_drained + autoclaimed + new_drained
                 catchup_duration = int((time.time() - start_time) * 1000)
                 with stats_lock:
                     stats["last_catchup"] = {
                         "pending_count": total_pending,
+                        "pel_drained": pel_drained,
+                        "autoclaimed": autoclaimed,
+                        "new_drained": new_drained,
                         "duration_ms": catchup_duration,
-                        "timestamp": time.time()
+                        "timestamp": time.time(),
                     }
                 was_partitioned = False
                 continue
@@ -825,54 +939,57 @@ async def auth(
                     stats["pop_rejected"] += 1
                 raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
             try:
-                if DB_MODE == "async":
-                    client = get_async_db_client()
-                    resp = await client.get(f"{db_url}/pubkey", params={"sid": x_spiffe_id}, timeout=DB_TIMEOUT_SEC)
-                    resp.raise_for_status()
-                    pubkey_pem = resp.json().get("public_key")
-                else:
-                    sem = get_db_semaphore()
-                    executor = get_db_executor()
-                    client = get_sync_http_client()
-                    try:
-                        await asyncio.wait_for(sem.acquire(), timeout=DB_SEMAPHORE_ACQUIRE_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
-                    try:
-                        resp = await asyncio.get_running_loop().run_in_executor(
-                            executor,
-                            lambda: client.get(f"{db_url}/pubkey", params={"sid": x_spiffe_id}, timeout=DB_TIMEOUT_SEC)
-                        )
+                try:
+                    if DB_MODE == "async":
+                        client = get_async_db_client()
+                        resp = await client.get(f"{db_url}/pubkey", params={"sid": x_spiffe_id}, timeout=DB_TIMEOUT_SEC)
                         resp.raise_for_status()
                         pubkey_pem = resp.json().get("public_key")
-                    finally:
-                        sem.release()
-                cb.record_success()
-                if pubkey_pem:
-                    l1_cache.set(pubkey_key, pubkey_pem)
-                    try:
-                        r_client = get_redis_client()
-                        await r_client.setex(f"policy:{pubkey_key}", L2_CACHE_TTL_SEC, pubkey_pem)
-                    except Exception as e:
-                        logging.warning(f"Failed to populate L2 pubkey cache: {e}")
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    with stats_lock:
-                        stats["pop_rejected"] += 1
-                    raise HTTPException(status_code=401, detail="Unknown Key ID")
-                cb.record_failure()
-                with stats_lock:
-                    stats["circuit_state"] = cb.current_state
-                    stats["pop_rejected"] += 1
-                raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
-            except Exception as e:
-                if not isinstance(e, DBOverloadError):
+                    else:
+                        sem = get_db_semaphore()
+                        executor = get_db_executor()
+                        client = get_sync_http_client()
+                        try:
+                            await asyncio.wait_for(sem.acquire(), timeout=DB_SEMAPHORE_ACQUIRE_TIMEOUT)
+                        except asyncio.TimeoutError:
+                            raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
+                        try:
+                            resp = await asyncio.get_running_loop().run_in_executor(
+                                executor,
+                                lambda: client.get(f"{db_url}/pubkey", params={"sid": x_spiffe_id}, timeout=DB_TIMEOUT_SEC)
+                            )
+                            resp.raise_for_status()
+                            pubkey_pem = resp.json().get("public_key")
+                        finally:
+                            sem.release()
+                    cb.record_success()
+                    if pubkey_pem:
+                        l1_cache.set(pubkey_key, pubkey_pem)
+                        try:
+                            r_client = get_redis_client()
+                            await r_client.setex(f"policy:{pubkey_key}", L2_CACHE_TTL_SEC, pubkey_pem)
+                        except Exception as e:
+                            logging.warning(f"Failed to populate L2 pubkey cache: {e}")
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        with stats_lock:
+                            stats["pop_rejected"] += 1
+                        raise HTTPException(status_code=401, detail="Unknown Key ID")
                     cb.record_failure()
-                logging.warning(f"Failed to fetch pubkey: {e}")
-                with stats_lock:
-                    stats["circuit_state"] = cb.current_state
-                    stats["pop_rejected"] += 1
-                raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
+                    with stats_lock:
+                        stats["circuit_state"] = cb.current_state
+                        stats["pop_rejected"] += 1
+                    raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
+                except Exception as e:
+                    if not isinstance(e, DBOverloadError):
+                        cb.record_failure()
+                    logging.warning(f"Failed to fetch pubkey: {e}")
+                    with stats_lock:
+                        stats["circuit_state"] = cb.current_state
+                        stats["pop_rejected"] += 1
+                    raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
+            finally:
+                cb.release_half_open_probe_if_unrecorded()
 
         if not pubkey_pem:
             with stats_lock:
@@ -951,16 +1068,23 @@ async def auth(
             stats["circuit_blocked"] += 1
         return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
 
-    fut = asyncio.get_running_loop().create_future()
-    if SINGLEFLIGHT_ENABLED:
-        in_flight[comp_key] = fut
+    try:
+        fut = asyncio.get_running_loop().create_future()
+        if SINGLEFLIGHT_ENABLED:
+            in_flight[comp_key] = fut
 
-    with stats_lock:
-        stats["db_fallbacks"] += 1
+        with stats_lock:
+            stats["db_fallbacks"] += 1
+            if SINGLEFLIGHT_ENABLED:
+                stats["singleflight_leader_queries"] += 1
 
-    task = asyncio.create_task(db_loader_task(comp_key, x_spiffe_id, x_res, fut, use_singleflight=SINGLEFLIGHT_ENABLED))
-    background_tasks.add(task)
-    task.add_done_callback(background_tasks.discard)
+        task = asyncio.create_task(db_loader_task(comp_key, x_spiffe_id, x_res, fut, use_singleflight=SINGLEFLIGHT_ENABLED))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+    except BaseException:
+        cb.release_half_open_probe_if_unrecorded()
+        raise
+
     try:
         return await asyncio.shield(fut)
     except DBOverloadError as e:
@@ -987,6 +1111,7 @@ async def get_metrics():
 
     with stats_lock:
         stats["circuit_state"] = current_state
+        stats["half_open_probe_active"] = cb.is_probe_active
         stats["l1_cache_size"] = len(l1_cache)
         stats["local_rl_size"] = len(local_rate_limits)
         snapshot = dict(stats)
@@ -998,6 +1123,7 @@ async def get_metrics():
         "singleflight_enabled": SINGLEFLIGHT_ENABLED,
         "rl_algorithm": RL_ALGORITHM,
         "pop_verify_enabled": POP_VERIFY_ENABLED,
+        "half_open_probe_active": cb.is_probe_active,
         "stats": snapshot,
         "is_partitioned": current_partitioned,
         "redis_ok": redis_ok
@@ -1018,6 +1144,8 @@ async def probe_db_health():
         except Exception as e:
             logging.warning(f"DB probe failed upon healing: {e}")
             cb.force_state("OPEN")
+        finally:
+            cb.release_half_open_probe_if_unrecorded()
 
 @app.post("/chaos/partition/{state}")
 async def set_partition(state: str):
