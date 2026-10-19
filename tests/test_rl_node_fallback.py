@@ -58,5 +58,10 @@ async def main():
     p_b.terminate()
     p_c.terminate()
 
+@pytest.mark.e2e
+async def test_rl_node_fallback():
+    await main()
+
 if __name__ == '__main__':
     asyncio.run(main())
+

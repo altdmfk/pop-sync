@@ -6,46 +6,12 @@ from unittest.mock import patch, AsyncMock
 
 from gateway import app, l1_cache, stats, stats_lock, cb, in_flight
 
-@pytest.fixture(autouse=True)
-def reset_globals():
-    import gateway
-    gateway.DB_MODE = "async"
-    l1_cache.cache.clear()
-    in_flight.clear()
-    cb.reset()
-    cb.last_transition_time = 0
-    with stats_lock:
-        for k in stats:
-            if isinstance(stats[k], int):
-                stats[k] = 0
-            elif isinstance(stats[k], float):
-                stats[k] = 0.0
-        stats["circuit_state"] = "CLOSED"
-        stats["circuit_blocked"] = 0
-        stats["l1_double_check_hits"] = 0
-
-@pytest.fixture
-def mock_dependencies():
-    with patch("gateway.check_rate_limit", new_callable=AsyncMock) as m_rl, \
-         patch("gateway.consume_nonce", new_callable=AsyncMock) as m_nonce, \
-         patch("gateway.redis_client") as m_redis, \
-         patch("gateway.db_async_call", new_callable=AsyncMock) as m_db:
-         
-        m_rl.return_value = True
-        m_nonce.return_value = True
-        m_redis.get = AsyncMock(return_value=None)
-        m_redis.set = AsyncMock(return_value=True)
-        
-        m_db.return_value = {"status": "allow", "role": "admin"}
-        
-        yield m_redis, m_db
-
 @pytest.mark.asyncio
-async def test_singleflight_off_100_requests(mock_dependencies, monkeypatch):
+async def test_singleflight_off_100_requests(mock_common_dependencies, monkeypatch):
     import gateway
     monkeypatch.setattr(gateway, "SINGLEFLIGHT_ENABLED", False)
     
-    m_redis, m_db = mock_dependencies
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     async def delayed_db_call(*args, **kwargs):
         await asyncio.sleep(0.1)
@@ -76,8 +42,8 @@ async def test_singleflight_off_100_requests(mock_dependencies, monkeypatch):
         assert stats["singleflight_coalesced"] == 0
 
 @pytest.mark.asyncio
-async def test_singleflight_100_requests(mock_dependencies):
-    m_redis, m_db = mock_dependencies
+async def test_singleflight_100_requests(mock_common_dependencies):
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     async def delayed_db_call(*args, **kwargs):
         await asyncio.sleep(0.1)
@@ -103,8 +69,8 @@ async def test_singleflight_100_requests(mock_dependencies):
         assert stats["singleflight_coalesced"] == 99
 
 @pytest.mark.asyncio
-async def test_leader_cancellation(mock_dependencies):
-    m_redis, m_db = mock_dependencies
+async def test_leader_cancellation(mock_common_dependencies):
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     async def delayed_db_call(*args, **kwargs):
         await asyncio.sleep(0.2)
@@ -135,8 +101,8 @@ async def test_leader_cancellation(mock_dependencies):
         assert stats["singleflight_coalesced"] == 1
 
 @pytest.mark.asyncio
-async def test_loader_failure(mock_dependencies):
-    m_redis, m_db = mock_dependencies
+async def test_loader_failure(mock_common_dependencies):
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     class TestException(Exception): pass
     
@@ -165,14 +131,14 @@ async def test_loader_failure(mock_dependencies):
         assert cb.failures == 1
 
 @pytest.mark.asyncio
-async def test_double_check_l1(mock_dependencies):
+async def test_double_check_l1(mock_common_dependencies):
     """
     [L1 더블체크 테스트]
     Leader가 Task로 생성되어 실행되기 직전에 다른 비동기 흐름에 의해 L1 캐시가 채워졌다고 가정합니다.
     (락을 사용하지 않는 순수 비동기 구조이므로, l1_cache.get을 패치하여 첫 번째 조회(/auth 진입 시)는 미스,
     두 번째 조회(db_loader_task 내부)는 히트하도록 시뮬레이션합니다.)
     """
-    m_redis, m_db = mock_dependencies
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     m_db.return_value = {"status": "allow", "role": "admin"}
     
     from gateway import l1_cache
@@ -196,12 +162,12 @@ async def test_double_check_l1(mock_dependencies):
             assert stats["l1_double_check_hits"] == 1
 
 @pytest.mark.asyncio
-async def test_stats_invariants(mock_dependencies):
+async def test_stats_invariants(mock_common_dependencies):
     """
     db_fallbacks 정의: "DB 경로로 진입한 요청 수, 서킷 차단과 L1 더블체크 히트 포함"
     불변식 검증 테스트
     """
-    m_redis, m_db = mock_dependencies
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     async def delayed_db_call(*args, **kwargs):
         await asyncio.sleep(0.05)
@@ -246,10 +212,11 @@ async def test_stats_invariants(mock_dependencies):
         total_classified = (
             stats["rate_limited"] + 
             stats["nonce_replays"] + 
+            stats["pop_rejected"] + 
             stats["l1_hits"] + 
             stats["l2_hits"] + 
             stats["db_fallbacks"] +
-            stats.get("redis_outage_blocked", 0)
+            stats["redis_outage_blocked"]
         )
         assert stats["requests"] == total_classified
 
@@ -268,8 +235,8 @@ async def test_stats_invariants(mock_dependencies):
         )
 
 @pytest.mark.asyncio
-async def test_unretrieved_future_exception(mock_dependencies):
-    m_redis, m_db = mock_dependencies
+async def test_unretrieved_future_exception(mock_common_dependencies):
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     class TestException(Exception): pass
     async def failing_db_call(*args, **kwargs):
         await asyncio.sleep(0.1)
@@ -360,22 +327,41 @@ def test_circuit_breaker_debounce_and_half_open_boundary(monkeypatch):
     assert can_exec is True
     assert state == "HALF_OPEN"
     assert cb_test.current_state == "HALF_OPEN"
+
+    # In HALF_OPEN, a failed probe at < 2.0s (t=1013.5) must bypass debounce and re-open immediately
+    current_time = 1013.5
+    cb_test.record_failure()
+    assert cb_test.current_state == "OPEN"
+    assert cb_test.last_failure_time == 1013.5
+    assert cb_test.last_transition_time == 1013.5
+
+    # Wait for reset_timeout (> 1023.5) to enter HALF_OPEN again
+    current_time = 1023.6
+    can_exec, state = cb_test.can_execute()
+    assert can_exec is True
+    assert state == "HALF_OPEN"
     
     # In HALF_OPEN, trial success resets circuit to CLOSED
     cb_test.record_success()
     assert cb_test.current_state == "CLOSED"
     assert cb_test.failures == 0
 
+    # In CLOSED after transition (t=1023.6), failure within debounce (< 2.0s) is still ignored
+    current_time = 1024.5
+    cb_test.record_failure()
+    assert cb_test.failures == 0
+    assert cb_test.current_state == "CLOSED"
+
 
 @pytest.mark.asyncio
-async def test_singleflight_exception_propagation_and_map_cleanup(mock_dependencies):
+async def test_singleflight_exception_propagation_and_map_cleanup(mock_common_dependencies):
     """
     Boundary test:
     1. Single-Flight exception in db loader propagates to leader and followers.
     2. in_flight map is cleaned up (popped) in finally block.
     3. Subsequent request creates a fresh loader and executes without being stuck.
     """
-    m_redis, m_db = mock_dependencies
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     call_count = 0
     async def failing_db_call(*args, **kwargs):
@@ -415,13 +401,13 @@ async def test_singleflight_exception_propagation_and_map_cleanup(mock_dependenc
 
 
 @pytest.mark.asyncio
-async def test_singleflight_db_overload_exception_propagation(mock_dependencies):
+async def test_singleflight_db_overload_exception_propagation(mock_common_dependencies):
     """
     Boundary test:
     Verify DBOverloadError propagates as 503 to followers and cleans up in_flight.
     """
     from gateway import DBOverloadError
-    m_redis, m_db = mock_dependencies
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     async def overload_db_call(*args, **kwargs):
         await asyncio.sleep(0.05)
@@ -447,7 +433,7 @@ async def test_singleflight_db_overload_exception_propagation(mock_dependencies)
 
 
 @pytest.mark.asyncio
-async def test_invariant_equality_under_redis_503(mock_dependencies):
+async def test_invariant_equality_under_redis_503(mock_common_dependencies):
     """
     Boundary test:
     Verify that simulated Redis outage during Nonce check in /auth
@@ -455,7 +441,7 @@ async def test_invariant_equality_under_redis_503(mock_dependencies):
     100% Invariant equality:
     requests == (rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked)
     """
-    m_redis, m_db = mock_dependencies
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     import redis.exceptions
     with patch("gateway.consume_nonce", new_callable=AsyncMock) as m_nonce:
@@ -486,3 +472,45 @@ async def test_invariant_equality_under_redis_503(mock_dependencies):
                 stats["redis_outage_blocked"]
             )
             assert stats["requests"] == classified_sum
+
+
+@pytest.mark.asyncio
+async def test_invariant_equality_under_rate_limit_503(mock_common_dependencies):
+    """
+    Verify that when check_rate_limit raises an exception in /auth,
+    it returns 503 and increments both 'requests' and 'redis_outage_blocked',
+    maintaining 100% Invariant equality:
+    requests == (rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked)
+    """
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
+
+    with patch("gateway.check_rate_limit", new_callable=AsyncMock) as m_rl:
+        m_rl.side_effect = RuntimeError("Rate limit unexpected failure")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = {
+                "Authorization": "Bearer token",
+                "X-SPIFFE-ID": "spiffe://test_rl_outage",
+            }
+
+            for i in range(5):
+                resp = await client.get("/auth", headers={**headers, "X-Nonce": f"nonce-rl-outage-{i}"})
+                assert resp.status_code == 503
+                assert "Rate Limit Failed" in resp.json()["message"]
+
+            assert stats["requests"] == 5
+            assert stats["redis_outage_blocked"] == 5
+
+            classified_sum = (
+                stats["rate_limited"] +
+                stats["nonce_replays"] +
+                stats["pop_rejected"] +
+                stats["l1_hits"] +
+                stats["l2_hits"] +
+                stats["db_fallbacks"] +
+                stats["redis_outage_blocked"]
+            )
+            assert stats["requests"] == classified_sum
+
+

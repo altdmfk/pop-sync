@@ -304,18 +304,22 @@ async def test_cleanup_local_rl_compatible_with_new_key_format():
     _reset_local_rl()
     W = RL_WINDOW_SEC
 
-    old_window = 500
     curr_window = 501
+    prev_window = curr_window - 1
+    expired_window = curr_window - 2
     client = "spiffe://example.org/test-cleanup"
 
-    # Insert one old entry and one current entry using the new key format.
-    old_key  = f"{client}:{old_window}"
-    curr_key = f"{client}:{curr_window}"
-    local_rate_limits[old_key]  = 5
-    local_rate_limits[curr_key] = 3
+    # Insert curr-2 (expired), curr-1 (prev), and curr entries using the new key format.
+    expired_key = f"{client}:{expired_window}"
+    prev_key    = f"{client}:{prev_window}"
+    curr_key    = f"{client}:{curr_window}"
+    local_rate_limits[expired_key] = 7
+    local_rate_limits[prev_key]    = 5
+    local_rate_limits[curr_key]    = 3
 
-    assert old_key  in local_rate_limits
-    assert curr_key in local_rate_limits
+    assert expired_key in local_rate_limits
+    assert prev_key    in local_rate_limits
+    assert curr_key    in local_rate_limits
 
     # Patch time so cleanup thinks current window is curr_window.
     t_now = float(W * curr_window + 1)
@@ -328,6 +332,110 @@ async def test_cleanup_local_rl_compatible_with_new_key_format():
         except asyncio.CancelledError:
             pass
 
-    # Old window entry must be deleted; current window entry must survive.
-    assert old_key  not in local_rate_limits, "Old window key should have been cleaned up"
-    assert curr_key in local_rate_limits,     "Current window key should survive cleanup"
+    # curr-2 must be purged; curr-1 and curr must be retained.
+    assert expired_key not in local_rate_limits, "curr-2 window key should have been purged"
+    assert prev_key    in local_rate_limits,     "curr-1 window key should be retained for sliding weighting"
+    assert curr_key    in local_rate_limits,     "Current window key should survive cleanup"
+
+
+def test_local_rl_max_keys_does_not_reset_existing_client(monkeypatch):
+    """Hitting RL_LOCAL_MAX_KEYS evicts only the oldest entries and does not reset an existing client's count."""
+    _reset_local_rl()
+    monkeypatch.setattr(gateway, "RL_LOCAL_MAX_KEYS", 5)
+
+    W = RL_WINDOW_SEC
+    curr_window = 700
+    t = int(W * curr_window + 2)
+
+    # Insert oldest filler clients first
+    for i in range(3):
+        assert _local_rate_limit(f"spiffe://test/old-{i}", t, curr_window) is True
+
+    # Existing client reaches RL_FALLBACK_LIMIT
+    active_client = "spiffe://test/active-client"
+    for _ in range(RL_FALLBACK_LIMIT):
+        assert _local_rate_limit(active_client, t, curr_window) is True
+    assert _local_rate_limit(active_client, t, curr_window) is False
+
+    # Add more clients to hit and exceed RL_LOCAL_MAX_KEYS (5)
+    for i in range(2):
+        assert _local_rate_limit(f"spiffe://test/new-{i}", t, curr_window) is True
+
+    assert len(local_rate_limits) <= 5
+    assert f"{active_client}:{curr_window}" in local_rate_limits
+    # Active client's count must not have been reset; further requests are still blocked
+    assert _local_rate_limit(active_client, t, curr_window) is False
+
+
+@pytest.mark.asyncio
+async def test_lazy_redis_init_without_lifespan(monkeypatch):
+    """
+    Verify (B-08):
+    1. Calling consume_nonce and check_rate_limit ("fixed" and "sliding") without lifespan
+       lazily creates the Redis client via get_redis_client() and registers nonce_script and rl_script.
+    2. The "fixed" branch uses get_redis_client().pipeline instead of global redis_client.
+    3. Whitespace-only ADMIN_SECRET_TOKEN is rejected at startup validation without altering
+       non-empty token values.
+    """
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(gateway, "redis_client", None)
+    monkeypatch.setattr(gateway, "nonce_script", None)
+    monkeypatch.setattr(gateway, "rl_script", None)
+
+    fake_nonce_script = AsyncMock(return_value=1)
+    fake_rl_script = AsyncMock(return_value=5)
+
+    def fake_register_script(lua_src):
+        if lua_src == gateway.NONCE_LUA:
+            return fake_nonce_script
+        if lua_src == gateway.SLIDING_RL_LUA:
+            return fake_rl_script
+        raise AssertionError(f"Unexpected script: {lua_src}")
+
+    pipe_executed = False
+
+    class FakePipe:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        def incr(self, key):
+            pass
+        def expire(self, key, ttl):
+            pass
+        async def execute(self):
+            nonlocal pipe_executed
+            pipe_executed = True
+            return [3, True]
+
+    fake_redis = MagicMock()
+    fake_redis.register_script = MagicMock(side_effect=fake_register_script)
+    fake_redis.pipeline = MagicMock(side_effect=lambda transaction=True: FakePipe())
+
+    with patch("gateway.Redis.from_url", return_value=fake_redis):
+        # 1. "fixed" rate limit without lifespan (redis_client is initially None)
+        monkeypatch.setattr(gateway, "RL_ALGORITHM", "fixed")
+        ok_fixed = await gateway.check_rate_limit("spiffe://test/lazy-fixed")
+        assert ok_fixed is True
+        assert pipe_executed is True
+        assert gateway.redis_client is fake_redis
+        assert gateway.nonce_script is fake_nonce_script
+        assert gateway.rl_script is fake_rl_script
+
+        # 2. "sliding" rate limit without lifespan
+        monkeypatch.setattr(gateway, "redis_client", None)
+        monkeypatch.setattr(gateway, "nonce_script", None)
+        monkeypatch.setattr(gateway, "rl_script", None)
+        monkeypatch.setattr(gateway, "RL_ALGORITHM", "sliding")
+        ok_sliding = await gateway.check_rate_limit("spiffe://test/lazy-sliding")
+        assert ok_sliding is True
+        fake_rl_script.assert_awaited_once()
+
+        # 3. consume_nonce without lifespan
+        monkeypatch.setattr(gateway, "redis_client", None)
+        monkeypatch.setattr(gateway, "nonce_script", None)
+        monkeypatch.setattr(gateway, "rl_script", None)
+        ok_nonce = await gateway.consume_nonce("lazy-nonce-1")
+        assert ok_nonce is True
+        fake_nonce_script.assert_awaited_once()

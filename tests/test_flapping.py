@@ -24,7 +24,7 @@ async def check_cb_state(client):
     try:
         resp = await client.get("http://localhost:8001/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         return resp.json()["stats"]["circuit_state"]
-    except:
+    except Exception:
         return "UNKNOWN"
 
 async def main():
@@ -54,5 +54,10 @@ async def main():
             
         await asyncio.gather(*tasks)
 
+@pytest.mark.e2e
+async def test_flapping():
+    await main()
+
 if __name__ == "__main__":
     asyncio.run(main())
+
