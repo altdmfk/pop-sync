@@ -61,8 +61,9 @@ async def broadcast_metrics_loop():
                         pass
                 try:
                     q.put_nowait(payload)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.warning(f"Failed to enqueue metrics for subscriber, dropping: {e}")
+                    subscribers.discard(q)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -128,18 +129,34 @@ async def get_index():
     return HTMLResponse(index_html_cache)
 
 @app.get("/chaos/auth_check")
-async def auth_check():
+async def auth_check(request: Request):
+    admin_token = request.headers.get("X-Admin-Token")
+    if not admin_token or not hmac.compare_digest(admin_token, ADMIN_SECRET_TOKEN):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized Admin Access"})
     return {"status": "ok"}
 
 async def fetch_metrics():
     client = get_async_http_client()
+    reqs = [
+        client.get(
+            f"{url}/metrics",
+            headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}
+        )
+        for url in GATEWAYS.values()
+    ]
+    resps = await asyncio.gather(*reqs, return_exceptions=True)
     results = {}
-    for name, url in GATEWAYS.items():
+    for name, resp in zip(GATEWAYS.keys(), resps):
         try:
-            resp = await client.get(
-                f"{url}/metrics",
-                headers={"X-Admin-Token": ADMIN_SECRET_TOKEN}
-            )
+            if isinstance(resp, Exception):
+                raise resp
+            resp.raise_for_status()
+            if isinstance(getattr(resp, "status_code", None), int) and resp.status_code != 200:
+                raise httpx.HTTPStatusError(
+                    f"Non-200 status code: {resp.status_code}",
+                    request=getattr(resp, "request", None),
+                    response=resp,
+                )
             results[name] = resp.json()
         except Exception as e:
             logging.warning(f"Failed to fetch metrics from {name}: {e}")

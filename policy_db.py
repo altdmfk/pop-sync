@@ -1,6 +1,11 @@
 import asyncio
+import hmac
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+
+ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN")
+if not ADMIN_SECRET_TOKEN:
+    raise RuntimeError("ADMIN_SECRET_TOKEN environment variable is required")
 
 CHAOS_DOWN_SLEEP_SEC = 2.0
 SIMULATED_DB_LATENCY_SEC = float(os.getenv("SIMULATED_DB_LATENCY_SEC", "0.02"))
@@ -41,7 +46,10 @@ async def get_pubkey(sid: str = "") -> dict:
     return {"public_key": TEST_PUBLIC_KEY}
 
 @app.post("/chaos/db/{state}")
-async def set_db_state(state: str) -> dict:
+async def set_db_state(state: str, request: Request) -> dict:
+    admin_token = request.headers.get("X-Admin-Token")
+    if not admin_token or not hmac.compare_digest(admin_token, ADMIN_SECRET_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized Admin Access")
     global is_down
     async with is_down_lock:
         is_down = (state == "down")
