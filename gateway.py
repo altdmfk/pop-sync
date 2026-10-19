@@ -121,9 +121,11 @@ def get_sync_http_client() -> httpx.Client:
     return sync_http_client
 
 def get_redis_client() -> Redis:
-    global redis_client
+    global redis_client, nonce_script, rl_script
     if redis_client is None:
         redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
+        nonce_script = redis_client.register_script(NONCE_LUA)
+        rl_script    = redis_client.register_script(SLIDING_RL_LUA)
     return redis_client
 
 def get_pop_executor() -> ThreadPoolExecutor:
@@ -244,6 +246,13 @@ class CircuitBreaker:
 
     def record_failure(self) -> Tuple[None, str]:
         with self._lock:
+            if self.state == "HALF_OPEN":
+                self.failures += 1
+                self.state = "OPEN"
+                self.last_transition_time = time.time()
+                self.last_failure_time = time.time()
+                return (None, self.state)
+
             if time.time() - self.last_transition_time < self.debounce_sec:
                 return (None, self.state)
 
@@ -346,9 +355,10 @@ local estimated = math.floor(prev * weight / 1000) + curr
 return estimated
 """
 
-local_rate_limits = {}
+local_rate_limits = OrderedDict()
 local_rl_lock = asyncio.Lock()
 in_flight: dict[str, asyncio.Future] = {}
+background_tasks: set[asyncio.Task] = set()
 
 async def cleanup_local_rl():
     while True:
@@ -359,7 +369,7 @@ async def cleanup_local_rl():
             for k in local_rate_limits.keys():
                 try:
                     w = int(k.rsplit(":", 1)[-1])
-                    if w < now_window:
+                    if w < now_window - 1:
                         to_delete.append(k)
                 except ValueError:
                     continue
@@ -379,6 +389,8 @@ async def check_rate_limit(client_id: str) -> bool:
 
     try:
         if RL_ALGORITHM == "sliding":
+            if rl_script is None:
+                get_redis_client()
             elapsed    = now % RL_WINDOW_SEC
             weight     = int((1 - elapsed / RL_WINDOW_SEC) * 1000)  # 0..1000
             prev_key   = f"rl:{client_id}:{window_key - 1}"
@@ -390,7 +402,7 @@ async def check_rate_limit(client_id: str) -> bool:
             return int(estimated) <= RL_LIMIT
         else:  # "fixed"
             key = f"rl:{client_id}:{window_key}"
-            async with redis_client.pipeline(transaction=True) as pipe:
+            async with get_redis_client().pipeline(transaction=True) as pipe:
                 pipe.incr(key)
                 pipe.expire(key, RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER)
                 results = await pipe.execute()
@@ -418,12 +430,16 @@ def _local_rate_limit(client_id: str, now: int, window_key: int) -> bool:
     prev_key  = f"{client_id}:{window_key - 1}"
     curr_key  = f"{client_id}:{window_key}"
 
-    # OOM guard: evict when too many keys accumulated.
-    if len(local_rate_limits) >= RL_LOCAL_MAX_KEYS:
-        local_rate_limits.clear()
-
     prev_count = local_rate_limits.get(prev_key, 0)
+    if prev_key in local_rate_limits:
+        local_rate_limits.move_to_end(prev_key)
     curr_count = local_rate_limits.get(curr_key, 0) + 1
+    if curr_key in local_rate_limits:
+        local_rate_limits.move_to_end(curr_key)
+    else:
+        # OOM guard: evict oldest entries when too many keys accumulated.
+        while len(local_rate_limits) >= RL_LOCAL_MAX_KEYS:
+            local_rate_limits.popitem(last=False)
     local_rate_limits[curr_key] = curr_count
 
     elapsed   = now % RL_WINDOW_SEC
@@ -432,6 +448,8 @@ def _local_rate_limit(client_id: str, now: int, window_key: int) -> bool:
     return estimated <= RL_FALLBACK_LIMIT
 
 async def consume_nonce(nonce: str, ttl: int = NONCE_TTL_SEC, act: str = "read") -> bool:
+    if nonce_script is None:
+        get_redis_client()
     key = f"nonce:{nonce}"
     result = await nonce_script(keys=[key], args=["1", str(ttl)])
     return result == 1
@@ -526,6 +544,21 @@ async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future,
         if in_flight.get(comp_key) is fut:
             in_flight.pop(comp_key, None)
 
+async def _process_stream_messages(messages, active_stream_client, active_redis_client):
+    for msg_id, msg_data in messages:
+        key_bytes = msg_data.get(b"key")
+        if not key_bytes:
+            logging.warning(f"Malformed message skipped: {msg_data}")
+            await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+            continue
+        key = key_bytes.decode()
+        l1_cache.delete(key)
+        try:
+            await active_redis_client.delete(f"policy:{key}")
+        except Exception as e:
+            logging.warning(f"Failed to delete L2 cache: {e}")
+        await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+
 async def stream_listener():
     try:
         client = stream_redis_client or get_redis_client()
@@ -554,23 +587,13 @@ async def stream_listener():
                 start_time = time.time()
                 total_pending = 0
 
-                pending = await active_stream_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: "0"}, count=STREAM_CATCHUP_COUNT)
-                if pending and pending[0][1]:
+                while True:
+                    pending = await active_stream_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: "0"}, count=STREAM_CATCHUP_COUNT)
+                    if not pending or not pending[0][1]:
+                        break
                     messages = pending[0][1]
                     total_pending += len(messages)
-                    for msg_id, msg_data in messages:
-                        key_bytes = msg_data.get(b"key")
-                        if not key_bytes:
-                            logging.warning(f"Malformed message skipped: {msg_data}")
-                            await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
-                            continue
-                        key = key_bytes.decode()
-                        l1_cache.delete(key)
-                        try:
-                            await active_redis_client.delete(f"policy:{key}")
-                        except Exception as e:
-                            logging.warning(f"Failed to delete L2 cache: {e}")
-                        await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+                    await _process_stream_messages(messages, active_stream_client, active_redis_client)
 
                 # Catch up on messages accumulated during partition that were never delivered to this consumer group
                 while True:
@@ -579,19 +602,7 @@ async def stream_listener():
                         break
                     messages = new_msgs[0][1]
                     total_pending += len(messages)
-                    for msg_id, msg_data in messages:
-                        key_bytes = msg_data.get(b"key")
-                        if not key_bytes:
-                            logging.warning(f"Malformed message skipped: {msg_data}")
-                            await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
-                            continue
-                        key = key_bytes.decode()
-                        l1_cache.delete(key)
-                        try:
-                            await active_redis_client.delete(f"policy:{key}")
-                        except Exception as e:
-                            logging.warning(f"Failed to delete L2 cache: {e}")
-                        await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+                    await _process_stream_messages(messages, active_stream_client, active_redis_client)
 
                 catchup_duration = int((time.time() - start_time) * 1000)
                 with stats_lock:
@@ -619,19 +630,7 @@ async def stream_listener():
 
                 messages = messages_data[0][1]
 
-            for msg_id, msg_data in messages:
-                key_bytes = msg_data.get(b"key")
-                if not key_bytes:
-                    logging.warning(f"Malformed message skipped: {msg_data}")
-                    await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
-                    continue
-                key = key_bytes.decode()
-                l1_cache.delete(key)
-                try:
-                    await active_redis_client.delete(f"policy:{key}")
-                except Exception as e:
-                    logging.warning(f"Failed to delete L2 cache: {e}")
-                await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+            await _process_stream_messages(messages, active_stream_client, active_redis_client)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -659,18 +658,24 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=MAX_DB_WORKERS, max_keepalive_connections=MAX_DB_WORKERS),
     )
     task = asyncio.create_task(stream_listener())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
     task_cleanup = asyncio.create_task(cleanup_local_rl())
+    background_tasks.add(task_cleanup)
+    task_cleanup.add_done_callback(background_tasks.discard)
+    tasks = [task, task_cleanup]
     yield
     task.cancel()
     task_cleanup.cancel()
+    await asyncio.gather(*tasks, *background_tasks, return_exceptions=True)
     if sync_http_client is not None and not sync_http_client.is_closed:
         sync_http_client.close()
     if async_db_client is not None and not async_db_client.is_closed:
         await async_db_client.aclose()
     if db_executor is not None:
-        db_executor.shutdown(wait=True)
+        db_executor.shutdown(wait=False, cancel_futures=True)
     if pop_executor is not None:
-        pop_executor.shutdown(wait=True)
+        pop_executor.shutdown(wait=False, cancel_futures=True)
     if redis_client is not None:
         await redis_client.close()
     if stream_redis_client is not None:
@@ -686,7 +691,7 @@ async def unified_http_exception_handler(request: Request, exc: HTTPException):
     )
 
 ADMIN_SECRET_TOKEN = os.environ.get("ADMIN_SECRET_TOKEN")
-if not ADMIN_SECRET_TOKEN:
+if not ADMIN_SECRET_TOKEN or not ADMIN_SECRET_TOKEN.strip():
     raise RuntimeError("ADMIN_SECRET_TOKEN environment variable is required")
 
 @app.middleware("http")
@@ -773,23 +778,24 @@ async def auth(
             return JSONResponse(status_code=429, headers={"Retry-After": str(RL_WINDOW_SEC)}, content={"status": "error", "message": "Too Many Requests"})
     except Exception as e:
         logging.warning(f"Rate limit check failed (Redis down?): {e}")
+        with stats_lock:
+            stats["redis_outage_blocked"] += 1
         raise HTTPException(status_code=503, detail="Service Unavailable - Rate Limit Failed")
 
     # Nonce verification runs BEFORE PoP ECDSA signature verification to burn attacker nonces atomically in Redis,
     # preventing signature verification CPU exhaustion (DoS) with replayed/forged nonces.
     try:
         nonce_ok = await consume_nonce(x_nonce, act=x_act)
-        if not nonce_ok:
-            with stats_lock:
-                stats["nonce_replays"] += 1
-            raise HTTPException(status_code=401, detail="Replay Detected")
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
         logging.warning(f"Nonce check failed (Redis down?): {e}")
         with stats_lock:
             stats["redis_outage_blocked"] += 1
         raise HTTPException(status_code=503, detail="Service Unavailable - Nonce Check Failed")
+
+    if not nonce_ok:
+        with stats_lock:
+            stats["nonce_replays"] += 1
+        raise HTTPException(status_code=401, detail="Replay Detected")
 
     if POP_VERIFY_ENABLED:
         if not x_pop_signature:
@@ -811,6 +817,13 @@ async def auth(
                 logging.debug(f"L2 pubkey cache read bypassed: {e}")
 
         if not pubkey_pem:
+            can_exec, current_state = cb.can_execute()
+            if not can_exec:
+                with stats_lock:
+                    stats["circuit_state"] = current_state
+                    stats["circuit_blocked"] += 1
+                    stats["pop_rejected"] += 1
+                raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
             try:
                 if DB_MODE == "async":
                     client = get_async_db_client()
@@ -821,13 +834,20 @@ async def auth(
                     sem = get_db_semaphore()
                     executor = get_db_executor()
                     client = get_sync_http_client()
-                    async with sem:
+                    try:
+                        await asyncio.wait_for(sem.acquire(), timeout=DB_SEMAPHORE_ACQUIRE_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        raise DBOverloadError("DB concurrency limit reached (Fast-Fail)")
+                    try:
                         resp = await asyncio.get_running_loop().run_in_executor(
                             executor,
                             lambda: client.get(f"{db_url}/pubkey", params={"sid": x_spiffe_id}, timeout=DB_TIMEOUT_SEC)
                         )
                         resp.raise_for_status()
                         pubkey_pem = resp.json().get("public_key")
+                    finally:
+                        sem.release()
+                cb.record_success()
                 if pubkey_pem:
                     l1_cache.set(pubkey_key, pubkey_pem)
                     try:
@@ -840,12 +860,17 @@ async def auth(
                     with stats_lock:
                         stats["pop_rejected"] += 1
                     raise HTTPException(status_code=401, detail="Unknown Key ID")
+                cb.record_failure()
                 with stats_lock:
+                    stats["circuit_state"] = cb.current_state
                     stats["pop_rejected"] += 1
                 raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
             except Exception as e:
+                if not isinstance(e, DBOverloadError):
+                    cb.record_failure()
                 logging.warning(f"Failed to fetch pubkey: {e}")
                 with stats_lock:
+                    stats["circuit_state"] = cb.current_state
                     stats["pop_rejected"] += 1
                 raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
 
@@ -934,6 +959,8 @@ async def auth(
         stats["db_fallbacks"] += 1
 
     task = asyncio.create_task(db_loader_task(comp_key, x_spiffe_id, x_res, fut, use_singleflight=SINGLEFLIGHT_ENABLED))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
     try:
         return await asyncio.shield(fut)
     except DBOverloadError as e:
@@ -1001,7 +1028,9 @@ async def set_partition(state: str):
         is_partitioned = (state == "isolate")
         current_partitioned = is_partitioned
     if state == "heal":
-        asyncio.create_task(probe_db_health())
+        task = asyncio.create_task(probe_db_health())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
     return {"status": current_partitioned}
 
 @app.post("/chaos/redis/{state}")
@@ -1039,14 +1068,16 @@ async def set_redis(state: str):
         except Exception as e:
             logging.warning(f"Failed to close old Redis clients: {e}")
 
-    asyncio.create_task(close_old_clients(old_redis, old_stream))
+    task = asyncio.create_task(close_old_clients(old_redis, old_stream))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
     return {"status": state}
 
 @app.post("/chaos/invalidate/{key}")
 async def invalidate_cache(key: str):
     try:
         client = get_redis_client()
-        await client.xadd(STREAM_NAME, {"key": key})
+        await client.xadd(STREAM_NAME, {"key": key}, maxlen=10000, approximate=True)
     except Exception as e:
         logging.warning(f"Failed to publish invalidation: {e}")
     return {"status": "published"}
