@@ -124,6 +124,10 @@ async def health():
 
 @app.get("/")
 async def get_index():
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "index.html")
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(f.read())
     if index_html_cache is None:
         return JSONResponse(status_code=503, content={"detail": "Service Unavailable - index.html not loaded"})
     return HTMLResponse(index_html_cache)
@@ -253,11 +257,14 @@ async def chaos_same_key_burst(node: str, count: int = 50):
 
     delta_db = stats_after.get("db_queries_executed", 0) - stats_before.get("db_queries_executed", 0)
     delta_coal = stats_after.get("singleflight_coalesced", 0) - stats_before.get("singleflight_coalesced", 0)
+    delta_l1 = stats_after.get("l1_hits", 0) - stats_before.get("l1_hits", 0)
 
     return {
         "node": node,
+        "count": count,
         "delta_db_queries_executed": delta_db,
-        "delta_singleflight_coalesced": delta_coal
+        "delta_singleflight_coalesced": delta_coal,
+        "delta_l1_hits": delta_l1
     }
 
 @app.post("/chaos/ddos")

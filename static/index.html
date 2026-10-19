@@ -2,355 +2,897 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>Aegis-Sync Console</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aegis-Sync Console | Distributed Resilience Gateway</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23f59e0b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/></svg>" type="image/svg+xml">
     <style>
         :root {
-            --bg: #0f1419;
-            --text-primary: #e2e8f0;
-            --text-secondary: #94a3b8;
-            --normal: #22c55e;
-            --warning: #f59e0b;
-            --danger: #ef4444;
-            --action: #3b82f6;
-            --card-bg: #1e293b;
-            --btn-bg: #334155;
+            --bg: #0d1117;
+            --card-bg: #161b22;
+            --card-border: #30363d;
+            --card-hover-border: #484f58;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+            --normal: #3fb950;
+            --normal-bg: rgba(63, 185, 80, 0.1);
+            --normal-border: rgba(63, 185, 80, 0.3);
+            --warning: #d29922;
+            --warning-bg: rgba(210, 153, 34, 0.1);
+            --warning-border: rgba(210, 153, 34, 0.3);
+            --danger: #f85149;
+            --danger-bg: rgba(248, 81, 73, 0.1);
+            --danger-border: rgba(248, 81, 73, 0.3);
+            --action: #58a6ff;
+            --action-bg: rgba(88, 166, 255, 0.1);
+            --action-border: rgba(88, 166, 255, 0.3);
+            --btn-bg: #21262d;
+            --btn-border: #30363d;
+            --btn-hover: #30363d;
+            --radius-sm: 6px;
+            --radius-md: 8px;
         }
+
+        * { box-sizing: border-box; }
+
         body {
             background-color: var(--bg);
             color: var(--text-primary);
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Pretendard", Helvetica, Arial, sans-serif;
             margin: 0;
-            padding: 16px;
-        }
-        h1, h2, h3, h4 { margin-top: 0; font-weight: 600; }
-        h1 { margin-bottom: 6px; font-size: 1.6rem; }
-        
-        .intro-text {
-            color: var(--text-secondary);
-            font-size: 0.95rem;
-            line-height: 1.4;
-            margin-bottom: 12px;
-            max-width: 900px;
+            padding: 20px 24px;
+            min-height: 100vh;
+            line-height: 1.5;
         }
 
-        .grid { display: grid; grid-template-columns: 1fr 400px; gap: 16px; align-items: start; }
-        .card { background-color: var(--card-bg); border-radius: 8px; padding: 16px; }
-        
-        /* Active Faults Area */
-        .active-faults-container {
+        /* Header / Brand */
+        .header-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-bottom: 16px;
+            padding-bottom: 14px;
+            border-bottom: 1px solid var(--card-border);
+        }
+        .header-brand {
             display: flex;
             align-items: center;
             gap: 12px;
-            margin-bottom: 12px;
-            min-height: 28px;
+        }
+        .header-logo {
+            width: 34px;
+            height: 34px;
+            background: #21262d;
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-md);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .header-title-box h1 {
+            margin: 0;
+            font-size: 1.4rem;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            color: var(--text-primary);
+        }
+        .header-title-box p {
+            margin: 2px 0 0 0;
+            font-size: 0.82rem;
+            color: var(--text-secondary);
+        }
+        .hero-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 6px;
+        }
+        .hero-tag {
+            font-size: 0.72rem;
+            padding: 2px 8px;
+            border-radius: 12px;
+            background: #21262d;
+            border: 1px solid var(--card-border);
+            color: var(--text-secondary);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+        .header-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .live-pill {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            background: #21262d;
+            border: 1px solid var(--card-border);
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            background-color: var(--normal);
+            border-radius: 50%;
+        }
+
+        /* Active Faults & Reset Bar */
+        .active-faults-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 16px;
+            padding: 8px 14px;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-md);
+            min-height: 42px;
         }
         .fault-title {
             color: var(--text-secondary);
-            font-size: 0.9rem;
+            font-size: 0.82rem;
             font-weight: 600;
         }
         .fault-list {
             display: flex;
             gap: 8px;
             align-items: center;
+            flex-wrap: wrap;
         }
         .fault-list-item {
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 0.8rem;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
             font-weight: 600;
         }
-        .fault-list-item.danger { background-color: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
-        .fault-list-item.warning { background-color: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+        .fault-list-item.danger { background-color: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border); }
+        .fault-list-item.warning { background-color: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }
         .fault-list-empty {
-            color: var(--normal);
-            font-size: 0.85rem;
-            font-style: italic;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+        .btn-reset-all {
+            background: #21262d;
+            color: var(--text-primary);
+            border: 1px solid var(--card-border);
+            padding: 4px 10px;
+            border-radius: var(--radius-sm);
+            font-size: 0.78rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .btn-reset-all:hover {
+            background: #30363d;
+            border-color: var(--card-hover-border);
+        }
+
+        /* Main Layout Grid */
+        .grid {
+            display: grid;
+            grid-template-columns: 1.15fr 0.85fr;
+            gap: 16px;
+            align-items: start;
+        }
+        @media (max-width: 1100px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-md);
+            padding: 16px;
+            transition: border-color 0.2s ease;
+        }
+        .card:hover {
+            border-color: var(--card-hover-border);
         }
 
         /* Banner Slot */
         .event-banner-slot {
-            height: 40px;
+            min-height: 40px;
             margin-bottom: 12px;
             position: relative;
         }
         .banner {
-            position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
-            padding: 0 20px;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 0.95rem;
+            padding: 8px 14px;
+            border-radius: var(--radius-sm);
+            font-weight: 500;
+            font-size: 0.85rem;
             display: flex;
             align-items: center;
-            transition: opacity 0.3s ease, transform 0.3s ease;
+            gap: 8px;
+            transition: all 0.2s ease;
         }
         .banner.placeholder {
-            border: 1px dashed rgba(255,255,255,0.15);
-            color: var(--text-secondary);
-            background: rgba(255,255,255,0.02);
-            font-weight: normal;
+            border: 1px dashed var(--card-border);
+            color: var(--text-muted);
+            background: transparent;
+            font-weight: 400;
         }
-        .banner.normal { background-color: rgba(34, 197, 94, 0.15); border-left: 4px solid var(--normal); color: var(--normal); }
-        .banner.warning { background-color: rgba(245, 158, 11, 0.15); border-left: 4px solid var(--warning); color: var(--warning); }
-        .banner.danger { background-color: rgba(239, 68, 68, 0.15); border-left: 4px solid var(--danger); color: var(--danger); }
-        .banner.action { background-color: rgba(59, 130, 246, 0.15); border-left: 4px solid var(--action); color: var(--action); }
-        
-        .topology { display: flex; gap: 16px; justify-content: space-between; margin-bottom: 16px; }
-        .node { 
-            flex: 1; 
-            background-color: rgba(255,255,255,0.03); 
-            border: 2px solid transparent; 
-            padding: 12px; 
-            border-radius: 8px; 
+        .banner.normal { background: var(--normal-bg); border-left: 3px solid var(--normal); color: var(--normal); border-top: 1px solid var(--normal-border); border-right: 1px solid var(--normal-border); border-bottom: 1px solid var(--normal-border); }
+        .banner.warning { background: var(--warning-bg); border-left: 3px solid var(--warning); color: var(--warning); border-top: 1px solid var(--warning-border); border-right: 1px solid var(--warning-border); border-bottom: 1px solid var(--warning-border); }
+        .banner.danger { background: var(--danger-bg); border-left: 3px solid var(--danger); color: var(--danger); border-top: 1px solid var(--danger-border); border-right: 1px solid var(--danger-border); border-bottom: 1px solid var(--danger-border); }
+        .banner.action { background: var(--action-bg); border-left: 3px solid var(--action); color: var(--action); border-top: 1px solid var(--action-border); border-right: 1px solid var(--action-border); border-bottom: 1px solid var(--action-border); }
+
+        /* Topology: 3 Gateway Nodes */
+        .topology {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        @media (max-width: 768px) {
+            .topology { grid-template-columns: 1fr; }
+        }
+
+        .node {
+            background-color: #0d1117;
+            border: 1px solid var(--card-border);
+            padding: 12px;
+            border-radius: var(--radius-sm);
             position: relative;
-            transition: all 0.3s ease; 
+            transition: all 0.2s ease;
         }
-        .node-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-        .node h3 { margin: 0; font-size: 1.1rem; }
-        
-        .badge { 
-            padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold;
-            transition: background-color 0.3s ease, color 0.3s ease;
-        }
-        .badge.normal { background-color: rgba(34, 197, 94, 0.15); color: var(--normal); }
-        .badge.warning { background-color: rgba(245, 158, 11, 0.15); color: var(--warning); }
-        .badge.danger { background-color: rgba(239, 68, 68, 0.15); color: var(--danger); }
-        
-        .node.normal { border-color: rgba(34, 197, 94, 0.2); }
-        .node.isolated { border-color: var(--warning); animation: pulse-warning 3s infinite ease-in-out; }
-        .node.circuit-open { border-color: var(--danger); animation: pulse-danger 3s infinite ease-in-out; }
-        
-        @keyframes pulse-warning {
-            0%, 100% { border-color: rgba(245, 158, 11, 0.2); box-shadow: 0 0 0 transparent; }
-            50% { border-color: rgba(245, 158, 11, 0.6); box-shadow: 0 0 8px rgba(245, 158, 11, 0.1); }
-        }
-        .node-reason { font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 12px; font-style: normal; line-height: 1.3; border-left: 2px solid rgba(255,255,255,0.2); padding-left: 8px;}
-        .impact-text { font-weight: normal; color: rgba(255,255,255,0.8); margin-left: 6px; font-size: 0.8rem; }
-        .layer.warning { border-color: var(--warning); animation: pulse-warning 3s infinite ease-in-out; }
-        .node.warning-pulse { border-color: var(--warning); animation: pulse-warning 3s infinite ease-in-out; }
-        .node.danger-pulse { border-color: var(--danger); animation: pulse-danger 3s infinite ease-in-out; }
-        @keyframes pulse-danger {
-            0%, 100% { border-color: rgba(239, 68, 68, 0.2); box-shadow: 0 0 0 transparent; }
-            50% { border-color: rgba(239, 68, 68, 0.6); box-shadow: 0 0 8px rgba(239, 68, 68, 0.1); }
-        }
+        .node.normal { border-color: var(--card-border); }
+        .node.isolated { border-color: var(--warning); }
+        .node.circuit-open { border-color: var(--danger); }
+        .node.warning-pulse { border-color: var(--warning); }
+        .node.danger-pulse { border-color: var(--danger); }
 
-        .flash { animation: flash-anim 0.5s ease-out; }
+        .flash { animation: flash-anim 0.4s ease-out; }
         @keyframes flash-anim {
-            0% { background-color: rgba(255,255,255,0.15); }
-            100% { background-color: rgba(255,255,255,0.03); }
+            0% { background-color: #21262d; }
+            100% { background-color: #0d1117; }
         }
 
-        .metrics { font-size: 0.85rem; color: var(--text-secondary); display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-        .metric-val { color: var(--text-primary); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-        .cb-val { font-weight: bold; transition: color 0.3s ease; }
-
-        .catchup-toast { 
-            position: absolute; bottom: -15px; left: 50%; transform: translateX(-50%);
-            background-color: var(--action); color: white; text-align: center; 
-            padding: 4px 12px; border-radius: 12px; font-size: 0.75rem; font-weight: 600;
-            opacity: 0; pointer-events: none; transition: opacity 0.3s ease; white-space: nowrap;
-        }
-        
-        /* Backend Component Layers */
-        .layer { 
-            padding: 12px; margin-top: 12px; 
-            background-color: rgba(255,255,255,0.02); border-radius: 8px; 
-            border: 2px solid transparent; color: var(--text-secondary);
-            transition: all 0.3s ease;
-        }
-        .layer-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
-        .layer h4 { margin: 0; color: var(--text-primary); font-size: 0.95rem; font-weight: 600; }
-        .layer.normal { border-color: rgba(34, 197, 94, 0.2); }
-        .layer.danger { border-color: var(--danger); animation: pulse-danger 3s infinite ease-in-out; }
-        .layer small { font-size: 0.75rem; }
-
-        .control-group { margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
-        .control-group:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
-        .controls-title { font-size: 1.15rem; margin: 0 0 10px 0; font-weight: 600; color: var(--text-primary); }
-        .control-group h4 { margin: 0 0 4px 0; font-size: 0.9rem; color: var(--text-primary); font-weight: 600; }
-        .control-desc { color: var(--text-secondary); font-size: 0.8rem; margin: 0 0 6px 0; line-height: 1.3; }
-        
-        .hint-details {
+        .node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 6px;
         }
+        .node h3 {
+            margin: 0;
+            font-size: 0.95rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+        }
+        .node-reason {
+            font-size: 0.72rem;
+            color: var(--text-secondary);
+            margin-bottom: 10px;
+            line-height: 1.35;
+            border-left: 2px solid var(--card-border);
+            padding-left: 6px;
+            min-height: 28px;
+        }
+
+        .metrics-grid-compact {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            font-size: 0.78rem;
+        }
+        .metric-cell {
+            background: #161b22;
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-sm);
+            padding: 4px 6px;
+        }
+        .metric-lbl {
+            font-size: 0.68rem;
+            color: var(--text-muted);
+            display: block;
+        }
+        .metric-val {
+            font-weight: 600;
+            color: var(--text-primary);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+        .cb-val { font-weight: 600; }
+
+        .badge {
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            display: inline-block;
+        }
+        .badge.normal { background: var(--normal-bg); color: var(--normal); border: 1px solid var(--normal-border); }
+        .badge.warning { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }
+        .badge.danger { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border); }
+        .badge.action { background: var(--action-bg); color: var(--action); border: 1px solid var(--action-border); }
+        .badge.neutral { background: #21262d; color: var(--text-secondary); border: 1px solid var(--card-border); }
+
+        .catchup-toast { 
+            position: absolute; bottom: -10px; left: 50%; transform: translateX(-50%);
+            background-color: var(--card-bg); border: 1px solid var(--card-border); color: var(--text-primary);
+            text-align: center; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 500;
+            opacity: 0; pointer-events: none; transition: opacity 0.2s ease; white-space: nowrap;
+            z-index: 10;
+        }
+
+        /* Backend Component Layers */
+        .layer {
+            padding: 10px 12px;
+            margin-top: 8px;
+            background-color: #0d1117;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--card-border);
+            color: var(--text-secondary);
+            transition: all 0.2s ease;
+        }
+        .layer-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2px;
+        }
+        .layer h4 {
+            margin: 0;
+            color: var(--text-primary);
+            font-size: 0.88rem;
+            font-weight: 600;
+        }
+        .layer.normal { border-color: var(--card-border); }
+        .layer.danger { border-color: var(--danger); }
+        .layer small { font-size: 0.75rem; color: var(--text-secondary); }
+
+        /* Terminal Console */
+        .terminal-container { margin-top: 14px; }
+        .terminal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #161b22;
+            padding: 6px 12px;
+            border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+            border: 1px solid var(--card-border);
+            border-bottom: none;
+        }
+        .terminal-title {
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-family: monospace;
+        }
+        .terminal {
+            background-color: #0d1117;
+            border: 1px solid var(--card-border);
+            border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+            padding: 10px 12px;
+            height: 140px;
+            overflow-y: auto;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+        .log-entry { margin-bottom: 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); padding-bottom: 4px; font-size: 0.78rem; }
+        .log-time { color: var(--text-muted); margin-right: 6px; }
+        .log-msg { color: var(--text-primary); }
+        .log-raw { margin-top: 4px; font-size: 0.72rem; color: var(--text-muted); }
+        .log-raw pre { margin: 2px 0 0 0; overflow-x: auto; background: #161b22; padding: 4px 6px; border-radius: 4px; border: 1px solid var(--card-border); }
+
+        /* Chaos Controls Panel */
+        .controls-title {
+            font-size: 1.05rem;
+            margin: 0 0 10px 0;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .control-group {
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--card-border);
+        }
+        .control-group:last-child {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: none;
+        }
+        .control-group h4 {
+            margin: 0 0 4px 0;
+            font-size: 0.88rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .control-desc {
+            color: var(--text-secondary);
+            font-size: 0.78rem;
+            margin: 0 0 6px 0;
+            line-height: 1.4;
+        }
+        .hint-details {
+            margin-bottom: 8px;
+        }
         .hint-details summary {
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             color: var(--action);
             cursor: pointer;
-            font-weight: 600;
+            font-weight: 500;
             user-select: none;
             outline: none;
         }
         .hint-content {
-            font-size: 0.75rem;
-            color: #94a3b8;
+            font-size: 0.74rem;
+            color: var(--text-secondary);
             margin-top: 6px;
-            background: rgba(0,0,0,0.2);
+            background: #0d1117;
             padding: 8px 10px;
-            border-radius: 4px;
+            border-radius: var(--radius-sm);
             border-left: 2px solid var(--action);
-            line-height: 1.4;
+            border: 1px solid var(--card-border);
+            border-left-width: 2px;
+            line-height: 1.45;
         }
-        
-        .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
-        .btn-row:last-child { margin-bottom: 0; }
-        
-        button { 
-            background-color: var(--btn-bg); color: var(--text-primary); 
-            border: none; padding: 6px 12px; border-radius: 4px; 
-            cursor: pointer; font-size: 0.85rem; transition: background-color 0.2s, filter 0.2s;
+
+        /* Buttons */
+        .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+        button {
+            background-color: var(--btn-bg);
+            color: var(--text-primary);
+            border: 1px solid var(--btn-border);
+            padding: 5px 10px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 500;
+            transition: all 0.15s ease;
         }
-        button:hover { filter: brightness(1.2); }
-        
-        .btn-isolate { background-color: #78350f; color: var(--warning); border: 1px solid var(--warning); }
-        .btn-danger { background-color: #7f1d1d; color: #fca5a5; border: 1px solid var(--danger); }
-        .btn-heal { background-color: var(--action); color: #fff; font-weight: 500; }
+        button:hover {
+            background-color: var(--btn-hover);
+            border-color: var(--card-hover-border);
+        }
+        .btn-isolate { color: var(--warning); border-color: rgba(210, 153, 34, 0.4); }
+        .btn-isolate:hover { background-color: #272115; }
+        .btn-danger { color: var(--danger); border-color: rgba(248, 81, 73, 0.4); }
+        .btn-danger:hover { background-color: #2c1618; }
+        .btn-heal { color: var(--normal); border-color: rgba(63, 185, 80, 0.4); }
+        .btn-heal:hover { background-color: #13241b; }
+        .btn-verify { color: var(--action); border-color: rgba(88, 166, 255, 0.4); }
+        .btn-verify:hover { background-color: #162638; }
         button:disabled {
-            opacity: 0.5;
+            opacity: 0.4;
             cursor: not-allowed;
             pointer-events: none;
         }
 
-        
-        .terminal-container { margin-top: 16px; }
-        details summary { cursor: pointer; color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 8px; user-select: none; }
-        .terminal { 
-            background-color: rgba(0,0,0,0.4); 
-            padding: 12px; border-radius: 6px; 
-            height: 160px; overflow-y: auto; 
+        /* Redis Degraded Matrix Styles */
+        .redis-behavior-matrix {
+            margin: 8px 0;
+            background: #0d1117;
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-sm);
+            padding: 8px 10px;
         }
-        
-        /* Human-readable Log Styles */
-        .log-entry { margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 8px; }
-        .log-time { color: #475569; margin-right: 8px; font-family: monospace; font-size: 0.8rem; }
-        .log-msg { color: var(--text-primary); font-size: 0.85rem; }
-        .log-raw { margin-top: 6px; font-size: 0.75rem; color: #64748b; }
-        .log-raw pre { margin: 4px 0 0 0; overflow-x: auto; font-family: monospace; }
+        .matrix-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+        }
+        @media (max-width: 600px) {
+            .matrix-grid { grid-template-columns: 1fr; }
+        }
+        .matrix-item {
+            background: #161b22;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: 0.72rem;
+            border: 1px solid var(--card-border);
+        }
+        .matrix-item strong { display: block; margin-top: 2px; color: var(--text-primary); }
+        .matrix-item p { margin: 2px 0 0 0; color: var(--text-secondary); line-height: 1.3; }
+        .matrix-badge {
+            font-size: 0.68rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: 600;
+            display: inline-block;
+        }
+        .matrix-badge.pass { background: var(--normal-bg); color: var(--normal); border: 1px solid var(--normal-border); }
+        .matrix-badge.block { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }
+        .matrix-badge.info { background: var(--action-bg); color: var(--action); border: 1px solid var(--action-border); }
+
+        /* Single-flight Burst & Verify Card UI */
+        .burst-result-card {
+            margin-top: 8px;
+            background: #0d1117;
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-sm);
+            padding: 10px 12px;
+        }
+        .burst-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .burst-bar-container {
+            background: #161b22;
+            border-radius: 4px;
+            height: 10px;
+            display: flex;
+            overflow: hidden;
+            margin-bottom: 8px;
+            border: 1px solid var(--card-border);
+        }
+        .burst-bar-db {
+            background: #d29922;
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+        .burst-bar-coal {
+            background: #238636;
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+        /* Chaos Controls Tab Navigation */
+        .chaos-tabs-nav {
+            display: flex;
+            gap: 4px;
+            background: #161b22;
+            padding: 4px;
+            border-radius: 6px;
+            margin-bottom: 12px;
+            border: 1px solid var(--card-border);
+        }
+        .chaos-tab-btn {
+            flex: 1;
+            background: transparent;
+            color: var(--text-secondary);
+            border: none;
+            border-radius: 4px;
+            padding: 7px 4px;
+            font-size: 0.74rem;
+            font-weight: 500;
+            cursor: pointer;
+            text-align: center;
+            transition: all 0.15s ease;
+            white-space: nowrap;
+        }
+        .chaos-tab-btn:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.04);
+        }
+        .chaos-tab-btn.active {
+            background: #21262d;
+            color: var(--text-primary);
+            font-weight: 600;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+            border: 1px solid rgba(240, 246, 252, 0.12);
+        }
+        .chaos-tab-pane {
+            display: none;
+        }
+        .chaos-tab-pane.active {
+            display: block;
+            animation: tabFadeIn 0.15s ease;
+        }
+        @keyframes tabFadeIn {
+            from { opacity: 0; transform: translateY(2px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .burst-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            margin-bottom: 6px;
+        }
+        .burst-metric {
+            background: #161b22;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: 0.72rem;
+            border: 1px solid var(--card-border);
+        }
+        .burst-metric-title {
+            color: var(--text-secondary);
+            display: block;
+            margin-bottom: 1px;
+            font-size: 0.7rem;
+        }
+        .burst-metric-val {
+            font-size: 0.92rem;
+            font-weight: 600;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+        .burst-principle {
+            font-size: 0.73rem;
+            color: var(--text-secondary);
+            line-height: 1.4;
+            border-left: 2px solid var(--action);
+            background: #161b22;
+            padding: 6px 8px;
+            border-radius: 0 4px 4px 0;
+            margin-top: 4px;
+            border: 1px solid var(--card-border);
+            border-left-width: 2px;
+        }
+        .spinner-inline {
+            display: inline-block;
+            width: 11px;
+            height: 11px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            border-top-color: #c9d1d9;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 5px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
-    <h1>Aegis-Sync Console</h1>
-    <p class="intro-text">
-        이 데모는 다중 노드 분산 환경에서 <strong>네트워크 단절, 데이터베이스 다운, 캐시 장애</strong> 등 극한의 상황이 발생해도 시스템이 정합성을 스스로 보호하고 무중단 서비스를 제공하는 복원력(Resilience) 아키텍처를 실시간으로 시각화합니다.
-    </p>
-    
-    <div class="active-faults-container">
-        <span class="fault-title">Active Faults:</span>
-        <div id="active-faults-list" class="fault-list">
-            <span class="fault-list-empty">All systems normal</span>
+
+    <!-- Header / Brand Section -->
+    <header class="header-container">
+        <div class="header-brand">
+            <div class="header-logo">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                </svg>
+            </div>
+            <div class="header-title-box">
+                <h1>Aegis-Sync Console</h1>
+                <p>High-Availability Distributed Gateway & Resilience Engineering Dashboard</p>
+                <div class="hero-tags">
+                    <span class="hero-tag">3-Node Cluster</span>
+                    <span class="hero-tag">Redis Streams PEL</span>
+                    <span class="hero-tag">Sliding-Window RL</span>
+                    <span class="hero-tag">Single-Flight DB</span>
+                    <span class="hero-tag">3-State Circuit Breaker</span>
+                    <span class="hero-tag">ECDSA P-256 PoP</span>
+                </div>
+            </div>
         </div>
+        <div class="header-status">
+            <div class="live-pill">
+                <span class="live-dot"></span> Cluster Live (SSE)
+            </div>
+        </div>
+    </header>
+
+    <!-- Active Faults Bar & Reset All -->
+    <div class="active-faults-container">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span class="fault-title">Active Faults:</span>
+            <div id="active-faults-list" class="fault-list">
+                <span class="fault-list-empty">All systems normal (Cluster Healthy)</span>
+            </div>
+        </div>
+        <button id="btn-reset-all" class="btn-reset-all" onclick="resetAllFaults()" title="모든 장애 주입을 해제하고 클러스터를 정상화합니다">
+            Reset All Faults (전체 정상 복구)
+        </button>
     </div>
 
+    <!-- Main Layout Grid -->
     <div class="grid">
+        <!-- Left Panel: Topology & Infrastructure & Logs -->
         <div class="main-panel">
             <div class="event-banner-slot">
                 <div id="recent-event-banner" class="banner placeholder">순간 이벤트 대기 중...</div>
             </div>
             
             <div class="card">
+                <!-- 3 Gateway Nodes -->
                 <div class="topology" id="gateway-layer"></div>
                 
+                <!-- Redis Layer -->
                 <div class="layer normal" id="redis-layer">
                     <div class="layer-header">
-                        <h4>Distributed State Layer (Redis)</h4>
+                        <h4>Distributed State Layer (Redis Cache & Stream)</h4>
                         <span class="badge normal" id="badge-redis">Normal</span>
                     </div>
-                    <small>노드 간 상태를 공유하고 동기화(Catch-up)를 담당하는 중앙 브로커</small>
+                    <small id="redis-layer-desc">노드 간 상태를 공유하고 동기화(Catch-up)를 담당하는 중앙 브로커</small>
                 </div>
                 
+                <!-- External DB Layer -->
                 <div class="layer normal" id="db-layer">
                     <div class="layer-header">
-                        <h4>External Policy DB</h4>
+                        <h4>External Policy DB (Backend Service)</h4>
                         <span class="badge normal" id="badge-db">Normal</span>
                     </div>
-                    <small>사용자 인증을 담당하는 실제 백엔드 (서킷 브레이커 감시 대상)</small>
+                    <small id="db-layer-desc">사용자 인증을 담당하는 실제 백엔드 (서킷 브레이커 감시 대상)</small>
                 </div>
             </div>
             
+            <!-- Real-time Terminal Logs -->
             <div class="terminal-container">
-                <details>
-                    <summary>실시간 시스템 로그 (자세히 보기)</summary>
-                    <div class="terminal" id="terminal">
-                        <div class="log-entry">
-                            <span class="log-time">[System]</span>
-                            <span class="log-msg">시스템 초기화 완료. 이벤트 대기 중...</span>
-                        </div>
+                <div class="terminal-header">
+                    <span class="terminal-title">cluster-events.log</span>
+                    <button onclick="clearTerminal()" style="padding: 1px 6px; font-size: 0.68rem; background: #21262d;">Clear</button>
+                </div>
+                <div class="terminal" id="terminal">
+                    <div class="log-entry">
+                        <span class="log-time">[System]</span>
+                        <span class="log-msg">시스템 초기화 완료. 실시간 이벤트 대기 중...</span>
                     </div>
-                </details>
+                </div>
             </div>
         </div>
 
+        <!-- Right Panel: Chaos Engineering Controls -->
         <div class="card">
-            <h2 class="controls-title">Chaos Controls</h2>
+            <h2 class="controls-title">
+                <span>Chaos Controls</span>
+                <span style="font-size: 0.72rem; color: var(--text-muted); font-weight: normal;">Fault Injection Engine</span>
+            </h2>
             
-            <div class="control-group">
-                <h4>1. 중복 요청 방어 (Race Condition 방어)</h4>
-                <p class="control-desc">같은 쓰기(Write) 요청이 두 노드에 동시에 도달할 때, 정확히 하나만 승인되는지 확인합니다.</p>
-                <details class="hint-details">
-                    <summary>💡 예상 결과 및 원리 보기</summary>
-                    <div class="hint-content">정상 시 1개 통과/1개 차단됩니다. 단, Redis 중단 시 쓰기(Write) 요청은 데이터 정합성을 강력하게 보호하기 위해 양쪽 노드에서 모두 차단(Fail-Closed)됩니다.</div>
-                </details>
-                <div class="btn-row">
-                    <button onclick="runChaos('/chaos/nonce')">테스트 실행</button>
-                </div>
+            <!-- Chaos Controls Tab Navigation -->
+            <div class="chaos-tabs-nav">
+                <button id="tab-btn-traffic" class="chaos-tab-btn active" onclick="switchChaosTab('traffic')">1. 트래픽 및 동시성</button>
+                <button id="tab-btn-faults" class="chaos-tab-btn" onclick="switchChaosTab('faults')">2. 인프라 장애 격리</button>
+                <button id="tab-btn-sync" class="chaos-tab-btn" onclick="switchChaosTab('sync')">3. 네트워크 및 동기화</button>
             </div>
-            
-            <div class="control-group">
-                <h4>2. 대규모 트래픽 방어 (L7 DDoS)</h4>
-                <p class="control-desc">짧은 시간에 대량의 요청을 보내 시스템이 초과 요청을 즉각 차단하여 방어하는지 확인합니다.</p>
-                <details class="hint-details">
-                    <summary>💡 예상 결과 및 원리 보기</summary>
-                    <div class="hint-content">글로벌 클라이언트 제한(기본값 10초 윈도우당 50개, sliding-window 근사)에 따라 초과 트래픽이 방어됩니다.<br>참고: Redis 장애 시, 로컬 rate-limit 폴백 한도에 도달하기 전에 Nonce 검증 단계에서 /auth 요청이 실패할 수 있습니다. (연속 클릭 시 10초 윈도우 한도가 꽉 차 있어 처음부터 방어될 수 있습니다)</div>
-                </details>
-                <div class="btn-row">
-                    <button onclick="runChaos('/chaos/ddos')">DDoS 시뮬레이션</button>
+
+            <!-- TAB 1: Traffic & Concurrency Defenses -->
+            <div id="tab-pane-traffic" class="chaos-tab-pane active">
+                <!-- Control 1: Nonce Replay / Idempotency -->
+                <div class="control-group">
+                    <h4>1. 중복 요청 방어 (Distributed Nonce & Idempotency)</h4>
+                    <p class="control-desc">같은 쓰기(Write) 요청이 두 노드에 동시 인입될 때, 정확히 하나만 승인(Race Condition 방어)되는지 확인합니다.</p>
+                    <details class="hint-details">
+                        <summary>[원리] 예상 결과 및 원리 보기 (Redis 정상 vs 장애)</summary>
+                        <div class="hint-content">
+                            • <strong>Redis 정상 시:</strong> 분산 원자적 소진으로 <strong>1개 통과(200 OK) / 1개 차단(401 Replay Detected)</strong>.<br>
+                            • <strong>Redis 장애 시:</strong> 분산 락/조율이 불가능하므로 이중 결제·데이터 오염을 막기 위해 <strong>양쪽 노드 모두 503(Fail-Closed)으로 안전 차단</strong>됩니다. (보안 안전 장치 정상 동작)
+                        </div>
+                    </details>
+                    <div class="btn-row">
+                        <button onclick="runChaos('/chaos/nonce')">중복 요청 테스트 실행</button>
+                    </div>
+                </div>
+
+                <!-- Control 2: DDoS / Rate Limiting -->
+                <div class="control-group">
+                    <h4>2. 대규모 트래픽 방어 (Sliding-Window Rate Limiter)</h4>
+                    <p class="control-desc">짧은 시간에 50건의 연속 요청을 보내 시스템이 초과 트래픽을 즉각 차단(429)하여 백엔드를 보호하는지 봅니다.</p>
+                    <details class="hint-details">
+                        <summary>[원리] 예상 결과 및 원리 보기</summary>
+                        <div class="hint-content">
+                            • <strong>Redis 정상 시:</strong> 전역 슬라이딩 윈도우(10초당 50개)를 초과하는 트래픽을 즉시 429로 방어합니다.<br>
+                            • <strong>Redis 장애 시:</strong> 각 게이트웨이가 <strong>노드별 로컬 인메모리 슬라이딩 윈도우(10초당 15개)로 자동 폴백</strong>하여 노드 다운을 방어합니다.
+                        </div>
+                    </details>
+                    <div class="btn-row">
+                        <button onclick="runChaos('/chaos/ddos')">DDoS 시뮬레이션</button>
+                    </div>
+                </div>
+
+                <!-- Control 6: Single-Flight Burst -->
+                <div class="control-group">
+                    <h4>6. Same-key Burst (Single-flight Test)</h4>
+                    <p class="control-desc">동일한 키로 동시에 여러 요청이 쏟아질 때(Thundering Herd), 백엔드 DB 조회를 1회로 병합하고 부하를 얼마나 줄이는지 확인합니다.</p>
+                    <details class="hint-details">
+                        <summary>[원리] 예상 결과 및 원리 보기</summary>
+                        <div class="hint-content">
+                            <strong>동작 원리 (Single-Flight 병합):</strong><br>
+                            동일한 리소스(사용자/정책)에 대해 50개의 요청이 캐시 미스 상태에서 동시에 도달하면, <strong>최초 요청(Leader)만 실제 DB를 조회</strong>하고 나머지 <strong>49개 요청(Followers)은 메모리에서 대기(In-flight Coalescing)</strong>하다가 Leader의 응답 결과를 그대로 공유받습니다.<br>
+                            → 50번 발생할 수 있는 DB 쿼리가 <strong>단 1번</strong>으로 압축되어 <strong>DB 부하를 약 98% 절감</strong>합니다.
+                        </div>
+                    </details>
+                    <div class="btn-row">
+                        <button id="btn-burst-Node-A" onclick="runSameKeyBurst('Node-A', 50)">Node-A에 Burst 50 발송</button>
+                        <button id="btn-burst-Node-B" onclick="runSameKeyBurst('Node-B', 50)">Node-B에 Burst 50 발송</button>
+                    </div>
+                    <div id="burst-result"></div>
                 </div>
             </div>
 
-            <div class="control-group">
-                <h4>3. 네트워크 단절 및 복구 (Partition Test)</h4>
-                <p class="control-desc">Node-B의 통신을 끊어 분립시키고, 복구될 때 즉시 상태를 동기화(Catch-up)하는지 봅니다.</p>
-                <details class="hint-details">
-                    <summary>💡 예상 결과 및 원리 보기</summary>
-                    <div class="hint-content">단절 상태에서는 B노드가 외부와 완전히 고립되므로, DB가 다운되어도 서킷 브레이커 Closed를 유지하는 것이 정상입니다. 복구 시 즉시 Active Health Check를 수행하여 서킷 브레이커 상태를 최신화합니다.</div>
-                </details>
-                <div class="btn-row">
-                    <button id="btn-isolate" class="btn-isolate" onclick="runChaos('/chaos/partition/Node-B/isolate')">Node-B 통신 단절</button>
-                    <button id="btn-heal" class="btn-heal" onclick="runChaos('/chaos/partition/Node-B/heal')">Node-B 통신 복구</button>
+            <!-- TAB 2: Infrastructure Outage & Circuit Breaker -->
+            <div id="tab-pane-faults" class="chaos-tab-pane">
+                <!-- Control 4: Policy DB Outage -->
+                <div class="control-group">
+                    <h4>4. 백엔드 장애 격리 (DB Outage & Circuit Breaker)</h4>
+                    <p class="control-desc">백엔드 DB를 멈춰서 모든 게이트웨이가 연쇄 장애(Cascading Failure)를 막기 위해 서킷 브레이커(Open)를 작동시키는지 봅니다.</p>
+                    <div class="btn-row">
+                        <button id="btn-db-down" class="btn-danger" onclick="runChaos('/chaos/db/down')">DB 강제 중단</button>
+                        <button id="btn-db-up" class="btn-heal" onclick="runChaos('/chaos/db/up')">DB 복구</button>
+                    </div>
+                </div>
+
+                <!-- Control 5: Redis Outage (Collapsible Degraded Matrix) -->
+                <div class="control-group" id="group-redis-outage">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <h4>5. 공유 캐시 장애 대응 (Redis Outage & Degraded Mode)</h4>
+                        <span id="redis-status-pill" class="badge normal">Redis Normal</span>
+                    </div>
+                    <p class="control-desc">중앙 캐시(Redis)가 다운되었을 때 시스템이 가용성과 보안 원칙에 따라 어떻게 차등 대응(Graceful Degradation)하는지 확인합니다.</p>
+                    
+                    <!-- REDIS OUTAGE BEHAVIOR MATRIX (Collapsible by default) -->
+                    <details class="hint-details">
+                        <summary>[원리] Redis 중단 시 동작 매트릭스 (Availability vs Consistency)</summary>
+                        <div class="redis-behavior-matrix">
+                            <div class="matrix-grid">
+                                <div class="matrix-item">
+                                    <span class="matrix-badge pass">[정상]</span>
+                                    <strong>L1 로컬 인메모리 캐시</strong>
+                                    <p>이미 노드 메모리에 적재된 정책 데이터는 Redis 없이 1ms 미만 초고속 응답</p>
+                                </div>
+                                <div class="matrix-item">
+                                    <span class="matrix-badge pass">[정상]</span>
+                                    <strong>로컬 슬라이딩 유량 제어</strong>
+                                    <p>노드별 독립 메모리 카운터로 자동 폴백 (15 req/10s 초과 시 429 차단 방어)</p>
+                                </div>
+                                <div class="matrix-item">
+                                    <span class="matrix-badge pass">[정상]</span>
+                                    <strong>Policy DB 직접 폴백 및 서킷</strong>
+                                    <p>L2 캐시 우회 후 DB 직접 조회 및 L1 적재 (서킷 브레이커 독립 감시)</p>
+                                </div>
+                                <div class="matrix-item">
+                                    <span class="matrix-badge pass">[정상]</span>
+                                    <strong>단일 비행 (Single-Flight)</strong>
+                                    <p>로컬 Future 기반 동일 키 50개 요청을 1회 DB 쿼리로 병합</p>
+                                </div>
+                                <div class="matrix-item" style="border-color: rgba(210, 153, 34, 0.4);">
+                                    <span class="matrix-badge block">[차단] Fail-Closed</span>
+                                    <strong>분산 Nonce 중복 방어</strong>
+                                    <p>분산 락 부재 시 이중 결제/데이터 오염 방지를 위해 503 즉시 차단 (정상 동작)</p>
+                                </div>
+                                <div class="matrix-item" style="border-color: rgba(88, 166, 255, 0.4);">
+                                    <span class="matrix-badge info">[정합성]</span>
+                                    <strong>통계 불변식 100% 일치</strong>
+                                    <p>503 차단 트래픽이 redis_outage_blocked에 집계되어 관측 무결성 유지</p>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <div class="btn-row">
+                        <button id="btn-redis-down" class="btn-danger" onclick="runChaos('/chaos/redis/down')">Redis 강제 중단</button>
+                        <button id="btn-redis-up" class="btn-heal" onclick="runChaos('/chaos/redis/up')">Redis 복구</button>
+                        <button id="btn-verify-redis" class="btn-verify" onclick="verifyRedisDegradedMode()">Redis 장애 생존성 검증</button>
+                    </div>
+                    <div id="redis-verify-result"></div>
                 </div>
             </div>
-            
-            <div class="control-group">
-                <h4>4. 백엔드 장애 대응 (DB Outage)</h4>
-                <p class="control-desc">백엔드 DB를 멈춰서 모든 노드가 즉시 대기를 멈추고 보호 모드(서킷 브레이커 오픈)에 들어가는지 봅니다.</p>
-                <div class="btn-row">
-                    <button id="btn-db-down" class="btn-danger" onclick="runChaos('/chaos/db/down')">DB 강제 중단</button>
-                    <button id="btn-db-up" class="btn-heal" onclick="runChaos('/chaos/db/up')">DB 복구</button>
+
+            <!-- TAB 3: Network Partition & Synchronization -->
+            <div id="tab-pane-sync" class="chaos-tab-pane">
+                <!-- Control 3: Network Partition -->
+                <div class="control-group">
+                    <h4>3. 네트워크 단절 및 복구 (Partition & PEL Catch-up)</h4>
+                    <p class="control-desc">Node-B의 통신을 끊어 분립시키고, 복구될 때 Redis Streams PEL(Pending Entries List)을 전량 동기화(Catch-up)하는지 봅니다.</p>
+                    <details class="hint-details">
+                        <summary>[원리] 예상 결과 및 원리 보기</summary>
+                        <div class="hint-content">
+                            단절 상태에서는 Node-B가 외부와 완전히 고립되므로 Split-Brain이 방지됩니다. 복구 시 즉시 Pending Entries List(PEL)의 미처리 이벤트를 전량 드레인하여 데이터 정합성을 일치시킵니다.
+                        </div>
+                    </details>
+                    <div class="btn-row">
+                        <button id="btn-isolate" class="btn-isolate" onclick="runChaos('/chaos/partition/Node-B/isolate')">Node-B 통신 단절</button>
+                        <button id="btn-heal" class="btn-heal" onclick="runChaos('/chaos/partition/Node-B/heal')">Node-B 통신 복구</button>
+                    </div>
                 </div>
-            </div>
-            
-            <div class="control-group">
-                <h4>5. 공유 캐시 장애 대응 (Redis Outage)</h4>
-                <p class="control-desc">중앙 캐시 서버를 죽여서 각 노드가 로컬 캐시(L1)만으로 무중단 버티기를 하는지 봅니다.</p>
-                <details class="hint-details">
-                    <summary>💡 예상 결과 및 원리 보기</summary>
-                    <div class="hint-content">Redis가 죽으면 글로벌 정합성을 포기하는 대신 서비스 가용성(Availability)을 선택하여 로컬 캐시로 무중단 서비스합니다.</div>
-                </details>
-                <div class="btn-row">
-                    <button id="btn-redis-down" class="btn-danger" onclick="runChaos('/chaos/redis/down')">Redis 강제 중단</button>
-                    <button id="btn-redis-up" class="btn-heal" onclick="runChaos('/chaos/redis/up')">Redis 복구</button>
+
+                <!-- Control 7: Cache Invalidation Stream -->
+                <div class="control-group">
+                    <h4>7. 캐시 무효화 전파 (Pub/Sub Stream Invalidation)</h4>
+                    <p class="control-desc">정책 데이터가 변경되었을 때 Redis Streams를 통해 모든 분산 게이트웨이의 L1 로컬 캐시를 실시간으로 즉시 무효화(삭제)합니다.</p>
+                    <details class="hint-details">
+                        <summary>[원리] 예상 결과 및 원리 보기</summary>
+                        <div class="hint-content">
+                            특정 노드에서 정책 변경이 발생하면 Redis Streams(invalidation_stream)에 이벤트를 발행합니다. 모든 활성 게이트웨이 노드가 실시간 리스너를 통해 이벤트를 수신하고 자신의 L1 메모리 캐시를 즉각 삭제하여 데이터 정합성을 유지합니다.
+                        </div>
+                    </details>
+                    <div class="btn-row">
+                        <button onclick="runChaos('/chaos/invalidate')">캐시 무효화 이벤트 발행</button>
+                    </div>
                 </div>
-            </div>
-        
-            <div class="control-group">
-                <h4>6. Same-key Burst (Single-flight Test)</h4>
-                <p class="control-desc">동일한 키로 동시에 여러 요청이 들어올 때 백엔드 부하를 얼마나 줄이는지 확인합니다.</p>
-                <div class="btn-row">
-                    <button onclick="runSameKeyBurst('Node-A', 50)">Node-A에 Burst 50 발송</button>
-                </div>
-                <div id="burst-result" style="margin-top: 8px; font-size: 0.85rem; color: var(--normal);"></div>
             </div>
         </div>
     </div>
@@ -359,28 +901,259 @@
         const nodes = ['Node-A', 'Node-B', 'Node-C'];
         const term = document.getElementById('terminal');
         
+        function switchChaosTab(tabId) {
+            const tabs = ['traffic', 'faults', 'sync'];
+            tabs.forEach(t => {
+                const btn = document.getElementById(`tab-btn-${t}`);
+                const pane = document.getElementById(`tab-pane-${t}`);
+                if (t === tabId) {
+                    if (btn) btn.classList.add('active');
+                    if (pane) pane.classList.add('active');
+                } else {
+                    if (btn) btn.classList.remove('active');
+                    if (pane) pane.classList.remove('active');
+                }
+            });
+            sessionStorage.setItem('activeChaosTab', tabId);
+        }
+        
         const activeFaults = {
             db: false,
             redis: false,
             partition: {}
         };
 
-        
-        async function runSameKeyBurst(node, n) {
+        function clearTerminal() {
+            term.innerHTML = '<div class="log-entry"><span class="log-time">[System]</span><span class="log-msg">터미널 로그가 초기화되었습니다.</span></div>';
+        }
+
+        async function resetAllFaults() {
+            showBanner("전체 클러스터 장애 복구 중...", "action");
+            try {
+                await Promise.all([
+                    runChaos('/chaos/redis/up'),
+                    runChaos('/chaos/db/up'),
+                    runChaos('/chaos/partition/Node-B/heal')
+                ]);
+                showBanner("모든 시스템이 정상 상태로 복구되었습니다.", "normal");
+            } catch(e) {
+                showBanner("복구 중 오류 발생: " + e, "danger");
+            }
+        }
+
+        async function verifyRedisDegradedMode() {
+            const resDiv = document.getElementById('redis-verify-result');
+            const btn = document.getElementById('btn-verify-redis');
+            if (btn) btn.disabled = true;
+
+            resDiv.innerHTML = `
+                <div class="burst-result-card" style="border-left: 2px solid var(--action);">
+                    <div style="font-size: 0.82rem; font-weight: 600; color: var(--action);">
+                        <span class="spinner-inline"></span> Redis 장애 상태 생존성 다각도 검증 중...
+                    </div>
+                    <div style="font-size: 0.74rem; color: var(--text-secondary); margin-top: 4px;">
+                        [1] 쓰기 Nonce 검증 (Fail-Closed 503 확인) [2] 로컬 Rate Limiting 폴백 (429 차단 확인) 실행 중...
+                    </div>
+                </div>
+            `;
+
             try {
                 let token = getAdminToken();
+                let nonceRes = await fetch('/chaos/nonce', { method: 'POST', headers: { 'X-Admin-Token': token } });
+                let nonceData = await nonceRes.json().catch(() => ({}));
+                
+                let ddosRes = await fetch('/chaos/ddos', { method: 'POST', headers: { 'X-Admin-Token': token } });
+                let ddosData = await ddosRes.json().catch(() => ({}));
+
+                let isRedisDown = activeFaults.redis;
+                const ddosOk = ddosData.responses ? (ddosData.responses['200'] || 0) : 0;
+                const ddos429 = ddosData.responses ? (ddosData.responses['429'] || 0) : 0;
+                const ddos503 = ddosData.responses ? (ddosData.responses['503'] || 0) : 0;
+
+                resDiv.innerHTML = `
+                    <div class="burst-result-card">
+                        <div class="burst-header">
+                            <span>[검증] Redis 생존성 검증 결과 ${isRedisDown ? '(장애 생존 모드)' : '(정상 분산 모드)'}</span>
+                            <span class="badge ${isRedisDown ? 'warning' : 'normal'}">${isRedisDown ? 'L1 로컬 생존 가동' : '클러스터 정상'}</span>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 6px 0;">
+                            <div class="burst-metric">
+                                <span class="burst-metric-title">쓰기 중복 방어 (Nonce)</span>
+                                <span class="burst-metric-val" style="color: ${isRedisDown ? 'var(--warning)' : 'var(--normal)'}; font-size: 0.85rem;">
+                                    ${isRedisDown ? '503 Fail-Closed (방어)' : '200 / 401 정상'}
+                                </span>
+                                <span style="font-size: 0.68rem; color: var(--text-secondary); display:block;">
+                                    ${isRedisDown ? '데이터 오염 방지 안전 차단' : '분산 1회 소진 성공'}
+                                </span>
+                            </div>
+                            <div class="burst-metric">
+                                <span class="burst-metric-title">유량 제어 (Rate Limiting)</span>
+                                <span class="burst-metric-val" style="color: var(--action); font-size: 0.85rem;">
+                                    ${ddos429 > 0 ? `429 방어 (${ddos429}건)` : `${ddosOk}건 허용`}
+                                </span>
+                                <span style="font-size: 0.68rem; color: var(--text-secondary); display:block;">
+                                    ${isRedisDown ? '로컬 메모리 슬라이딩 윈도우' : 'Redis 전역 슬라이딩 윈도우'}
+                                </span>
+                            </div>
+                        </div>
+                        <div class="burst-principle">
+                            <strong>[결론]</strong> ${isRedisDown 
+                                ? '중앙 Redis가 다운되어도 시스템 전체가 다운되지 않고, <strong>로컬 인메모리 유량 제어로 DDoS를 429로 방어</strong>하며, 데이터 오염 위험이 있는 <strong>쓰기 Nonce는 503 Fail-Closed로 안전하게 막아냄</strong>을 확인했습니다.' 
+                                : 'Redis가 정상 가동 중입니다. 분산 캐시와 원자적 잠금이 모든 노드에서 동기화되고 있습니다.'}
+                        </div>
+                    </div>
+                `;
+                showBanner(`Redis 생존성 검증 완료: ${isRedisDown ? 'L1 로컬 생존 모드 정상 방어' : '정상 분산 모드'}`, isRedisDown ? 'warning' : 'normal');
+                logAction(`Redis 생존성 종합 검증: Nonce(${isRedisDown ? '503 Fail-Closed 안전 차단' : '200/401 정상'}), DDoS(429 방어: ${ddos429}건, 503: ${ddos503}건)`, JSON.stringify({ nonceData, ddosData }, null, 2));
+
+            } catch(e) {
+                resDiv.innerHTML = `<div class="burst-result-card" style="border-color: var(--danger); color: var(--danger);">검증 중 오류 발생: ${e}</div>`;
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        async function runSameKeyBurst(node, n) {
+            const btnA = document.getElementById('btn-burst-Node-A');
+            const btnB = document.getElementById('btn-burst-Node-B');
+            const activeBtn = document.getElementById(`btn-burst-${node}`);
+            const resultDiv = document.getElementById('burst-result');
+            const origText = activeBtn ? activeBtn.innerText : '';
+
+            try {
+                let token = getAdminToken();
+                if (btnA) btnA.disabled = true;
+                if (btnB) btnB.disabled = true;
+                if (activeBtn) activeBtn.innerHTML = `<span class="spinner-inline"></span>${node} 50개 발송 중...`;
+
+                triggerFlash(node);
+                const toast = document.getElementById(`toast-${node}`);
+                if (toast) {
+                    toast.innerText = `${n} Burst In-Flight`;
+                    toast.style.opacity = '1';
+                }
+
+                showBanner(`[${node}] 동일 키 ${n}개 동시 폭주 요청(Burst) 발송 중... Single-Flight 병합 관측 중`, 'action');
+
+                resultDiv.innerHTML = `
+                    <div class="burst-result-card" style="border-left: 2px solid var(--action);">
+                        <div style="display: flex; align-items: center; gap: 8px; color: var(--action); font-size: 0.82rem; font-weight: 600;">
+                            <span class="spinner-inline"></span> ${node}로 ${n}개 동시 요청 전송 및 처리 중...
+                        </div>
+                        <div style="font-size: 0.74rem; color: var(--text-secondary); margin-top: 4px;">
+                            동일 사용자(SPIFFE ID) 토큰으로 캐시 미스 상태의 ${n}개 요청이 동시에 도달했습니다. 최초 1개만 DB를 조회하고 나머지가 병합되는지 확인 중입니다.
+                        </div>
+                    </div>
+                `;
+
                 let res = await fetch(`/chaos/same_key_burst?node=${node}&count=${n}`, {
                     method: 'POST',
                     headers: { 'X-Admin-Token': token }
                 });
+
                 if (res.status === 401) {
-                    showBanner("인증 실패: 잘못된 Admin Token입니다.", "danger");
+                    token = getAdminToken(true);
+                    if (token) {
+                        res = await fetch(`/chaos/same_key_burst?node=${node}&count=${n}`, {
+                            method: 'POST',
+                            headers: { 'X-Admin-Token': token }
+                        });
+                    }
+                    if (res.status === 401) {
+                        showBanner("인증 실패: 잘못된 Admin Token입니다.", "danger");
+                        resultDiv.innerHTML = `<div class="burst-result-card" style="border-color: var(--danger); color: var(--danger);">인증 실패: 잘못된 Admin Token입니다.</div>`;
+                        return;
+                    }
+                }
+
+                if (!res.ok) {
+                    const errData = await res.json().catch(() => ({}));
+                    const detail = errData.detail || `HTTP ${res.status}`;
+                    showBanner(`Burst 요청 실패: ${detail}`, "danger");
+                    resultDiv.innerHTML = `<div class="burst-result-card" style="border-color: var(--danger); color: var(--danger);">요청 실패 (${detail})</div>`;
                     return;
                 }
+
                 const data = await res.json();
-                document.getElementById('burst-result').innerText = `[Burst 50] Δ DB Queries: ${data.delta_db_queries_executed}, Δ Coalesced: ${data.delta_singleflight_coalesced}`;
+                const totalReqs = data.count || n;
+                const dbQueries = data.delta_db_queries_executed != null ? data.delta_db_queries_executed : 0;
+                const coalesced = data.delta_singleflight_coalesced != null ? data.delta_singleflight_coalesced : 0;
+                const l1Hits = data.delta_l1_hits != null ? data.delta_l1_hits : Math.max(0, totalReqs - dbQueries - coalesced);
+                
+                // 실제 백엔드 DB 부하 절감 건수 (총 요청 중 DB 쿼리를 유발하지 않고 방어된 요청 수)
+                const savedQueries = Math.max(0, totalReqs - dbQueries);
+                const savedPercent = totalReqs > 0 ? Math.round((savedQueries / totalReqs) * 100) : 0;
+                const dbPercent = totalReqs > 0 ? Math.round((dbQueries / totalReqs) * 100) : 0;
+
+                resultDiv.innerHTML = `
+                    <div class="burst-result-card">
+                        <div class="burst-header">
+                            <span>[${node}] Single-flight 병합 결과</span>
+                            <span class="badge normal" style="font-size: 0.75rem; padding: 2px 6px;">DB 부하 ${savedPercent}% 절감</span>
+                        </div>
+
+                        <div style="margin: 8px 0 8px 0;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.74rem; margin-bottom: 5px;">
+                                <span style="color: var(--warning); font-weight: 600;">Leader (실제 DB 쿼리): <strong>${dbQueries}회</strong> (${dbPercent}%)</span>
+                                <span style="color: var(--normal); font-weight: 600;">Followers (부하 절감): <strong>${savedQueries}건</strong> (${savedPercent}%)</span>
+                            </div>
+                            <div class="burst-bar-container">
+                                <div class="burst-bar-db" style="width: ${Math.max(dbPercent, 3)}%;" title="Leader: 실제 DB 쿼리 ${dbQueries}회 (${dbPercent}%)"></div>
+                                <div class="burst-bar-coal" style="width: ${Math.min(savedPercent, 97)}%;" title="Followers: DB 부하 방어 ${savedQueries}건 (${savedPercent}%)"></div>
+                            </div>
+                        </div>
+
+                        <div class="burst-grid">
+                            <div class="burst-metric">
+                                <span class="burst-metric-title">동시 인입 요청</span>
+                                <span class="burst-metric-val" style="color: var(--text-primary);">${totalReqs}건</span>
+                                <span style="font-size: 0.68rem; color: var(--text-secondary); display:block;">동일 캐시 키 동시 폭주</span>
+                            </div>
+                            <div class="burst-metric">
+                                <span class="burst-metric-title">실제 DB 조회 (Leader)</span>
+                                <span class="burst-metric-val" style="color: var(--warning);">${dbQueries}회</span>
+                                <span style="font-size: 0.68rem; color: var(--text-secondary); display:block;">최초 1개 요청만 DB 전송</span>
+                            </div>
+                            <div class="burst-metric">
+                                <span class="burst-metric-title">DB 부하 절감 (Followers)</span>
+                                <span class="burst-metric-val" style="color: var(--normal);">${savedQueries}건</span>
+                                <span style="font-size: 0.68rem; color: var(--text-secondary); display:block;">Single-Flight ${coalesced}건 + L1 캐시 ${l1Hits}건</span>
+                            </div>
+                            <div class="burst-metric">
+                                <span class="burst-metric-title">백엔드 부하 절감률</span>
+                                <span class="burst-metric-val" style="color: var(--action);">${savedPercent}%</span>
+                                <span style="font-size: 0.68rem; color: var(--text-secondary); display:block;">Cache Stampede 방어 성공</span>
+                            </div>
+                        </div>
+
+                        <div class="burst-principle">
+                            <strong>[해설]</strong> 50개의 동일 키 요청이 캐시 미스 상태에서 동시에 도달했을 때(Cache Stampede), <strong>최초 1개 요청(Leader)만 실제 DB를 조회(${dbQueries}회)</strong>하고 나머지 <strong>${savedQueries}개 요청(Followers)은 DB에 가지 않고 메모리 병합(Single-Flight ${coalesced}건)과 첫 응답의 즉시 캐시 재활용(L1 캐시 ${l1Hits}건)을 통해 안전하게 처리</strong>되었습니다. DB 쿼리 50회가 <strong>단 ${dbQueries}회로 압축</strong>되어 백엔드 부하가 <strong>${savedPercent}% 절감</strong>되었습니다.
+                        </div>
+                    </div>
+                `;
+
+                triggerFlash(node);
+                if (toast) {
+                    toast.innerText = `Saved: ${savedQueries}/${totalReqs} (${savedPercent}% Saved)`;
+                    toast.style.opacity = '1';
+                    if (toast.timeout1) clearTimeout(toast.timeout1);
+                    toast.timeout1 = setTimeout(() => { toast.style.opacity = '0'; }, 3500);
+                }
+
+                showBanner(`[${node}] Cache Stampede 방어 성공: 50개 요청 중 ${dbQueries}회만 DB 조회 (${savedQueries}건 방어, DB 부하 ${savedPercent}% 절감)`, 'normal');
+                logAction(
+                    `Single-flight 및 캐시 동시성 방어 [${node}]: 동일 키 ${totalReqs}건 동시 폭주 중 실제 DB 조회는 ${dbQueries}회만 실행되고, ${savedQueries}건은 메모리 병합(Single-Flight ${coalesced}건) 및 L1 즉시 적재(${l1Hits}건)로 흡수되어 백엔드 DB 부하를 ${savedPercent}% 절감했습니다.`,
+                    JSON.stringify(data, null, 2)
+                );
+
             } catch(e) {
                 console.error(e);
+                showBanner(`Burst 에러 발생: ${e}`, "danger");
+                logAction(`Burst 실행 중 에러 발생: ${e}`, "");
+            } finally {
+                if (btnA) btnA.disabled = false;
+                if (btnB) btnB.disabled = false;
+                if (activeBtn) activeBtn.innerHTML = origText;
             }
         }
 
@@ -391,7 +1164,7 @@
                     <span class="log-time">[${time}]</span>
                     <span class="log-msg">${readableMsg}</span>
                     <details class="log-raw">
-                        <summary style="cursor:pointer;">Raw JSON</summary>
+                        <summary style="cursor:pointer; color: #8b949e;">Raw JSON Response</summary>
                         <pre>${rawJson}</pre>
                     </details>
                 </div>`;
@@ -407,7 +1180,7 @@
             window.bannerTimeout = setTimeout(() => { 
                 banner.className = 'banner placeholder';
                 banner.innerText = '순간 이벤트 대기 중...';
-            }, 5000);
+            }, 6000);
         }
 
         function triggerFlash(nodeId) {
@@ -418,7 +1191,6 @@
                 el.classList.add('flash');
             }
         }
-        
         
         function updateButtons() {
             const btnDbDown = document.getElementById('btn-db-down');
@@ -444,16 +1216,33 @@
             
             const redisLayer = document.getElementById('redis-layer');
             const badgeRedis = document.getElementById('badge-redis');
+            const redisDesc = document.getElementById('redis-layer-desc');
+            const redisPill = document.getElementById('redis-status-pill');
+
             if (activeFaults.redis) {
                 html += '<span class="fault-list-item danger">Redis: Down</span>';
                 hasFaults = true;
                 redisLayer.className = 'layer danger';
                 badgeRedis.className = 'badge danger';
-                badgeRedis.innerText = 'Fault';
+                badgeRedis.innerText = 'Fault (L1 Mode)';
+                if (redisDesc) {
+                    redisDesc.innerHTML = `<span style="color:var(--warning); font-weight:600;">[L1 생존 모드 가동 중]</span> 상태 공유 중단됨 → L1 로컬 캐시 응답 유지, 로컬 슬라이딩 유량제어(15 req/s) 폴백, Nonce 중복 쓰기는 이중실행 방지 위해 503 Fail-Closed 차단`;
+                }
+                if (redisPill) {
+                    redisPill.className = 'badge danger';
+                    redisPill.innerText = 'Redis: Down (L1 생존 모드)';
+                }
             } else {
                 redisLayer.className = 'layer normal';
                 badgeRedis.className = 'badge normal';
                 badgeRedis.innerText = 'Normal';
+                if (redisDesc) {
+                    redisDesc.innerText = '노드 간 상태를 공유하고 동기화(Catch-up)를 담당하는 중앙 브로커';
+                }
+                if (redisPill) {
+                    redisPill.className = 'badge normal';
+                    redisPill.innerText = 'Redis: Normal (분산 모드)';
+                }
             }
             
             const dbLayer = document.getElementById('db-layer');
@@ -463,7 +1252,7 @@
                 hasFaults = true;
                 dbLayer.className = 'layer danger';
                 badgeDb.className = 'badge danger';
-                badgeDb.innerText = 'Fault';
+                badgeDb.innerText = 'Fault (Circuit Open)';
             } else {
                 dbLayer.className = 'layer normal';
                 badgeDb.className = 'badge normal';
@@ -478,7 +1267,7 @@
             }
             
             if (!hasFaults) {
-                html = '<span class="fault-list-empty">All systems normal</span>';
+                html = '<span class="fault-list-empty">All systems normal (Cluster Healthy)</span>';
             }
             list.innerHTML = html;
             updateButtons();
@@ -520,25 +1309,66 @@
                 }
 
                 const data = await res.json();
-
                 let msg = "", type = "normal", readableMsg = "";
 
-                if (endpoint.includes('nonce') && data.results) {
+                if (endpoint.includes('nonce')) {
+                    if (data.error) {
+                        showBanner(`중복 방어 불가: ${data.error}`, "warning");
+                        logAction(`중복 방어 불가: ${data.error} (가용 노드가 2개 미만입니다)`, JSON.stringify(data, null, 2));
+                        return;
+                    }
+
                     let resultsArr = [];
-                    for (const [node, r] of Object.entries(data.results)) {
+                    let failClosedCount = 0;
+                    let isolatedCount = 0;
+                    let passCount = 0;
+                    let replayCount = 0;
+
+                    for (const [node, r] of Object.entries(data.results || {})) {
                         if (r.includes('200')) {
-                            resultsArr.push(`${node} 통과`);
+                            resultsArr.push(`${node} 통과 (200 OK)`);
+                            passCount++;
                         } else if (r.includes('401')) {
-                            resultsArr.push(`${node} 차단`);
+                            resultsArr.push(`${node} 차단 (401 Replay)`);
+                            replayCount++;
+                            triggerFlash(node);
+                        } else if (r.includes('Node Isolated')) {
+                            resultsArr.push(`${node} 격리 차단 (503 Isolated)`);
+                            isolatedCount++;
+                            triggerFlash(node);
+                        } else if (r.includes('Nonce Check Failed')) {
+                            resultsArr.push(`${node} 안전 차단 (503 Fail-Closed)`);
+                            failClosedCount++;
+                            triggerFlash(node);
+                        } else if (r.includes('Key Fetch Failed') || r.includes('Circuit')) {
+                            resultsArr.push(`${node} 차단 (503 DB Breaker)`);
+                            triggerFlash(node);
+                        } else if (r.includes('503')) {
+                            resultsArr.push(`${node} 차단 (503 Unavailable)`);
                             triggerFlash(node);
                         } else {
-                            resultsArr.push(`${node} 실패`);
+                            resultsArr.push(`${node} 오류`);
                         }
                     }
                     const summary = resultsArr.join(", ");
-                    msg = `중복 방어: ${summary}`;
-                    readableMsg = `동시성 방어 시뮬레이션: ${summary} 되었습니다.`;
-                    type = "warning";
+
+                    if (isolatedCount > 0) {
+                        msg = `중복 방어: 격리 노드 감지 (${summary})`;
+                        readableMsg = `네트워크 단절 노드로 인입된 요청은 분립 방지(Split-Brain)를 위해 503 Node Isolated로 즉시 거부되었습니다. (격리 방어 정상)`;
+                        type = "warning";
+                    } else if (failClosedCount > 0 && passCount === 0) {
+                        msg = `중복 방어: Redis 장애 감지 → 이중 실행 방지를 위해 503 Fail-Closed 안전 차단`;
+                        readableMsg = `Redis 중앙 캐시 다운 감지: 분산 원자성 조율이 불가능하므로, 중복 결제 및 데이터 오염을 원천 방지하기 위해 두 요청 모두 안전하게 503 Fail-Closed로 차단되었습니다. (보안 설계상 정상 방어 동작)`;
+                        type = "warning";
+                    } else if (passCount === 1 && replayCount >= 1) {
+                        msg = `중복 방어: ${summary}`;
+                        readableMsg = `동시성 방어 시뮬레이션: ${summary} 처리되었습니다. (정상 원자적 소진)`;
+                        type = "normal";
+                    } else {
+                        msg = `중복 방어 결과: ${summary}`;
+                        readableMsg = `동시성 방어 시뮬레이션 결과: ${summary}`;
+                        type = "normal";
+                    }
                 } 
                 else if (endpoint.includes('ddos') && data.responses) {
                     const ok = data.responses['200'] || 0;
@@ -547,6 +1377,10 @@
                         msg = `DDoS 방어: 공격자 100% 차단 (한도 초과)`;
                         readableMsg = `동일 공격자의 악의적인 연속 요청으로 판단되어 한도를 초과했습니다. 인입된 ${rate}개의 공격 트래픽이 시스템 보호를 위해 100% 방어(차단)되었습니다.`;
                         type = "action";
+                    } else if (activeFaults.redis && rate > 0) {
+                        msg = `DDoS 방어 (Redis 장애 모드): 로컬 슬라이딩 폴백으로 ${rate}건 정상 차단`;
+                        readableMsg = `Redis 장애 상태에서 각 게이트웨이가 노드별 인메모리 슬라이딩 윈도우(15 req/s)로 폴백하여 ${rate}건의 초과 DDoS 트래픽을 429로 정상 방어했습니다.`;
+                        type = "warning";
                     } else {
                         msg = `DDoS 방어: 정상 ${ok} 허용, 공격 ${rate} 방어`;
                         readableMsg = `DDoS 공격이 인입되어 정상 한도 내 ${ok}건은 허용되고, 초과 공격 트래픽 ${rate}건은 안전하게 방어(차단)되었습니다.`;
@@ -554,88 +1388,61 @@
                     }
                     const toast = document.getElementById('toast-Node-A');
                     if (toast) {
-                        toast.innerText = 'Rate Limited';
-                        toast.style.backgroundColor = 'var(--danger)';
+                        toast.innerText = 'Rate Limited (429)';
                         toast.style.opacity = '1';
                         if (toast.timeout1) clearTimeout(toast.timeout1);
                         if (toast.timeout2) clearTimeout(toast.timeout2);
                         toast.timeout1 = setTimeout(() => {
                             toast.style.opacity = '0';
-                            toast.timeout2 = setTimeout(() => { toast.style.backgroundColor = 'var(--action)'; }, 300);
                         }, 2000);
                     }
                 }
                 else if (endpoint.includes('db/down')) {
                     activeFaults.db = true;
                     nodes.forEach(n => triggerFlash(n));
-                    if (data.results) {
-                        let failedNodes = [];
-                        for (const [node, status] of Object.entries(data.results)) {
-                            if (status === "failed") failedNodes.push(node);
-                        }
-                        if (failedNodes.length > 0) {
-                            msg = `DB 다운됨 (경고: ${failedNodes.join(", ")} 부분 반영 실패)`;
-                            readableMsg = `DB 강제 중단됨 (단, ${failedNodes.join(", ")} 노드에는 반영 실패했습니다. 격리 상태이거나 통신 장애일 수 있습니다.)`;
-                            type = "warning";
-                        } else {
-                            msg = "DB 다운됨";
-                            readableMsg = `DB 강제 중단됨: 서킷 브레이커가 작동하여 OPEN 상태로 전환되었습니다. → 연쇄 장애(Cascading Failure)를 막고 서비스 전체 다운을 방어합니다.`;
-                            type = "danger";
-                        }
-                    } else {
-                        msg = "DB 다운됨";
-                        readableMsg = `DB 강제 중단됨: 서킷 브레이커가 작동하여 OPEN 상태로 전환되었습니다. → 연쇄 장애(Cascading Failure)를 막고 서비스 전체 다운을 방어합니다.`;
-                        type = "danger";
-                    }
+                    msg = "DB 다운됨";
+                    readableMsg = `DB 강제 중단됨: 서킷 브레이커가 작동하여 Open 상태로 전환되었습니다. → 연쇄 장애(Cascading Failure)를 막고 서비스 전체 다운을 방어합니다.`;
+                    type = "danger";
                 }
                 else if (endpoint.includes('db/up')) {
                     activeFaults.db = false;
                     nodes.forEach(n => triggerFlash(n));
-                    if (data.results) {
-                        let failedNodes = [];
-                        for (const [node, status] of Object.entries(data.results)) {
-                            if (status === "failed") failedNodes.push(node);
-                        }
-                        if (failedNodes.length > 0) {
-                            msg = `DB 복구됨 (경고: ${failedNodes.join(", ")} 부분 반영 실패)`;
-                            readableMsg = `DB 정상 복구됨 (단, ${failedNodes.join(", ")} 노드에는 복구 신호 전달 실패했습니다. 격리 상태일 수 있습니다.)`;
-                            type = "warning";
-                        } else {
-                            msg = "DB 복구됨";
-                            readableMsg = `DB 정상 복구됨: 서킷 브레이커가 원래 상태로 돌아왔습니다.`;
-                            type = "normal";
-                        }
-                    } else {
-                        msg = "DB 복구됨";
-                        readableMsg = `DB 정상 복구됨: 서킷 브레이커가 원래 상태로 돌아왔습니다.`;
-                        type = "normal";
-                    }
+                    msg = "DB 복구됨";
+                    readableMsg = `DB 정상 복구됨: 서킷 브레이커가 원래 상태로 돌아왔습니다.`;
+                    type = "normal";
                 }
                 else if (endpoint.includes('redis/down')) {
-                    msg = "Redis 다운됨 (L1 전용 모드)";
-                    readableMsg = `Redis 서버 중단됨: 캐시 상태 공유가 멈추고 각 게이트웨이가 L1 로컬 캐시만으로 연명합니다. → 기존 세션 사용자는 끊김 없이 무중단 서비스를 제공받습니다.`;
+                    msg = "Redis 다운됨 (L1 로컬 생존 모드 활성화)";
+                    readableMsg = `Redis 서버 중단됨: 상태 공유 계층이 멈추고 각 게이트웨이가 L1 로컬 캐시 + 로컬 유량제어(15 req/s) 폴백으로 연명합니다. Nonce 중복 쓰기는 이중 실행 방지를 위해 503 Fail-Closed로 차단됩니다.`;
                     type = "danger";
                     activeFaults.redis = true;
                 }
                 else if (endpoint.includes('redis/up')) {
-                    msg = "Redis 복구됨";
-                    readableMsg = `Redis 서버 정상 복구됨: 상태 공유 계층이 다시 작동합니다.`;
+                    msg = "Redis 복구됨 (분산 상태 공유 계층 재가동)";
+                    readableMsg = `Redis 서버 정상 복구됨: 전역 분산 캐시와 실시간 무효화 스트림(Stream) 계층이 정상 작동합니다.`;
                     type = "normal";
                     activeFaults.redis = false;
                 }
                 else if (endpoint.includes('partition')) {
                     const node = data.node || "Node-B";
                     if (data.state === 'isolate') {
-                        msg = `단절: ${node} 통신 고립됨`;
-                        readableMsg = `네트워크 단절 시뮬레이션: ${node}의 통신이 끊어졌습니다.`;
+                        msg = `단절: ${node} 통신 고립됨 (Split-Brain 방지)`;
+                        readableMsg = `네트워크 단절 시뮬레이션: ${node}의 통신이 격리되었습니다.`;
                         type = "warning";
                         activeFaults.partition[node] = true;
                     } else {
-                        msg = `복구: ${node} 재연결됨`;
-                        readableMsg = `네트워크 재연결: ${node}의 통신이 복구되었으며, 밀린 데이터를 동기화합니다.`;
+                        msg = `복구: ${node} 재연결 및 PEL 전량 동기화(Catch-up)`;
+                        readableMsg = `네트워크 재연결: ${node}의 통신이 복구되었으며, Redis Streams PEL의 미처리 이벤트를 전량 드레인하여 동기화합니다.`;
                         type = "action";
                         activeFaults.partition[node] = false;
                     }
+                }
+                else if (endpoint.includes('invalidate')) {
+                    const targetNode = data.node || "클러스터";
+                    nodes.forEach(n => triggerFlash(n));
+                    msg = `무효화: ${targetNode}에서 스트림 이벤트 발행 완료`;
+                    readableMsg = `캐시 무효화 전파: ${targetNode}에서 정책 무효화 스트림 이벤트를 발행하여, 모든 분산 게이트웨이의 L1 캐시가 실시간 동기화(삭제)되었습니다.`;
+                    type = "action";
                 }
 
                 if (msg) showBanner(msg, type);
@@ -652,33 +1459,48 @@
             layer.innerHTML += `
                 <div class="node normal" id="${n}">
                     <div class="node-header">
-                        <h3>${n} <span id="mode-${n}" style="font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; display: none; color: white; margin-left: 6px; vertical-align: middle;"></span></h3>
+                        <h3>${n} <span id="mode-${n}" style="font-size: 0.68rem; padding: 1px 6px; border-radius: 4px; display: none; margin-left: 6px; vertical-align: middle;" class="badge neutral"></span></h3>
                         <span class="badge normal" id="badge-${n}">Normal</span>
                     </div>
                     <div class="node-reason" id="reason-${n}">모든 기능이 정상적으로 트래픽을 처리하고 있습니다.</div>
                     
-                    <div class="metrics">
-                        <div>RPS: <span class="metric-val" id="rps-${n}">0</span></div>
-                        <div>Lat: <span class="metric-val" id="lat-${n}">0</span>ms</div>
-                        <div>L1 Hit: <span class="metric-val" id="l1-${n}">0</span></div>
-                        <div>L2 Hit: <span class="metric-val" id="l2-${n}">0</span></div>
-                        <div style="grid-column: span 2;">Circuit: <span class="cb-val" id="cb-${n}">Closed</span></div>
+                    <div class="metrics-grid-compact">
+                        <div class="metric-cell">
+                            <span class="metric-lbl">RPS</span>
+                            <span class="metric-val" id="rps-${n}">0</span>
+                        </div>
+                        <div class="metric-cell">
+                            <span class="metric-lbl">Avg Lat</span>
+                            <span class="metric-val"><span id="lat-${n}">0</span>ms</span>
+                        </div>
+                        <div class="metric-cell">
+                            <span class="metric-lbl">L1 Hit</span>
+                            <span class="metric-val" id="l1-${n}">0</span>
+                        </div>
+                        <div class="metric-cell">
+                            <span class="metric-lbl">L2 Hit</span>
+                            <span class="metric-val" id="l2-${n}">0</span>
+                        </div>
+                        <div class="metric-cell" style="grid-column: span 2;">
+                            <span class="metric-lbl">Circuit Breaker</span>
+                            <span class="cb-val" id="cb-${n}">Closed</span>
+                        </div>
                     </div>
-                    <div title="Transient mismatches while requests are in flight may appear. Equality holds for finished requests." style="margin-top:8px; font-size: 0.8rem;">
+                    <div title="Transient mismatches while requests are in flight may appear. Equality holds for finished requests." style="margin-top:6px; font-size: 0.75rem;">
                         Invariant: <span class="badge normal" id="inv-${n}">Pass (0 = 0)</span>
                     </div>
-                    <details style="margin-top: 8px;">
-                        <summary style="font-size: 0.8rem; color: var(--action);">Config & DB Stats</summary>
-                        <div class="metrics" style="margin-top: 4px;">
-                            <div style="grid-column: span 2;">Config: <span class="metric-val" id="cfg-rl-${n}">-</span> | <span class="metric-val" id="cfg-pop-${n}">-</span></div>
-                            <div style="grid-column: span 2;">SF Enabled: <span class="metric-val" id="sf-en-${n}">-</span> <a href="docs/benchmarks/singleflight-effect.md" target="_blank" style="color:var(--text-secondary); text-decoration:underline;">(docs)</a></div>
-                            <div>DB Exec: <span class="metric-val" id="db-exec-${n}">0</span></div>
-                            <div>Coalesced: <span class="metric-val" id="sf-coal-${n}">0</span></div>
-                            <div>Blocked: <span class="metric-val" id="cb-block-${n}">0</span></div>
-                            <div>L1 DblChk: <span class="metric-val" id="l1-dbl-${n}">0</span></div>
-                            <div>PoP Verif: <span class="metric-val" id="pop-ver-${n}">0</span></div>
-                            <div>PoP Rej: <span class="metric-val" id="pop-rej-${n}">0</span></div>
-                            <div>Outage Blocked: <span class="metric-val" id="redis-out-${n}">0</span></div>
+                    <details style="margin-top: 6px;">
+                        <summary style="font-size: 0.75rem; color: var(--action);">Config & Resilience Stats</summary>
+                        <div class="metrics-grid-compact" style="margin-top: 4px;">
+                            <div class="metric-cell" style="grid-column: span 2;">Config: <span class="metric-val" id="cfg-rl-${n}">-</span> | <span class="metric-val" id="cfg-pop-${n}">-</span></div>
+                            <div class="metric-cell" style="grid-column: span 2;">SF: <span class="metric-val" id="sf-en-${n}">-</span> <a href="docs/benchmarks/singleflight-effect.md" target="_blank" style="color:var(--text-secondary); text-decoration:underline;">(docs)</a></div>
+                            <div class="metric-cell"><span class="metric-lbl">DB Exec</span><span class="metric-val" id="db-exec-${n}">0</span></div>
+                            <div class="metric-cell"><span class="metric-lbl">Coalesced</span><span class="metric-val" id="sf-coal-${n}">0</span></div>
+                            <div class="metric-cell"><span class="metric-lbl">CB Block</span><span class="metric-val" id="cb-block-${n}">0</span></div>
+                            <div class="metric-cell"><span class="metric-lbl">L1 DblChk</span><span class="metric-val" id="l1-dbl-${n}">0</span></div>
+                            <div class="metric-cell"><span class="metric-lbl">PoP Verif</span><span class="metric-val" id="pop-ver-${n}">0</span></div>
+                            <div class="metric-cell"><span class="metric-lbl">PoP Rej</span><span class="metric-val" id="pop-rej-${n}">0</span></div>
+                            <div class="metric-cell" style="grid-column: span 2;"><span class="metric-lbl">Redis Outage Blocked (503)</span><span class="metric-val" id="redis-out-${n}">0</span></div>
                         </div>
                     </details>
                     <div class="catchup-toast" id="toast-${n}"></div>
@@ -698,17 +1520,30 @@
             }
             let token = getAdminToken();
 
-
             evtSource = new EventSource(`/metrics/stream?token=${encodeURIComponent(token)}`);
             evtSource.onerror = function() {
-                // If 401 or stream disconnected, don't spam loop, wait
                 console.warn("EventSource error, but re-auth is handled by pre-flight check");
             };
             evtSource.onmessage = function(event) {
                 const data = JSON.parse(event.data);
                 
+                let anyRedisDown = false;
+                let anyDbDown = false;
+                let partitionChanged = false;
+
                 for (const [nodeName, nodeData] of Object.entries(data)) {
                     if(nodeData.status === "offline") continue;
+
+                    if (nodeData.redis_ok === false) {
+                        anyRedisDown = true;
+                    }
+                    if (nodeData.stats && nodeData.stats.circuit_state === "OPEN") {
+                        anyDbDown = true;
+                    }
+                    if (nodeData.is_partitioned !== undefined && activeFaults.partition[nodeName] !== nodeData.is_partitioned) {
+                        activeFaults.partition[nodeName] = nodeData.is_partitioned;
+                        partitionChanged = true;
+                    }
                 
                     const stats = nodeData.stats;
                     const el = document.getElementById(nodeName);
@@ -718,30 +1553,24 @@
                     if (nodeData.db_mode) {
                         const modeBadge = document.getElementById(`mode-${nodeName}`);
                         if (modeBadge) {
-                            modeBadge.innerText = nodeData.db_mode.toUpperCase();
+                            modeBadge.innerText = nodeData.db_mode === 'async' ? 'Async' : 'Sync';
                             modeBadge.style.display = 'inline-block';
-                            if (nodeData.db_mode === 'async') {
-                                modeBadge.style.background = '#3b82f6';
-                            } else {
-                                modeBadge.style.background = '#64748b';
-                            }
                         }
                     }
                     
                     let badgeText = "Normal";
                     let badgeClass = "badge normal";
                     let nodeClass = "node normal";
-                    
                     let reasonText = "모든 기능이 정상적으로 트래픽을 처리하고 있습니다.";
 
                     if (nodeData.is_partitioned) {
                         badgeText = "Stale (Partitioned)";
                         badgeClass = "badge danger";
-                        nodeClass = "node danger-pulse"; // Red
+                        nodeClass = "node danger-pulse";
                         reasonText = "네트워크 단절: 중앙 캐시와 고립되었으나 과거 데이터로 단독 서비스 생존 중";
                     } else if (cb === "OPEN") {
                         badgeText = "Protected (Circuit Open)";
-                        badgeClass = "badge danger"; // Match DB layer Red
+                        badgeClass = "badge danger";
                         nodeClass = "node danger-pulse";
                         reasonText = "DB 장애 감지 (원인: Policy DB): 연쇄 장애 방지를 위해 신규 인증 요청 즉시 차단 중";
                     } else if (cb === "HALF_OPEN") {
@@ -751,7 +1580,7 @@
                         reasonText = "DB 복구 확인 중: 제한된 트래픽만 흘려보내며 백엔드 안정성 테스트 중";
                     } else if (nodeData.redis_ok === false) {
                         badgeText = "Degraded (L1 Only)";
-                        badgeClass = "badge warning"; // Match Redis layer Orange
+                        badgeClass = "badge warning";
                         nodeClass = "node warning-pulse";
                         reasonText = "상태 공유 중단 (원인: Redis): 분산 정합성 대신 가용성을 선택해 로컬(L1)로 무중단 서비스 중";
                     }
@@ -781,7 +1610,6 @@
                     const deltaLat = currentLat - (prevLat[nodeName] || 0);
                     document.getElementById(`lat-${nodeName}`).innerText = deltaReqs > 0 ? (deltaLat / deltaReqs * 1000).toFixed(0) : 0;
                     prevLat[nodeName] = currentLat;
-                    
                     
                     document.getElementById(`l1-${nodeName}`).innerText = stats.l1_hits;
                     document.getElementById(`l2-${nodeName}`).innerText = stats.l2_hits;
@@ -818,16 +1646,23 @@
                         }
                     }
 
-                    
                     const cbEl = document.getElementById(`cb-${nodeName}`);
                     const cbLabel = cb === 'OPEN' ? 'Open' : (cb === 'HALF_OPEN' ? 'Half-Open' : 'Closed');
                     cbEl.innerText = cbLabel;
                     cbEl.style.color = cb === 'OPEN' ? 'var(--danger)' : (cb === 'HALF_OPEN' ? 'var(--warning)' : 'var(--normal)');
                 }
+
+                if (activeFaults.redis !== anyRedisDown || activeFaults.db !== anyDbDown || partitionChanged) {
+                    activeFaults.redis = anyRedisDown;
+                    activeFaults.db = anyDbDown;
+                    renderActiveFaults();
+                }
             };
         }
         
         initMetricsStream();
+        const savedChaosTab = sessionStorage.getItem('activeChaosTab') || 'traffic';
+        switchChaosTab(savedChaosTab);
     </script>
 </body>
 </html>

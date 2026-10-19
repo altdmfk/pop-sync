@@ -98,6 +98,9 @@ services:
     command: python control_plane.py
     ports:
       - "8080:8080"
+    volumes:
+      - ./static:/app/static
+      - ./control_plane.py:/app/control_plane.py
     environment:
       - REDIS_URL=redis://redis:6379
       - GATEWAY_A=http://gateway-a:8001
