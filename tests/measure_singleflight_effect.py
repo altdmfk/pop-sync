@@ -13,10 +13,8 @@ async def measure():
         nonce_base = str(uuid.uuid4())
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # 1. Get metrics before
             before = (await client.get(f"{NODE_A}/metrics", headers={"X-Admin-Token": ADMIN_TOKEN})).json()["stats"]
             
-            # 2. Fire 100 concurrent requests to NODE_A
             print(f"Firing 100 concurrent requests for {spiffe_id}...")
             tasks = []
             for i in range(100):
@@ -31,10 +29,8 @@ async def measure():
             results = await asyncio.gather(*tasks, return_exceptions=True)
             total_duration = time.time() - start_time
             
-            # 3. Get metrics after
             after = (await client.get(f"{NODE_A}/metrics", headers={"X-Admin-Token": ADMIN_TOKEN})).json()["stats"]
             
-            # 4. Calculate increments
             requests_inc = after["requests"] - before["requests"]
             l1_hits_inc = after["l1_hits"] - before["l1_hits"]
             l2_hits_inc = after["l2_hits"] - before["l2_hits"]
@@ -44,7 +40,6 @@ async def measure():
             circuit_blocked_inc = after["circuit_blocked"] - before["circuit_blocked"]
             l1_double_inc = after["l1_double_check_hits"] - before["l1_double_check_hits"]
             
-            # Calculate latencies
             latencies = []
             exceptions = 0
             for r in results:
@@ -74,8 +69,6 @@ async def measure():
             print(f"  circuit_blocked: {circuit_blocked_inc}")
             print(f"  l1_double_check_hits: {l1_double_inc}")
             
-            # Invariant check
-            # db_fallbacks == db_queries_executed + coalesced + l1_double_check_hits + circuit_blocked
             lhs = db_fallbacks_inc
             rhs = db_queries_inc + coalesced_inc + l1_double_inc + circuit_blocked_inc
             invariant_holds = (lhs == rhs)
@@ -84,7 +77,6 @@ async def measure():
             
             assert invariant_holds, "Invariant failed!"
             
-            # Allow time to let system settle
             await asyncio.sleep(0.5)
 
 if __name__ == "__main__":

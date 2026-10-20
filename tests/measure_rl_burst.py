@@ -11,7 +11,7 @@ async def send_requests(client, client_id, count):
     headers = {
         "Authorization": "Bearer super-token",
         "X-SPIFFE-ID": client_id,
-        "X-Nonce": ""  # will be filled per request
+        "X-Nonce": ""
     }
     
     async def make_request(idx):
@@ -29,16 +29,12 @@ async def send_requests(client, client_id, count):
     return passed, ratelimited, other
 
 async def measure_burst():
-    # Wait until we are 1 second before the next window boundary
-    # Window boundary is when time.time() % 10 == 0
     now = time.time()
     next_boundary = ((int(now) // RL_WINDOW_SEC) + 1) * RL_WINDOW_SEC
     
-    # We want to start sending requests 0.5s before boundary
     start_time_before = next_boundary - 0.5
     sleep_time = start_time_before - now
     if sleep_time < 0:
-        # Too close to boundary, wait for the next one
         next_boundary += RL_WINDOW_SEC
         start_time_before = next_boundary - 0.5
         sleep_time = start_time_before - time.time()
@@ -53,7 +49,6 @@ async def measure_burst():
         pass1, rl1, o1 = await send_requests(client, client_id, RL_LIMIT)
         print(f"Before boundary results - Passed: {pass1}, 429: {rl1}, Other: {o1}")
         
-        # Wait until 0.5s AFTER boundary
         now = time.time()
         start_time_after = next_boundary + 0.5
         sleep_time2 = start_time_after - now

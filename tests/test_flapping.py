@@ -32,7 +32,6 @@ async def main():
         print("1. Bringing DB down...")
         await client.post("http://localhost:8080/chaos/db/down", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         
-        # Ensure CB is OPEN
         for i in range(5):
             await fire(client, i)
         print(f"CB state: {await check_cb_state(client)}")
@@ -40,7 +39,6 @@ async def main():
         print("2. Firing 200 concurrent requests while DB is down...")
         tasks = [asyncio.create_task(fire(client, i)) for i in range(200)]
         
-        # Give them a tiny moment to hit the gateway
         await asyncio.sleep(0.2)
         
         print("3. Instantly bringing DB up (which resets CB to CLOSED)...")

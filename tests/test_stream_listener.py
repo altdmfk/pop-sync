@@ -314,7 +314,6 @@ async def test_stream_listener_xautoclaim_and_enriched_catchup_telemetry(monkeyp
 
         if stream_id == ">":
             if block is None:
-                # Catchup phase (Step C)
                 new_calls += 1
                 if new_calls == 1:
                     return [[gateway.STREAM_NAME.encode(), [
@@ -351,7 +350,6 @@ async def test_stream_listener_xautoclaim_and_enriched_catchup_telemetry(monkeyp
 
     await asyncio.wait_for(task, timeout=2.0)
 
-    # Verify telemetry in last_catchup
     catchup = gateway.stats["last_catchup"]
     assert catchup["pending_count"] == 5
     assert catchup["pel_drained"] == 2
@@ -360,17 +358,14 @@ async def test_stream_listener_xautoclaim_and_enriched_catchup_telemetry(monkeyp
     assert catchup["duration_ms"] >= 0
     assert catchup["timestamp"] > 0
 
-    # Verify all 5 messages were acknowledged
     assert acked_ids == [b"pel-0", b"pel-1", b"claim-0", b"claim-1", b"new-0"]
 
-    # Verify all 5 keys were cleared from L1 cache
     assert gateway.l1_cache.get("pel_k0") is None
     assert gateway.l1_cache.get("pel_k1") is None
     assert gateway.l1_cache.get("claim_k0") is None
     assert gateway.l1_cache.get("claim_k1") is None
     assert gateway.l1_cache.get("new_k0") is None
 
-    # Verify L2 deletes were called for all keys
     deleted_keys = [call.args[0] for call in mock_redis_client.delete.await_args_list]
     for expected_key in ["policy:pel_k0", "policy:pel_k1", "policy:claim_k0", "policy:claim_k1", "policy:new_k0"]:
         assert expected_key in deleted_keys
@@ -431,3 +426,33 @@ async def test_stream_listener_xautoclaim_graceful_fallback_without_xautoclaim(m
     assert catchup["pel_drained"] == 1
     assert catchup["new_drained"] == 1
     assert catchup["pending_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_listener_undecodable_stream_key_acked_and_logged():
+    mock_stream_client = AsyncMock()
+    mock_redis_client = AsyncMock()
+
+    acked_ids = []
+    async def mock_xack(stream, group, msg_id):
+        acked_ids.append(msg_id)
+        return 1
+
+    mock_stream_client.xack = AsyncMock(side_effect=mock_xack)
+    mock_redis_client.delete = AsyncMock(return_value=1)
+
+    gateway.l1_cache.set("valid_key", "allow")
+    assert gateway.l1_cache.get("valid_key") == "allow"
+
+    messages = [
+        (b"msg-corrupted", {b"key": b"\xff\xfe\xfa"}),
+        (b"msg-empty", {}),
+        (b"msg-valid", {b"key": b"valid_key"}),
+    ]
+
+    await gateway._process_stream_messages(messages, mock_stream_client, mock_redis_client)
+
+    assert acked_ids == [b"msg-corrupted", b"msg-empty", b"msg-valid"]
+    assert gateway.l1_cache.get("valid_key") is None
+    mock_redis_client.delete.assert_awaited_once_with("policy:valid_key")
+

@@ -10,7 +10,6 @@ pytestmark = pytest.mark.e2e
 
 async def _test_node(client, node_url, node_name, spiffe_id):
     tasks = []
-    # Send 30 requests to the specific node
     for _ in range(30):
         headers = {
             "Authorization": "Bearer test_token",
@@ -28,15 +27,14 @@ async def _test_node(client, node_url, node_name, spiffe_id):
         else:
             status_codes[r.status_code] = status_codes.get(r.status_code, 0) + 1
             
-    print(f"{node_name}: 200 {status_codes.get(200, 0)}개 / 429 {status_codes.get(429, 0)}개 / 503 {status_codes.get(503, 0)}개 / Exception {status_codes.get('Exception', 0)}개")
+    print(f"{node_name}: 200 {status_codes.get(200, 0)} / 429 {status_codes.get(429, 0)} / 503 {status_codes.get(503, 0)} / Exception {status_codes.get('Exception', 0)}")
     return status_codes
 
 async def main():
     print("=== Rate Limit Fallback Node-by-Node Test ===")
     
-    # Start gateway nodes locally as subprocesses (since Redis is unavailable, it will trigger fallback)
     env = os.environ.copy()
-    env["REDIS_URL"] = "redis://127.0.0.1:9999"  # Dummy URL to force Redis failure
+    env["REDIS_URL"] = "redis://127.0.0.1:9999"
     
     p_a = subprocess.Popen(["python", "gateway.py", "--node", "Node-A", "--port", "8001"], env=env)
     p_b = subprocess.Popen(["python", "gateway.py", "--node", "Node-B", "--port", "8002"], env=env)
@@ -53,7 +51,6 @@ async def main():
         await _test_node(client, "http://127.0.0.1:8002", "Node-B", spiffe_id)
         await _test_node(client, "http://127.0.0.1:8003", "Node-C", spiffe_id)
         
-    # Cleanup
     p_a.terminate()
     p_b.terminate()
     p_c.terminate()

@@ -26,19 +26,17 @@ import uvicorn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Configuration helpers
 def _int(name: str, default: int) -> int:
     return int(os.getenv(name, default))
 
 def _float(name: str, default: float) -> float:
     return float(os.getenv(name, default))
 
-# Redis timeouts
 REDIS_TIMEOUT_SEC            = _float("REDIS_TIMEOUT_SEC", 0.2)
 STREAM_SOCKET_TIMEOUT        = _float("STREAM_SOCKET_TIMEOUT", 5.0)
 REDIS_DOWN_SOCKET_TIMEOUT    = _float("REDIS_DOWN_SOCKET_TIMEOUT", 0.1)
+DUMMY_REDIS_URL              = os.getenv("DUMMY_REDIS_URL", "redis://127.0.0.1:9999")
 
-# Stream synchronization
 STREAM_NAME                  = os.getenv("STREAM_NAME", "invalidation_stream")
 STREAM_CATCHUP_COUNT         = _int("STREAM_CATCHUP_COUNT", 100)
 STREAM_NORMAL_COUNT          = _int("STREAM_NORMAL_COUNT", 10)
@@ -46,7 +44,6 @@ STREAM_BLOCK_MS              = _int("STREAM_BLOCK_MS", 500)
 PARTITION_SLEEP_SEC          = _float("PARTITION_SLEEP_SEC", 0.5)
 STREAM_CLAIM_MIN_IDLE_MS     = _int("STREAM_CLAIM_MIN_IDLE_MS", 60000)
 
-# Rate limiting
 RL_WINDOW_SEC                = _int("RL_WINDOW_SEC", 10)
 RL_LIMIT                     = _int("RL_LIMIT", 50)
 RL_FALLBACK_LIMIT            = _int("RL_FALLBACK_LIMIT", 15)
@@ -54,29 +51,23 @@ RL_LOCAL_MAX_KEYS            = _int("RL_LOCAL_MAX_KEYS", 10000)
 # RL_ALGORITHM: "sliding" (weighted-counter approximation) or "fixed" (pipeline INCR)
 RL_ALGORITHM                 = os.getenv("RL_ALGORITHM", "sliding").lower()
 
-# Proof of Possession (Scope B)
 POP_VERIFY_ENABLED           = os.getenv("POP_VERIFY_ENABLED", "false").lower() == "true"
 POP_EXECUTOR_WORKERS         = _int("POP_EXECUTOR_WORKERS", 4)
 
-# Replay window and cache TTLs
 NONCE_TTL_SEC                = _int("NONCE_TTL_SEC", 60)
 L2_CACHE_TTL_SEC             = _int("L2_CACHE_TTL_SEC", 60)
 
-# L1 cache configuration
 L1_MAX_SIZE                  = _int("L1_MAX_SIZE", 1000)
 L1_TTL_SEC                   = _int("L1_TTL_SEC", 60)
 
-# Rate limiting modifiers
 RL_EXPIRE_MULTIPLIER         = _int("RL_EXPIRE_MULTIPLIER", 2)
 
-# Circuit breaker thresholds
 CB_MAX_FAILURES              = _int("CB_MAX_FAILURES", 3)
 CB_RESET_TIMEOUT_SEC         = _int("CB_RESET_TIMEOUT_SEC", 10)
 CB_DEBOUNCE_SEC              = _float("CB_DEBOUNCE_SEC", 2.0)
 CB_FORCE_STATE_MARGIN_SEC    = _float("CB_FORCE_STATE_MARGIN_SEC", 1.0)
 VALID_CB_STATES              = frozenset(["OPEN", "CLOSED", "HALF_OPEN"])
 
-# DB timeouts and connection pool limits
 DB_TIMEOUT_SEC               = _float("DB_TIMEOUT_SEC", 1.0)
 DB_SEMAPHORE_ACQUIRE_TIMEOUT = _float("DB_SEMAPHORE_ACQUIRE_TIMEOUT", 0.1)
 MAX_DB_WORKERS               = _int("MAX_DB_WORKERS", 5)
@@ -307,10 +298,6 @@ class CircuitBreaker:
         with self._lock:
             self._half_open_probe_in_flight = False
 
-    def release_half_open_probe_if_unrecorded(self) -> None:
-        """Alias for release_half_open_probe."""
-        self.release_half_open_probe()
-
     def force_open(self) -> str:
         return self.force_state("OPEN")
 
@@ -354,6 +341,8 @@ stats = {
     "singleflight_coalesced": 0,
     "singleflight_leader_queries": 0,
     "circuit_blocked": 0,
+    "pubkey_circuit_blocked": 0,
+    "total_latency_ms": 0.0,
     "l1_double_check_hits": 0,
     "redis_outage_blocked": 0,
     "half_open_probe_active": False
@@ -396,8 +385,8 @@ local prev = tonumber(redis.call('GET', prev_key)) or 0
 local curr = tonumber(redis.call('GET', curr_key)) or 0
 
 local weight = tonumber(ARGV[2]) or 0
-if weight > 1 then
-    weight = weight / 1000
+if weight >= 1 then
+    weight = weight / 1000.0
 end
 
 local limit = tonumber(ARGV[3]) or 50
@@ -423,17 +412,16 @@ async def cleanup_local_rl():
     while True:
         await asyncio.sleep(RL_WINDOW_SEC)
         now_window = int(time.time()) // RL_WINDOW_SEC
-        async with local_rl_lock:
-            to_delete = []
-            for k in local_rate_limits.keys():
-                try:
-                    w = int(k.rsplit(":", 1)[-1])
-                    if w < now_window - 1:
-                        to_delete.append(k)
-                except ValueError:
-                    continue
-            for k in to_delete:
-                del local_rate_limits[k]
+        to_delete = []
+        for k in local_rate_limits.keys():
+            try:
+                w = int(k.rsplit(":", 1)[-1])
+                if w < now_window - 1:
+                    to_delete.append(k)
+            except ValueError:
+                continue
+        for k in to_delete:
+            del local_rate_limits[k]
 
 async def check_rate_limit(client_id: str) -> bool:
     """Return True if request is within rate limit, False if it should be 429-ed.
@@ -443,15 +431,15 @@ async def check_rate_limit(client_id: str) -> bool:
     RL_FALLBACK_LIMIT as the threshold.  Errors from this path are re-raised so
     the caller can decide (currently: 503 for Redis failure, 429 for RL exceeded).
     """
-    now = int(time.time())
-    window_key = now // RL_WINDOW_SEC
+    now = time.time()
+    window_key = int(now) // RL_WINDOW_SEC
 
     try:
         if RL_ALGORITHM == "sliding":
             if rl_script is None:
                 get_redis_client()
             elapsed    = now % RL_WINDOW_SEC
-            weight     = int((1 - elapsed / RL_WINDOW_SEC) * 1000)  # 0..1000
+            weight     = int(round((1 - elapsed / RL_WINDOW_SEC) * 1000))
             prev_key   = f"rl:{client_id}:{window_key - 1}"
             curr_key   = f"rl:{client_id}:{window_key}"
             res        = await rl_script(
@@ -459,7 +447,7 @@ async def check_rate_limit(client_id: str) -> bool:
                 args=[str(RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER), str(weight), str(RL_LIMIT)],
             )
             return int(res) == 1 or (int(res) <= RL_LIMIT and int(res) != 0)
-        else:  # "fixed"
+        else:
             key = f"rl:{client_id}:{window_key}"
             async with get_redis_client().pipeline(transaction=True) as pipe:
                 pipe.incr(key)
@@ -585,18 +573,18 @@ async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future,
         policy = "DENY" if db_status == "deny" else db_resp.get("role")
 
         l1_cache.set(comp_key, policy)
-        try:
-            client = get_redis_client()
-            await client.set(f"policy:{comp_key}", policy, ex=L2_CACHE_TTL_SEC)
-        except Exception as e:
-            logging.warning(f"Failed to populate L2 policy cache: {e}")
-
         if not fut.done():
             fut.set_result({
                 "status": "deny" if db_status == "deny" else "allow",
                 "source": "DB",
                 "policy": policy,
             })
+
+        try:
+            client = get_redis_client()
+            await client.set(f"policy:{comp_key}", policy, ex=L2_CACHE_TTL_SEC)
+        except Exception as e:
+            logging.warning(f"Failed to populate L2 policy cache: {e}")
     except BaseException as e:
         if not fut.done():
             if isinstance(e, asyncio.CancelledError):
@@ -613,7 +601,7 @@ async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future,
         if isinstance(e, asyncio.CancelledError):
             raise
     finally:
-        cb.release_half_open_probe_if_unrecorded()
+        cb.release_half_open_probe()
         if in_flight.get(comp_key) is fut:
             in_flight.pop(comp_key, None)
 
@@ -624,7 +612,12 @@ async def _process_stream_messages(messages, active_stream_client, active_redis_
             logging.warning(f"Malformed message skipped: {msg_data}")
             await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
             continue
-        key = key_bytes.decode()
+        try:
+            key = key_bytes.decode("utf-8") if isinstance(key_bytes, bytes) else str(key_bytes)
+        except (UnicodeDecodeError, Exception) as e:
+            logging.warning(f"Undecodable stream key skipped: {e}")
+            await active_stream_client.xack(STREAM_NAME, STREAM_GROUP, msg_id)
+            continue
         l1_cache.delete(key)
         try:
             await active_redis_client.delete(f"policy:{key}")
@@ -655,17 +648,12 @@ async def stream_listener():
             active_redis_client = redis_client or get_redis_client()
 
             if was_partitioned:
-                # Partition resolution phase:
-                # Step A: Drain unacknowledged entries from own Pending Entries List (PEL) using ID '0'
-                # Step B: Reclaim long-idle pending messages via XAUTOCLAIM (if supported)
-                # Step C: Catch up on un-delivered messages using ID '>'
                 start_time = time.time()
                 total_pending = 0
                 pel_drained = 0
                 autoclaimed = 0
                 new_drained = 0
 
-                # Step A: Drain all batches of own PEL (ID "0")
                 while True:
                     pending = await active_stream_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: "0"}, count=STREAM_CATCHUP_COUNT)
                     if not pending or not pending[0][1]:
@@ -674,7 +662,6 @@ async def stream_listener():
                     pel_drained += len(messages)
                     await _process_stream_messages(messages, active_stream_client, active_redis_client)
 
-                # Step B: Attempt XAUTOCLAIM on idle pending messages (gracefully handle older Redis / mocks)
                 try:
                     if hasattr(active_stream_client, "xautoclaim"):
                         claim_start_id = "0-0"
@@ -705,8 +692,8 @@ async def stream_listener():
                 except (AttributeError, Exception) as e:
                     logging.warning(f"XAUTOCLAIM skipped or failed: {e}")
 
-                # Step C: Catch up on messages accumulated during partition that were never delivered to this consumer group (ID ">")
-                while True:
+                max_catchup_batches = 100
+                for _ in range(max_catchup_batches):
                     new_msgs = await active_stream_client.xreadgroup(STREAM_GROUP, node_name, {STREAM_NAME: ">"}, count=STREAM_CATCHUP_COUNT)
                     if not new_msgs or not new_msgs[0][1]:
                         break
@@ -834,17 +821,19 @@ async def measure_latency(request: Request, call_next):
         return JSONResponse(status_code=503, content={"status": "error", "message": "Node Isolated"})
 
     start = time.time()
-    response = await call_next(request)
-    duration = time.time() - start
-    if request.url.path == "/auth":
-        with stats_lock:
-            stats["requests"] += 1
-            stats["latency_sum"] += duration
-    return response
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        duration = time.time() - start
+        if request.url.path == "/auth" and getattr(request.state, "entered_pipeline", False):
+            with stats_lock:
+                stats["requests"] += 1
+                stats["latency_sum"] += duration
+                stats["total_latency_ms"] += duration * 1000.0
 
 def generate_canonical_payload(method: str, path: str, spiffe_id: str, nonce: str) -> bytes:
-    # Scope B: Simplified request digest ECDSA signature
-    # Omitting Host, Query, Timestamp, Body (since /auth is GET and uses single-use nonce)
+    # Omitting Host, Query, Timestamp, Body since /auth is GET and uses single-use nonce
     canonical_str = f"{method.upper()}\n{path}\n{spiffe_id}\n{nonce}"
     return canonical_str.encode("utf-8")
 
@@ -883,6 +872,8 @@ async def auth(
 ):
     if not authorization or not x_nonce or not x_spiffe_id:
         raise HTTPException(status_code=401, detail="Missing Headers")
+
+    request.state.entered_pipeline = True
 
     try:
         allowed = await check_rate_limit(x_spiffe_id)
@@ -936,6 +927,7 @@ async def auth(
                 with stats_lock:
                     stats["circuit_state"] = current_state
                     stats["circuit_blocked"] += 1
+                    stats["pubkey_circuit_blocked"] += 1
                     stats["pop_rejected"] += 1
                 raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
             try:
@@ -972,7 +964,9 @@ async def auth(
                             logging.warning(f"Failed to populate L2 pubkey cache: {e}")
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
+                        cb.record_success()
                         with stats_lock:
+                            stats["circuit_state"] = cb.current_state
                             stats["pop_rejected"] += 1
                         raise HTTPException(status_code=401, detail="Unknown Key ID")
                     cb.record_failure()
@@ -989,12 +983,17 @@ async def auth(
                         stats["pop_rejected"] += 1
                     raise HTTPException(status_code=503, detail="Service Unavailable - Key Fetch Failed")
             finally:
-                cb.release_half_open_probe_if_unrecorded()
+                cb.release_half_open_probe()
 
         if not pubkey_pem:
             with stats_lock:
                 stats["pop_rejected"] += 1
             raise HTTPException(status_code=401, detail="Unknown Key ID")
+
+        if not x_pop_signature or len(x_pop_signature) % 4 == 1:
+            with stats_lock:
+                stats["pop_rejected"] += 1
+            raise HTTPException(status_code=401, detail="Invalid PoP Signature")
 
         try:
             padding_needed = (4 - len(x_pop_signature) % 4) % 4
@@ -1002,7 +1001,7 @@ async def auth(
         except (binascii.Error, ValueError):
             with stats_lock:
                 stats["pop_rejected"] += 1
-            raise HTTPException(status_code=401, detail="Invalid PoP Signature Encoding")
+            raise HTTPException(status_code=401, detail="Invalid PoP Signature")
 
         canonical_payload = generate_canonical_payload(request.method, request.url.path, x_spiffe_id, x_nonce)
 
@@ -1082,7 +1081,7 @@ async def auth(
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
     except BaseException:
-        cb.release_half_open_probe_if_unrecorded()
+        cb.release_half_open_probe()
         raise
 
     try:
@@ -1145,7 +1144,7 @@ async def probe_db_health():
             logging.warning(f"DB probe failed upon healing: {e}")
             cb.force_state("OPEN")
         finally:
-            cb.release_half_open_probe_if_unrecorded()
+            cb.release_half_open_probe()
 
 @app.post("/chaos/partition/{state}")
 async def set_partition(state: str):
@@ -1170,8 +1169,8 @@ async def set_redis(state: str):
     old_stream = stream_redis_client
 
     if state == "down":
-        new_redis = Redis.from_url("redis://127.0.0.1:9999", socket_timeout=REDIS_DOWN_SOCKET_TIMEOUT)
-        new_stream = Redis.from_url("redis://127.0.0.1:9999", socket_timeout=REDIS_DOWN_SOCKET_TIMEOUT)
+        new_redis = Redis.from_url(DUMMY_REDIS_URL, socket_timeout=REDIS_DOWN_SOCKET_TIMEOUT)
+        new_stream = Redis.from_url(DUMMY_REDIS_URL, socket_timeout=REDIS_DOWN_SOCKET_TIMEOUT)
     else:
         new_redis = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
         new_stream = Redis.from_url(redis_url, socket_timeout=STREAM_SOCKET_TIMEOUT)
@@ -1211,7 +1210,7 @@ async def invalidate_cache(key: str):
     return {"status": "published"}
 
 @app.post("/chaos/cb/force/{state}")
-async def force_cb_state(state: str, request: Request):
+async def force_cb_state(state: str):
     if state not in VALID_CB_STATES:
         raise HTTPException(status_code=400, detail=f"Invalid circuit breaker state: {state}")
     cb.force_state(state)

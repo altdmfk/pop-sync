@@ -47,7 +47,6 @@ async def test_pop_valid_signature(mock_common_dependencies, monkeypatch):
         assert stats["pop_verified"] == 1
         assert stats["pop_rejected"] == 0
         assert stats["db_fallbacks"] == 1
-        # requests == rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked
         assert stats["requests"] == stats["rate_limited"] + stats["nonce_replays"] + stats["pop_rejected"] + stats["l1_hits"] + stats["l2_hits"] + stats["db_fallbacks"] + stats["redis_outage_blocked"]
 
 @pytest.mark.asyncio
@@ -58,7 +57,6 @@ async def test_pop_tampered_payload(mock_common_dependencies, monkeypatch):
     
     spiffe_id = "spiffe://test/valid"
     nonce = str(uuid.uuid4())
-    # Sign with path "/other" instead of "/auth"
     sig_b64 = sign_payload(priv, "GET", "/other", spiffe_id, nonce)
     
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
@@ -80,11 +78,10 @@ async def test_pop_wrong_key(mock_common_dependencies, monkeypatch):
     monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
     priv, pub = generate_keypair()
     wrong_priv, wrong_pub = generate_keypair()
-    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)  # Server knows 'pub'
+    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
     
     spiffe_id = "spiffe://test/valid"
     nonce = str(uuid.uuid4())
-    # Sign with 'wrong_priv'
     sig_b64 = sign_payload(wrong_priv, "GET", "/auth", spiffe_id, nonce)
     
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
@@ -107,7 +104,6 @@ async def test_pop_missing_header(mock_common_dependencies, monkeypatch):
             "Authorization": "Bearer token1",
             "X-SPIFFE-ID": "spiffe://test/valid",
             "X-Nonce": str(uuid.uuid4())
-            # X-PoP-Signature is missing
         })
         
         assert res.status_code == 400
@@ -165,7 +161,6 @@ async def test_pop_toggle_off(mock_common_dependencies, monkeypatch):
             "Authorization": "Bearer token1",
             "X-SPIFFE-ID": "spiffe://test/valid",
             "X-Nonce": str(uuid.uuid4())
-            # Signature missing, but should pass because toggle is off
         })
         
         assert res.status_code == 200
@@ -174,20 +169,10 @@ async def test_pop_toggle_off(mock_common_dependencies, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pop_stream_invalidation(mock_common_dependencies):
-    # Test that an update/invalidate removes the pubkey from L1
     pubkey_key = "pubkey:spiffe://test/valid"
     l1_cache.set(pubkey_key, "fake_pem")
     assert l1_cache.get(pubkey_key) == "fake_pem"
     
-    # Send mock message to stream listener?
-    # Stream listener is a background task. We can just call the logic or test it via /chaos/invalidate.
-    # Actually, the stream listener polls redis. We can just manually call the logic that the listener runs,
-    # or rely on the test that ensures the pubkey uses the exact key format.
-    # Since the listener deletes `key` from L1, if we send `pubkey_key`, it will delete it.
-    
-    # We just test the key structure in l1_cache matches what invalidation expects.
-    # The invalidation stream pushes {"key": pubkey_key}, and L1 deletes it.
-    # Let's mock a stream message to the L1 cache.
     l1_cache.delete(pubkey_key)
     assert l1_cache.get(pubkey_key) is None
 
@@ -195,7 +180,7 @@ async def test_pop_stream_invalidation(mock_common_dependencies):
 @pytest.mark.asyncio
 async def test_pop_pubkey_circuit_breaker_and_timeout(mock_common_dependencies, monkeypatch):
     """
-    Verify (B-05):
+    Verify:
     1. Circuit OPEN -> /pubkey lookup on L1/L2 miss fast-fails without calling DB,
        nonce is still burned, and the request is rejected (not allowed).
     2. DB timeout during /pubkey lookup increments cb.failures.
@@ -210,7 +195,6 @@ async def test_pop_pubkey_circuit_breaker_and_timeout(mock_common_dependencies, 
     nonce = str(uuid.uuid4())
     sig_b64 = sign_payload(priv, "GET", "/auth", spiffe_id, nonce)
 
-    # 1. Circuit OPEN -> fast-fail without calling DB, request rejected
     gateway.cb.force_state("OPEN")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         res = await client.get("/auth", headers={
@@ -231,7 +215,6 @@ async def test_pop_pubkey_circuit_breaker_and_timeout(mock_common_dependencies, 
             stats["redis_outage_blocked"]
         )
 
-    # 2. Circuit CLOSED (past debounce) -> DB timeout increments cb.failures
     gateway.cb.reset()
     gateway.cb.force_state("CLOSED")
     assert gateway.cb.failures == 0
@@ -252,4 +235,125 @@ async def test_pop_pubkey_circuit_breaker_and_timeout(mock_common_dependencies, 
         assert res2.status_code == 503
         assert gateway.cb.failures == 1
         assert stats["pop_rejected"] == 2
+
+
+@pytest.mark.asyncio
+async def test_pop_pubkey_circuit_breaker_invariant_2(mock_common_dependencies, monkeypatch):
+    monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
+    priv, pub = generate_keypair()
+    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
+
+    spiffe_id = "spiffe://test/cb-pubkey-inv2"
+    nonce = str(uuid.uuid4())
+    sig_b64 = sign_payload(priv, "GET", "/auth", spiffe_id, nonce)
+
+    gateway.cb.force_state("OPEN")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.get("/auth", headers={
+            "Authorization": "Bearer token1",
+            "X-SPIFFE-ID": spiffe_id,
+            "X-Nonce": nonce,
+            "X-PoP-Signature": sig_b64,
+        })
+        assert res.status_code == 503
+        assert stats["circuit_blocked"] == 1
+        assert stats["pubkey_circuit_blocked"] == 1
+        assert stats["pop_rejected"] == 1
+        assert stats["db_fallbacks"] == 0
+
+        classified_sum = (
+            stats["rate_limited"] + stats["nonce_replays"] + stats["pop_rejected"] +
+            stats["l1_hits"] + stats["l2_hits"] + stats["db_fallbacks"] +
+            stats["redis_outage_blocked"]
+        )
+        assert stats["requests"] == classified_sum
+
+        policy_circuit_blocked = stats["circuit_blocked"] - stats["pubkey_circuit_blocked"]
+        resolved_sum = (
+            stats["db_queries_executed"] + stats["singleflight_coalesced"] +
+            stats["l1_double_check_hits"] + policy_circuit_blocked
+        )
+        assert stats["db_fallbacks"] == resolved_sum
+
+
+@pytest.mark.asyncio
+async def test_pop_missing_header_zero_drift_invariant_1(mock_common_dependencies):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        r1 = await client.get("/auth", headers={
+            "X-SPIFFE-ID": "spiffe://test/missing-auth",
+            "X-Nonce": str(uuid.uuid4()),
+        })
+        assert r1.status_code == 401
+        assert stats["requests"] == 0
+
+        r2 = await client.get("/auth", headers={
+            "Authorization": "Bearer token1",
+            "X-SPIFFE-ID": "spiffe://test/missing-nonce",
+        })
+        assert r2.status_code == 401
+        assert stats["requests"] == 0
+
+        r3 = await client.get("/auth", headers={
+            "Authorization": "Bearer token1",
+            "X-Nonce": str(uuid.uuid4()),
+        })
+        assert r3.status_code == 401
+        assert stats["requests"] == 0
+
+        classified_sum = (
+            stats["rate_limited"] + stats["nonce_replays"] + stats["pop_rejected"] +
+            stats["l1_hits"] + stats["l2_hits"] + stats["db_fallbacks"] +
+            stats["redis_outage_blocked"]
+        )
+        assert stats["requests"] == classified_sum
+
+
+@pytest.mark.asyncio
+async def test_pop_pubkey_404_half_open_transitions_to_closed(mock_common_dependencies, monkeypatch):
+    monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
+    priv, pub = generate_keypair()
+    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
+
+    spiffe_id = "spiffe://test/nokey"
+    nonce = str(uuid.uuid4())
+    sig_b64 = sign_payload(priv, "GET", "/auth", spiffe_id, nonce)
+
+    gateway.cb.force_state("HALF_OPEN")
+    assert gateway.cb.current_state == "HALF_OPEN"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.get("/auth", headers={
+            "Authorization": "Bearer token1",
+            "X-SPIFFE-ID": spiffe_id,
+            "X-Nonce": nonce,
+            "X-PoP-Signature": sig_b64,
+        })
+        assert res.status_code == 401
+        assert "Unknown Key ID" in res.text
+        assert gateway.cb.current_state == "CLOSED"
+        assert gateway.cb.failures == 0
+        assert gateway.cb.is_probe_active is False
+
+
+@pytest.mark.asyncio
+async def test_pop_signature_invalid_length_mod_4_equals_1(mock_common_dependencies, monkeypatch):
+    monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
+    priv, pub = generate_keypair()
+    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
+
+    spiffe_id = "spiffe://test/valid"
+    nonce = str(uuid.uuid4())
+    invalid_sig = "abcde"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.get("/auth", headers={
+            "Authorization": "Bearer token1",
+            "X-SPIFFE-ID": spiffe_id,
+            "X-Nonce": nonce,
+            "X-PoP-Signature": invalid_sig,
+        })
+        assert res.status_code == 401
+        assert "Invalid PoP Signature" in res.text
+        assert stats["pop_rejected"] == 1
+
 

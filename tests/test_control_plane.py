@@ -76,7 +76,6 @@ async def test_control_plane_metrics_stream_endpoint():
         first_event = await gen.__anext__()
         assert "Node-A" in str(first_event)
         
-        # Simulate client disconnect
         disconnected = True
         with pytest.raises(StopAsyncIteration):
             await gen.__anext__()
@@ -310,12 +309,10 @@ async def test_chaos_audit_healthy_and_degraded_nodes():
             assert resp.status_code == 200
             data = resp.json()
 
-            # Global summary
             assert data["overall_invariant_pass"] is True
             assert data["online_nodes_count"] == 2
             assert data["total_nodes_count"] == 3
 
-            # Node-A verification
             node_a = data["nodes"]["Node-A"]
             assert node_a["status"] == "online"
             assert node_a["circuit_state"] == "CLOSED"
@@ -326,14 +323,10 @@ async def test_chaos_audit_healthy_and_degraded_nodes():
             assert node_a["invariant_2"]["pass"] is True
             assert node_a["invariant_2"]["db_fallbacks"] == 50
             assert node_a["invariant_2"]["resolved_sum"] == 50
-            # Cache hit ratio: (20 + 10) / 100 = 30.0%
             assert node_a["cache_hit_ratio_pct"] == 30.0
-            # Single-Flight coalescing ratio: 40 / 50 = 80.0%
             assert node_a["singleflight_coalescing_ratio_pct"] == 80.0
-            # DB load reduction: (40 + 3 + 2) / 50 = 45 / 50 = 90.0%
             assert node_a["db_load_reduction_percentage"] == 90.0
 
-            # Node-B verification (degraded)
             node_b = data["nodes"]["Node-B"]
             assert node_b["status"] == "online"
             assert node_b["circuit_state"] == "OPEN"
@@ -344,10 +337,8 @@ async def test_chaos_audit_healthy_and_degraded_nodes():
             assert node_b["invariant_2"]["pass"] is True
             assert node_b["invariant_2"]["db_fallbacks"] == 20
             assert node_b["invariant_2"]["resolved_sum"] == 20
-            # All 20 DB fallbacks were blocked by Circuit Breaker: 100% DB load reduction
             assert node_b["db_load_reduction_percentage"] == 100.0
 
-            # Node-C verification (offline)
             node_c = data["nodes"]["Node-C"]
             assert node_c["status"] == "offline"
             assert node_c["invariant_pass"] is None
@@ -367,7 +358,6 @@ async def test_chaos_audit_invariant_mismatch_failure():
             "status": "online",
             "stats": {
                 "requests": 100,
-                # Sum of classification = 90 (missing 10 requests!)
                 "rate_limited": 10,
                 "nonce_replays": 0,
                 "pop_rejected": 0,
@@ -400,6 +390,57 @@ async def test_chaos_audit_invariant_mismatch_failure():
             assert node_a["invariant_1"]["requests"] == 100
             assert node_a["invariant_1"]["classified_sum"] == 90
             assert node_a["invariant_2"]["pass"] is True
+
+
+@pytest.mark.asyncio
+async def test_chaos_audit_invariant_2_holds_during_pubkey_circuit_blocked():
+    from httpx import AsyncClient, ASGITransport
+
+    mock_metrics = {
+        "Node-A": {
+            "node": "Node-A",
+            "status": "online",
+            "circuit_state": "OPEN",
+            "stats": {
+                "requests": 5,
+                "rate_limited": 0,
+                "nonce_replays": 0,
+                "pop_rejected": 5,
+                "l1_hits": 0,
+                "l2_hits": 0,
+                "db_fallbacks": 0,
+                "redis_outage_blocked": 0,
+                "db_queries_executed": 0,
+                "singleflight_coalesced": 0,
+                "l1_double_check_hits": 0,
+                "circuit_blocked": 5,
+                "pubkey_circuit_blocked": 5,
+                "circuit_state": "OPEN",
+            }
+        }
+    }
+
+    with patch("control_plane.fetch_metrics", new_callable=AsyncMock) as m_fetch:
+        m_fetch.return_value = mock_metrics
+
+        transport = ASGITransport(app=control_plane.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/chaos/audit", headers={"X-Admin-Token": control_plane.ADMIN_SECRET_TOKEN})
+            assert resp.status_code == 200
+            data = resp.json()
+
+            assert data["overall_invariant_pass"] is True
+            node_a = data["nodes"]["Node-A"]
+            assert node_a["invariant_pass"] is True
+            assert node_a["invariant_1"]["pass"] is True
+            assert node_a["invariant_1"]["requests"] == 5
+            assert node_a["invariant_1"]["classified_sum"] == 5
+            assert node_a["invariant_2"]["pass"] is True
+            assert node_a["invariant_2"]["db_fallbacks"] == 0
+            assert node_a["invariant_2"]["resolved_sum"] == 0
+            assert node_a["invariant_2"]["details"]["circuit_blocked"] == 5
+            assert node_a["invariant_2"]["details"]["pubkey_circuit_blocked"] == 5
+
 
 
 

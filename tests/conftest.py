@@ -3,10 +3,8 @@ import sys
 import pytest
 from unittest.mock import patch, AsyncMock
 
-# Add project root to PYTHONPATH
 sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
-# Set environment variables for tests
 os.environ["ADMIN_SECRET_TOKEN"] = "super-secret-admin"
 
 @pytest.fixture(autouse=True)
@@ -22,17 +20,26 @@ def clean_gateway_state():
     gateway.cb.reset()
     gateway.cb.force_state("CLOSED")
     with gateway.stats_lock:
-        for k in gateway.stats:
+        for k in list(gateway.stats.keys()):
             if isinstance(gateway.stats[k], int):
                 gateway.stats[k] = 0
             elif isinstance(gateway.stats[k], float):
                 gateway.stats[k] = 0.0
         gateway.stats["circuit_state"] = "CLOSED"
         gateway.stats["circuit_blocked"] = 0
+        gateway.stats["pubkey_circuit_blocked"] = 0
         gateway.stats["l1_double_check_hits"] = 0
         gateway.stats["redis_outage_blocked"] = 0
         gateway.stats["half_open_probe_active"] = False
         gateway.stats["singleflight_leader_queries"] = 0
+        gateway.stats["last_catchup"] = {
+            "pending_count": 0,
+            "pel_drained": 0,
+            "autoclaimed": 0,
+            "new_drained": 0,
+            "duration_ms": 0,
+            "timestamp": 0.0,
+        }
 
     yield
 
@@ -43,6 +50,27 @@ def clean_gateway_state():
     gateway.local_rate_limits.clear()
     gateway.cb.reset()
     gateway.cb.force_state("CLOSED")
+    with gateway.stats_lock:
+        for k in list(gateway.stats.keys()):
+            if isinstance(gateway.stats[k], int):
+                gateway.stats[k] = 0
+            elif isinstance(gateway.stats[k], float):
+                gateway.stats[k] = 0.0
+        gateway.stats["circuit_state"] = "CLOSED"
+        gateway.stats["circuit_blocked"] = 0
+        gateway.stats["pubkey_circuit_blocked"] = 0
+        gateway.stats["l1_double_check_hits"] = 0
+        gateway.stats["redis_outage_blocked"] = 0
+        gateway.stats["half_open_probe_active"] = False
+        gateway.stats["singleflight_leader_queries"] = 0
+        gateway.stats["last_catchup"] = {
+            "pending_count": 0,
+            "pel_drained": 0,
+            "autoclaimed": 0,
+            "new_drained": 0,
+            "duration_ms": 0,
+            "timestamp": 0.0,
+        }
 
 @pytest.fixture
 def mock_common_dependencies():

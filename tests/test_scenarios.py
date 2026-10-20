@@ -63,7 +63,6 @@ def test_circuit_breaker():
     print("Restoring DB...")
     httpx.post(f"{BASE_URL}/chaos/db/up", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
     
-    # Wait for reset timeout (10s)
     print("Waiting 10s for HALF_OPEN transition...")
     time.sleep(11)
     
@@ -85,11 +84,9 @@ import random
 def test_partition_catchup():
     print_header("Scenario 4: Hard Partition & Stream Catch-up (Robustness Test)")
     
-    # Run 5 times with random timings to prove robustness
     for iteration in range(5):
         print(f"\n--- Iteration {iteration + 1} ---")
         
-        # Populate L1 cache on Node-B
         for i in range(5):
             httpx.get(f"{NODE_B}/auth", headers={
                 "Authorization": "Bearer test",

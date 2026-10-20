@@ -33,11 +33,6 @@ async def test_singleflight_off_100_requests(mock_common_dependencies, monkeypat
             assert r.status_code == 200
             assert r.json()["policy"] == "admin"
             
-        # Circuit breaker may open if failures occurred, but this is a success test.
-        # But wait, MAX_DB_WORKERS is 5! db_semaphore limit!
-        # db_queries_executed might not be exactly 100 if DBOverloadError is raised!
-        # But in test_globals fixture, DB_MODE="async", which bypasses semaphore!
-        # [주석] mock 환경이라 세마포어/서킷 영향이 없어서 100이 나오며, 실제 DB 환경에서는 달라질 수 있음.
         assert stats["db_queries_executed"] == 100
         assert stats["singleflight_coalesced"] == 0
 
@@ -144,7 +139,6 @@ async def test_double_check_l1(mock_common_dependencies):
     
     from gateway import l1_cache
     
-    # 첫 번째 L1 확인은 None(캐시 미스), 두 번째(더블체크)는 "DENY"를 반환하도록 조작
     with patch.object(l1_cache, "get", side_effect=[None, "DENY"]):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -164,10 +158,6 @@ async def test_double_check_l1(mock_common_dependencies):
 
 @pytest.mark.asyncio
 async def test_stats_invariants(mock_common_dependencies):
-    """
-    db_fallbacks 정의: "DB 경로로 진입한 요청 수, 서킷 차단과 L1 더블체크 히트 포함"
-    불변식 검증 테스트
-    """
     _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     
     async def delayed_db_call(*args, **kwargs):
@@ -177,15 +167,12 @@ async def test_stats_invariants(mock_common_dependencies):
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. DB Fallback (1 leader + 4 followers) = 5 requests
         headers = {"Authorization": "Bearer token", "X-Nonce": "nonce-1"}
         tasks = [client.get("/auth", headers={**headers, "X-SPIFFE-ID": "spiffe://inv1"}) for _ in range(5)]
         
-        # 2. L1 Hit (1 request, since previous populated it)
-        await asyncio.gather(*tasks) # Wait for cache to populate
+        await asyncio.gather(*tasks)
         resp_l1 = await client.get("/auth", headers={**headers, "X-SPIFFE-ID": "spiffe://inv1", "X-Nonce": "nonce-2"})
         
-        # 3. L2 Hit (1 request, different sid, mock L2 to return hit)
         m_redis.get.side_effect = lambda k: b"DENY" if k == "policy:test_l2" else None
         with patch("gateway.generate_composite_key", return_value="test_l2"):
             resp_l2 = await client.get("/auth", headers={**headers, "X-SPIFFE-ID": "spiffe://inv2", "X-Nonce": "nonce-3"})
@@ -193,14 +180,12 @@ async def test_stats_invariants(mock_common_dependencies):
         assert resp_l1.status_code == 200
         assert resp_l2.status_code == 200
 
-        # 4. L1 Double Check Hit (1 request)
         from gateway import l1_cache
         m_redis.get.side_effect = lambda k: l1_cache.set("test_l1_double", "DENY") or None
         with patch("gateway.generate_composite_key", return_value="test_l1_double"):
             resp_l1_dc = await client.get("/auth", headers={**headers, "X-SPIFFE-ID": "spiffe://inv_dc", "X-Nonce": "nonce-4"})
             assert resp_l1_dc.status_code == 200
 
-        # 5. Circuit Breaker OPEN (1 request)
         from gateway import cb
         cb.force_state("OPEN")
         m_redis.get.side_effect = AsyncMock(return_value=None)
@@ -261,9 +246,7 @@ async def test_unretrieved_future_exception(mock_common_dependencies):
         except asyncio.CancelledError:
             pass
             
-        # Wait for background db_loader_task to finish and set exception
         await asyncio.sleep(0.15)
-        # Without fix, garbage collection will complain. We can't easily assert on gc warnings directly in pytest without specific fixtures, but running pytest -W error will fail if there is a warning.
 
 
 def test_circuit_breaker_debounce_and_half_open_boundary(monkeypatch):
@@ -284,70 +267,59 @@ def test_circuit_breaker_debounce_and_half_open_boundary(monkeypatch):
     cb_test.reset()
     assert cb_test.current_state == "CLOSED"
     
-    # 1. Failure at t=1001.0 (< 2.0s debounce window from reset at t=1000.0) -> Debounced
     current_time = 1001.0
     cb_test.record_failure()
     assert cb_test.failures == 0, "Failure within debounce window must be debounced"
     assert cb_test.current_state == "CLOSED"
     
-    # 2. Failure at t=1001.99 (< 2.0s) -> Debounced
     current_time = 1001.99
     cb_test.record_failure()
     assert cb_test.failures == 0
     
-    # 3. Failure at t=1002.0 (>= 2.0s debounce window) -> Counted (1)
     current_time = 1002.0
     cb_test.record_failure()
     assert cb_test.failures == 1
     assert cb_test.current_state == "CLOSED"
     
-    # Additional failures after debounce are counted
     current_time = 1002.5
     cb_test.record_failure()
     assert cb_test.failures == 2
     
     current_time = 1003.0
-    cb_test.record_failure()  # 3rd failure reaches max_failures=3
+    cb_test.record_failure()
     assert cb_test.failures == 3
     assert cb_test.current_state == "OPEN"
     
-    # Transition to OPEN happened at t=1003.0. While OPEN:
     can_exec, state = cb_test.can_execute()
     assert can_exec is False
     assert state == "OPEN"
     
-    # Before reset_timeout (10s) expires:
     current_time = 1012.9
     can_exec, state = cb_test.can_execute()
     assert can_exec is False
     assert state == "OPEN"
     
-    # After reset_timeout (10s) expires (> 1013.0):
     current_time = 1013.1
     can_exec, state = cb_test.can_execute()
     assert can_exec is True
     assert state == "HALF_OPEN"
     assert cb_test.current_state == "HALF_OPEN"
 
-    # In HALF_OPEN, a failed probe at < 2.0s (t=1013.5) must bypass debounce and re-open immediately
     current_time = 1013.5
     cb_test.record_failure()
     assert cb_test.current_state == "OPEN"
     assert cb_test.last_failure_time == 1013.5
     assert cb_test.last_transition_time == 1013.5
 
-    # Wait for reset_timeout (> 1023.5) to enter HALF_OPEN again
     current_time = 1023.6
     can_exec, state = cb_test.can_execute()
     assert can_exec is True
     assert state == "HALF_OPEN"
     
-    # In HALF_OPEN, trial success resets circuit to CLOSED
     cb_test.record_success()
     assert cb_test.current_state == "CLOSED"
     assert cb_test.failures == 0
 
-    # In CLOSED after transition (t=1023.6), failure within debounce (< 2.0s) is still ignored
     current_time = 1024.5
     cb_test.record_failure()
     assert cb_test.failures == 0
@@ -382,7 +354,6 @@ async def test_singleflight_exception_propagation_and_map_cleanup(mock_common_de
             "X-SPIFFE-ID": "spiffe://test_cleanup",
         }
         
-        # 1 leader + 3 followers
         tasks = [client.get("/auth", headers={**headers, "X-Nonce": f"nonce-err-{i}"}) for i in range(4)]
         results = await asyncio.gather(*tasks)
         
@@ -390,10 +361,8 @@ async def test_singleflight_exception_propagation_and_map_cleanup(mock_common_de
             assert r.status_code == 200
             assert r.json()["status"] == "degraded_allow"
             
-        # Verify in_flight map is cleaned up
         assert len(in_flight) == 0, f"in_flight map must be empty, but had: {in_flight}"
         
-        # Subsequent request succeeds and also cleans up in_flight
         cb.reset()
         resp2 = await client.get("/auth", headers={**headers, "X-Nonce": "nonce-succ-1"})
         assert resp2.status_code == 200
@@ -555,21 +524,18 @@ async def test_half_open_allows_strictly_single_probe_under_concurrency(mock_com
         ]
         results = await asyncio.gather(*tasks)
 
-        # Classify responses by source
         successful_probes = [r for r in results if r.json().get("source") == "DB"]
         blocked_requests = [r for r in results if r.json().get("source") == "Fallback_Degradation"]
 
         assert len(successful_probes) == 1, f"Expected exactly 1 DB probe, got {len(successful_probes)}"
         assert len(blocked_requests) == 9, f"Expected 9 circuit-blocked requests, got {len(blocked_requests)}"
 
-        # Strict metric assertions
         assert stats["db_queries_executed"] == 1
         assert stats["circuit_blocked"] == 9
         assert stats["singleflight_coalesced"] == 0
         assert stats["db_fallbacks"] == 10
         assert stats["requests"] == 10
 
-        # Mathematical Invariant 1: requests == sum of classification counters
         assert stats["requests"] == (
             stats["rate_limited"] +
             stats["nonce_replays"] +
@@ -580,7 +546,6 @@ async def test_half_open_allows_strictly_single_probe_under_concurrency(mock_com
             stats["redis_outage_blocked"]
         )
 
-        # Mathematical Invariant 2: Strong DB Fallback Invariant
         assert stats["db_fallbacks"] == (
             stats["db_queries_executed"] +
             stats["singleflight_coalesced"] +
@@ -588,11 +553,9 @@ async def test_half_open_allows_strictly_single_probe_under_concurrency(mock_com
             stats["circuit_blocked"]
         )
 
-        # After probe succeeded, circuit must transition to CLOSED and probe inactive
         assert cb.current_state == "CLOSED"
         assert cb.is_probe_active is False
 
-        # Subsequent request with another distinct key executes normally against DB in CLOSED state
         m_db.side_effect = None
         m_db.return_value = {"status": "allow", "role": "admin"}
         resp_after = await client.get(
@@ -622,7 +585,6 @@ async def test_half_open_probe_slot_released_on_cancellation_or_overload(mock_co
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # --- Part 1: DBOverloadError releases probe slot ---
         cb.force_state("HALF_OPEN")
         assert cb.current_state == "HALF_OPEN"
         assert cb.is_probe_active is False
@@ -640,12 +602,9 @@ async def test_half_open_probe_slot_released_on_cancellation_or_overload(mock_co
         assert resp_overload.status_code == 503
         assert "DB Overload" in resp_overload.json()["message"]
 
-        # Circuit must remain HALF_OPEN (overload doesn't increment failure count)
-        # and probe slot MUST be released
         assert cb.current_state == "HALF_OPEN"
         assert cb.is_probe_active is False
 
-        # Subsequent request retries the probe without deadlock
         m_db.side_effect = None
         m_db.return_value = {"status": "allow", "role": "admin"}
 
@@ -662,7 +621,6 @@ async def test_half_open_probe_slot_released_on_cancellation_or_overload(mock_co
         assert cb.current_state == "CLOSED"
         assert cb.is_probe_active is False
 
-        # --- Part 2: Coroutine Cancellation (asyncio.CancelledError during DB execution) ---
         cb.force_state("HALF_OPEN")
         assert cb.current_state == "HALF_OPEN"
         assert cb.is_probe_active is False
@@ -683,14 +641,11 @@ async def test_half_open_probe_slot_released_on_cancellation_or_overload(mock_co
         except (asyncio.CancelledError, Exception):
             pass
 
-        # Give loader task event loop cycle to execute finally block
         await asyncio.sleep(0.05)
 
-        # Circuit must remain HALF_OPEN and probe slot released
         assert cb.current_state == "HALF_OPEN"
         assert cb.is_probe_active is False
 
-        # Verify retry is permitted and transitions circuit to CLOSED
         m_db.side_effect = None
         m_db.return_value = {"status": "allow", "role": "admin"}
 
@@ -707,7 +662,6 @@ async def test_half_open_probe_slot_released_on_cancellation_or_overload(mock_co
         assert cb.current_state == "CLOSED"
         assert cb.is_probe_active is False
 
-        # --- Part 3: Explicit Task Cancellation of in-flight loader task ---
         cb.force_state("HALF_OPEN")
         assert cb.current_state == "HALF_OPEN"
         assert cb.is_probe_active is False
@@ -726,10 +680,8 @@ async def test_half_open_probe_slot_released_on_cancellation_or_overload(mock_co
             }
         ))
         await asyncio.sleep(0.05)
-        # Probe slot is currently held by the active request
         assert cb.is_probe_active is True
 
-        # Cancel all background tasks (including db_loader_task)
         for bg_task in list(background_tasks):
             bg_task.cancel()
         req_task.cancel()
@@ -740,11 +692,9 @@ async def test_half_open_probe_slot_released_on_cancellation_or_overload(mock_co
             pass
 
         await asyncio.sleep(0.05)
-        # Probe slot MUST be released upon cancellation
         assert cb.current_state == "HALF_OPEN"
         assert cb.is_probe_active is False
 
-        # Retry succeeds
         m_db.side_effect = None
         m_db.return_value = {"status": "allow", "role": "admin"}
         resp_retry3 = await client.get(
@@ -764,7 +714,7 @@ def test_circuit_breaker_single_probe_direct_unit(monkeypatch):
     Direct unit test for CircuitBreaker atomic single-probe gating:
     - Verifies is_probe_active property and lock safety
     - Verifies can_execute() returns (True, 'HALF_OPEN') exactly once and (False, 'HALF_OPEN') thereafter
-    - Verifies release_half_open_probe_if_unrecorded() releases probe slot
+    - Verifies release_half_open_probe() releases probe slot
     - Verifies record_failure() in HALF_OPEN immediately re-opens and resets probe slot
     - Verifies record_success() in HALF_OPEN closes circuit and resets probe slot
     - Verifies check_and_half_open() transitions OPEN -> HALF_OPEN with probe slot unacquired
@@ -780,65 +730,52 @@ def test_circuit_breaker_single_probe_direct_unit(monkeypatch):
     assert test_cb.current_state == "CLOSED"
     assert test_cb.is_probe_active is False
 
-    # Force to OPEN
     test_cb.force_open()
     assert test_cb.current_state == "OPEN"
     assert test_cb.is_probe_active is False
 
-    # While OPEN and reset timeout not elapsed:
     can_exec, state = test_cb.can_execute()
     assert can_exec is False
     assert state == "OPEN"
     assert test_cb.is_probe_active is False
 
-    # After reset timeout expires (> 10s):
     current_time = 2011.0
-    # First trial request acquires probe slot
     can_exec, state = test_cb.can_execute()
     assert can_exec is True
     assert state == "HALF_OPEN"
     assert test_cb.is_probe_active is True
 
-    # Concurrent request is blocked by single-probe gate
     can_exec2, state2 = test_cb.can_execute()
     assert can_exec2 is False
     assert state2 == "HALF_OPEN"
     assert test_cb.is_probe_active is True
 
-    # Release probe slot (e.g. overload or cancellation before recording)
-    test_cb.release_half_open_probe_if_unrecorded()
+    test_cb.release_half_open_probe()
     assert test_cb.is_probe_active is False
     assert test_cb.current_state == "HALF_OPEN"
 
-    # Now the next request can acquire probe slot
     can_exec3, state3 = test_cb.can_execute()
     assert can_exec3 is True
     assert state3 == "HALF_OPEN"
     assert test_cb.is_probe_active is True
 
-    # Failed probe immediately re-opens circuit and resets probe slot
     test_cb.record_failure()
     assert test_cb.current_state == "OPEN"
     assert test_cb.is_probe_active is False
 
-    # Expire reset timeout again
     current_time = 2022.0
-    # Use check_and_half_open(): transitions to HALF_OPEN with probe slot NOT yet acquired
     assert test_cb.check_and_half_open() == "HALF_OPEN"
     assert test_cb.is_probe_active is False
 
-    # Very next can_execute() acquires the probe slot
     can_exec4, state4 = test_cb.can_execute()
     assert can_exec4 is True
     assert state4 == "HALF_OPEN"
     assert test_cb.is_probe_active is True
 
-    # Successful probe resets circuit to CLOSED and resets probe slot
     test_cb.record_success()
     assert test_cb.current_state == "CLOSED"
     assert test_cb.is_probe_active is False
 
-    # force_close / force_open / force_state reset probe slot
     test_cb.force_state("HALF_OPEN")
     assert test_cb.is_probe_active is False
     test_cb.can_execute()
@@ -869,7 +806,6 @@ async def test_singleflight_leader_follower_efficiency_observability(mock_common
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Group 1: 50 requests with key A
         tasks_a = [
             client.get(
                 "/auth",
@@ -881,7 +817,6 @@ async def test_singleflight_leader_follower_efficiency_observability(mock_common
             )
             for i in range(50)
         ]
-        # Group 2: 50 requests with key B
         tasks_b = [
             client.get(
                 "/auth",
@@ -894,24 +829,18 @@ async def test_singleflight_leader_follower_efficiency_observability(mock_common
             for i in range(50)
         ]
 
-        # Launch all 100 requests concurrently
         results = await asyncio.gather(*tasks_a, *tasks_b)
 
         for r in results:
             assert r.status_code == 200
             assert r.json()["policy"] == "admin"
 
-        # Exactly 2 DB queries executed (1 for Key A, 1 for Key B)
         assert stats["db_queries_executed"] == 2
-        # Exactly 2 Single-Flight Leader queries initiated
         assert stats["singleflight_leader_queries"] == 2
-        # Exactly 98 Single-Flight Followers coalesced (49 + 49)
         assert stats["singleflight_coalesced"] == 98
-        # Total DB fallbacks = 100
         assert stats["db_fallbacks"] == 100
         assert stats["requests"] == 100
 
-        # Mathematical Invariant 1
         assert stats["requests"] == (
             stats["rate_limited"] +
             stats["nonce_replays"] +
@@ -922,13 +851,71 @@ async def test_singleflight_leader_follower_efficiency_observability(mock_common
             stats["redis_outage_blocked"]
         )
 
-        # Mathematical Invariant 2 (Strong DB Fallback Invariant)
         assert stats["db_fallbacks"] == (
             stats["db_queries_executed"] +
             stats["singleflight_coalesced"] +
             stats["l1_double_check_hits"] +
             stats["circuit_blocked"]
         )
+
+
+@pytest.mark.asyncio
+async def test_follower_cancellation_zero_drift_invariant_1(mock_common_dependencies):
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
+
+    async def delayed_db_call(*args, **kwargs):
+        await asyncio.sleep(0.15)
+        return {"status": "allow", "role": "admin"}
+    m_db.side_effect = delayed_db_call
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {
+            "Authorization": "Bearer token",
+            "X-SPIFFE-ID": "spiffe://test-follower-cancel",
+            "X-Nonce": "nonce-leader",
+        }
+
+        leader_task = asyncio.create_task(client.get("/auth", headers=headers))
+        await asyncio.sleep(0.03)
+
+        follower_task = asyncio.create_task(
+            client.get("/auth", headers={**headers, "X-Nonce": "nonce-follower"})
+        )
+        await asyncio.sleep(0.02)
+
+        follower_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await follower_task
+
+        leader_resp = await leader_task
+        assert leader_resp.status_code == 200
+
+        assert stats["requests"] == 2
+        assert stats["db_fallbacks"] == 2
+        assert stats["db_queries_executed"] == 1
+        assert stats["singleflight_coalesced"] == 1
+
+        classified_sum = (
+            stats["rate_limited"] +
+            stats["nonce_replays"] +
+            stats["pop_rejected"] +
+            stats["l1_hits"] +
+            stats["l2_hits"] +
+            stats["db_fallbacks"] +
+            stats["redis_outage_blocked"]
+        )
+        assert stats["requests"] == classified_sum
+
+        resolved_sum = (
+            stats["db_queries_executed"] +
+            stats["singleflight_coalesced"] +
+            stats["l1_double_check_hits"] +
+            stats["circuit_blocked"]
+        )
+        assert stats["db_fallbacks"] == resolved_sum
+
 
 
 

@@ -16,7 +16,6 @@ async def main():
         print(f"Status: {resp.status_code}, Body: {resp.text}")
 
         print("\n--- 2. chaos/db/down 호출 후 3개 노드 즉시 OPEN 확인 ---")
-        # Get baseline requests to prove no dummy nonces/requests were sent
         r_before = await client.get("http://localhost:8001/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         reqs_before = r_before.json()['stats']['requests']
 
@@ -45,7 +44,6 @@ async def main():
         print(f"Node-A CB State after 3 failures (should be OPEN): {r.json()['stats']['circuit_state']}")
         
         print("\n--- 5. Node-B 격리 상태에서 chaos/db/down 호출 동작 확인 ---")
-        # Bring everything up and heal
         await client.post("http://localhost:8080/chaos/db/up", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         await client.post("http://localhost:8080/chaos/partition/Node-B/heal", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         await asyncio.sleep(0.5)
@@ -61,7 +59,6 @@ async def main():
             r = await client.get(f"{node}/metrics", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
             print(f"{node} CB State: {r.json()['stats']['circuit_state']} (Partitioned: {r.json().get('is_partitioned')})")
 
-        # Cleanup
         await client.post("http://localhost:8080/chaos/partition/Node-B/heal", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
         await client.post("http://localhost:8080/chaos/db/up", headers={"X-Admin-Token": ADMIN_SECRET_TOKEN})
 

@@ -20,7 +20,7 @@ if not ADMIN_SECRET_TOKEN:
 HTTP_TIMEOUT_SEC = 5.0
 METRICS_STREAM_SLEEP_SEC = 1.0
 DDOS_REQUEST_COUNT = 60
-TEST_INVALIDATE_KEY = "a8f5f167f44f4964e6c998dee827110c"
+TEST_INVALIDATE_KEY = os.getenv("TEST_INVALIDATE_KEY", "a8f5f167f44f4964e6c998dee827110c")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -124,13 +124,18 @@ async def health():
 
 @app.get("/")
 async def get_index():
+    global index_html_cache
+    if index_html_cache:
+        return HTMLResponse(index_html_cache)
     file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "index.html")
     if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(f.read())
-    if index_html_cache is None:
-        return JSONResponse(status_code=503, content={"detail": "Service Unavailable - index.html not loaded"})
-    return HTMLResponse(index_html_cache)
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                index_html_cache = f.read()
+            return HTMLResponse(index_html_cache)
+        except Exception as e:
+            logging.error(f"Failed to read index.html on fallback: {e}")
+    return JSONResponse(status_code=503, content={"detail": "Service Unavailable - index.html not loaded"})
 
 @app.get("/chaos/auth_check")
 async def auth_check(request: Request):
@@ -408,6 +413,7 @@ async def chaos_audit():
         singleflight_coalesced = stats.get("singleflight_coalesced", 0)
         l1_double_check_hits = stats.get("l1_double_check_hits", 0)
         circuit_blocked = stats.get("circuit_blocked", 0)
+        pubkey_circuit_blocked = stats.get("pubkey_circuit_blocked", 0)
 
         # Invariant 1: Request Classification
         inv1_lhs = requests
@@ -423,12 +429,13 @@ async def chaos_audit():
         inv1_pass = (inv1_lhs == inv1_rhs)
 
         # Invariant 2: Strong DB Fallback
+        policy_circuit_blocked = circuit_blocked - pubkey_circuit_blocked
         inv2_lhs = db_fallbacks
         inv2_rhs = (
             db_queries_executed +
             singleflight_coalesced +
             l1_double_check_hits +
-            circuit_blocked
+            policy_circuit_blocked
         )
         inv2_pass = (inv2_lhs == inv2_rhs)
 
@@ -436,7 +443,7 @@ async def chaos_audit():
         if not node_pass:
             all_pass = False
 
-        saved_db = singleflight_coalesced + l1_double_check_hits + circuit_blocked
+        saved_db = singleflight_coalesced + l1_double_check_hits + policy_circuit_blocked
         db_load_reduction_ratio = round(saved_db / db_fallbacks, 4) if db_fallbacks > 0 else 0.0
         db_load_reduction_percentage = round((saved_db / db_fallbacks) * 100.0, 2) if db_fallbacks > 0 else 0.0
 
@@ -477,6 +484,7 @@ async def chaos_audit():
                     "singleflight_coalesced": singleflight_coalesced,
                     "l1_double_check_hits": l1_double_check_hits,
                     "circuit_blocked": circuit_blocked,
+                    "pubkey_circuit_blocked": pubkey_circuit_blocked,
                 }
             },
             "db_load_reduction_ratio": db_load_reduction_ratio,
