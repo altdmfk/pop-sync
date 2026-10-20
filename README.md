@@ -66,7 +66,7 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
    ├─ 4. PoP 서명 검증 (POP_VERIFY_ENABLED=true 시 활성화)
    │     ├─ X-PoP-Signature 헤더 누락 ───────────────────────────────────> 400 Missing PoP Signature (pop_rejected +1)
    │     ├─ 공개키 조회 (L1 → L2 → Policy DB /pubkey)
-   │     │     ├─ 서킷 브레이커 OPEN 상태 ───────────────────────────────> 503 Key Fetch Failed [Fail-Closed] (circuit_blocked +1, pop_rejected +1)
+   │     │     ├─ 서킷 브레이커 OPEN 상태 ───────────────────────────────> 503 Key Fetch Failed [Fail-Closed] (circuit_blocked +1, pubkey_circuit_blocked +1, pop_rejected +1)
    │     │     ├─ 미등록 SPIFFE ID (DB 404) ─────────────────────────────> 401 Unknown Key ID (pop_rejected +1)
    │     │     └─ DB 타임아웃/5xx (cb.record_failure) ───────────────────> 503 Key Fetch Failed (pop_rejected +1)
    │     └─ ECDSA P-256 서명 검증 실패 (위변조/타인 키) ─────────────────> 401 Invalid PoP Signature (pop_rejected +1)
@@ -200,7 +200,7 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
   3. **10초 경과 후 `HALF_OPEN` 원자적 단일 프로브 및 자동 복구 (`CB_RESET_TIMEOUT_SEC = 10s`)**:
      - DB가 복구된 후 마지막 실패 시점으로부터 **10초**가 지나면, 다음 캐시 미스 요청에서 서킷이 `OPEN` → `HALF_OPEN`으로 전환되어 DB 호출을 허용한다.
      - **원자적 단일 프로브 게이팅 (`_half_open_probe_in_flight`)**: `HALF_OPEN` 전이 시 동시 유입된 다수의 캐시 미스 요청 중 **오직 단 1건의 시험 요청만 원자적으로 프로브 슬롯을 획득**하여 백엔드 DB를 검증하며, 프로브 진행 중 유입되는 다른 동시 요청들은 `circuit_blocked`로 안전하게 차단되어 복구 중인 DB에 트래픽 쇄도(Thundering Herd)가 발생하는 것을 원천 방지한다.
-     - **취소 및 세마포어 과부하 데드락 방어**: 시험 프로브가 세마포어 타임아웃(`DBOverloadError`)이나 클라이언트 코루틴 취소(`asyncio.CancelledError`)를 겪더라도 `release_half_open_probe_if_unrecorded()`를 통해 프로브 슬롯이 즉시 반환되어 데드락 없이 다음 요청이 재시도할 수 있다.
+     - **취소 및 세마포어 과부하 데드락 방어**: 시험 프로브가 세마포어 타임아웃(`DBOverloadError`)이나 클라이언트 코루틴 취소(`asyncio.CancelledError`)를 겪더라도 `release_half_open_probe()`를 통해 프로브 슬롯이 즉시 반환되어 데드락 없이 다음 요청이 재시도할 수 있다.
      - **성공 시**: `cb.record_success()`가 호출되어 즉시 `CLOSED` 상태로 완전 복구(`failures = 0`, 프로브 슬롯 반환)되고, 정상 응답(`{"status": "allow", "source": "DB", "policy": "admin"}`)을 반환한다.
      - **실패 시**: `HALF_OPEN` 상태에서는 디바운스를 우회하여 **단 1회 실패만으로도 즉시 다시 `OPEN` 상태로 재개방**된다.
   4. **플래핑(Flapping) 방지 2.0초 디바운스 (`CB_DEBOUNCE_SEC = 2.0s`)**:
@@ -292,7 +292,7 @@ FIDO2 모델에서 영감을 받은 경량화된 ECDSA P-256 서명 검증(Reque
 | **8-3. 페이로드 위변조 / 타인 키** | `/other` 경로로 서명 후 `/auth` 호출, 또는 다른 개인키로 서명 | 공개키로 검증 시 해시 불일치 (`InvalidSignature`) | `401 Unauthorized` (`"Invalid PoP Signature"`) | `pop_rejected +1` |
 | **8-4. 미등록 클라이언트 키** | `X-SPIFFE-ID: spiffe://test/nokey` | Policy DB `GET /pubkey`가 `404 Key not found` 반환 | `401 Unauthorized` (`"Unknown Key ID"`) | `pop_rejected +1` |
 | **8-5. 리플레이된 Nonce 공격** | 이미 사용된 `X-Nonce` + 임의의 서명 전송 | **PoP 서명 검증 전에 Nonce 검사 단계에서 즉시 차단** (고비용 ECDSA 연산을 수행하지 않아 CPU 고갈 DoS 방어) | `401 Unauthorized` (`"Replay Detected"`) | `nonce_replays +1` (`pop_rejected`는 `0` 유지) |
-| **8-6. DB 장애 중 공개키 캐시 미스** | 서킷 `OPEN` 상태에서 L1/L2에 없는 신규 ID로 요청 | Nonce는 소진(Burn)된 후, `/pubkey` DB 폴백 전 `cb.can_execute()`에서 즉시 차단 (Fail-Closed) | `503 Service Unavailable` (`"Service Unavailable - Key Fetch Failed"`) | `circuit_blocked +1`, `pop_rejected +1` |
+| **8-6. DB 장애 중 공개키 캐시 미스** | 서킷 `OPEN` 상태에서 L1/L2에 없는 신규 ID로 요청 | Nonce는 소진(Burn)된 후, `/pubkey` DB 폴백 전 `cb.can_execute()`에서 즉시 차단 (Fail-Closed) | `503 Service Unavailable` (`"Service Unavailable - Key Fetch Failed"`) | `circuit_blocked +1`, `pubkey_circuit_blocked +1`, `pop_rejected +1` |
 
 ---
 
@@ -318,9 +318,11 @@ $$\text{requests} = \text{rate\_limited} + \text{nonce\_replays} + \text{pop\_re
 - Redis 장애로 인해 Rate Limit 또는 Nonce 단계에서 `503`으로 조기 차단된 요청도 `redis_outage_blocked`에 집계되므로 장애 중에도 항상 `Pass`를 유지한다.
 
 ### 2. DB 폴백 강한 불변식 (Strong DB Fallback Invariant)
-L1과 L2 캐시를 모두 미스하여 DB 폴백 단계로 진입한 요청(`db_fallbacks`)은 아래 4개 내부 처리 경로의 합과 항상 일치한다:
+L1과 L2 캐시를 모두 미스하여 DB 폴백 단계로 진입한 요청(`db_fallbacks`)은 아래 내부 처리 경로의 합과 항상 일치한다:
 
-$$\text{db\_fallbacks} = \text{db\_queries\_executed} + \text{singleflight\_coalesced} + \text{l1\_double\_check\_hits} + \text{circuit\_blocked}$$
+$$\text{db\_fallbacks} = \text{db\_queries\_executed} + \text{singleflight\_coalesced} + \text{l1\_double\_check\_hits} + (\text{circuit\_blocked} - \text{pubkey\_circuit\_blocked})$$
+
+- PoP 서명 검증(`POP_VERIFY_ENABLED=true`) 중 공개키 캐시 미스로 인해 서킷 브레이커에서 차단된 요청(`pubkey_circuit_blocked`)은 정책 DB 폴백 경로(`db_fallbacks`)와 독립적이므로, 전체 `circuit_blocked`에서 이를 차감한 순수 정책 DB 서킷 차단 건수(`policy_circuit_blocked`)를 합산하여 강한 불변식이 엄격하게 성립한다.
 
 - **대시보드 구성**:
   - **상단 Active Faults 바**: 현재 주입된 장애(`Redis: Down`, `Policy DB: Down`, `Node-B: Isolated`) 표시 및 `Reset All Faults (전체 정상 복구)` 원클릭 복구 버튼 제공.
@@ -366,7 +368,7 @@ source .venv/bin/activate  # (Windows: .\.venv\Scripts\activate)
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
 
-# 단위 및 경계 테스트 실행 (Docker 불필요, Mock 기반으로 51개 테스트 즉시 실행)
+# 단위 및 경계 테스트 실행 (Docker 불필요, Mock 기반으로 59개 테스트 즉시 실행)
 pytest -v
 
 # E2E 시나리오 테스트 실행 (실제 Docker 클러스터 구동 필요)

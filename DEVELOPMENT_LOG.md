@@ -186,7 +186,7 @@
   - `can_execute()` 내부에서 `OPEN` -> `HALF_OPEN` 전이 시 또는 기존 `HALF_OPEN` 상태에서 `_half_open_probe_in_flight == False`일 때, `self._lock` 보호 아래 원자적으로 `_half_open_probe_in_flight = True`를 마킹하고 단 1건의 시험 요청만 `True`를 반환하도록 게이팅했다.
   - 프로브 실행 중 유입된 후속 동시 요청에는 `(False, "HALF_OPEN")`을 반환하여 Policy DB 호출을 차단하고 `stats["circuit_blocked"]` 및 `stats["db_fallbacks"]`를 증가시켜 기존 강한 DB Fallback Invariant 및 대시보드 Invariant 방정식을 100% 보존했다.
   - `record_success()`, `record_failure()`, `force_state()`, `force_open()`, `force_close()`, `reset()` 시 `_half_open_probe_in_flight`를 `False`로 초기화하도록 보장했다.
-  - 시험 프로브가 `DBOverloadError`(세마포어 타임아웃) 또는 코루틴 취소(`asyncio.CancelledError`)를 겪어 성공/실패가 기록되지 않은 채 중단되더라도 데드락이 발생하지 않도록 `finally` 블록에서 `release_half_open_probe_if_unrecorded()`를 호출하여 슬롯을 즉시 반환하도록 구현했다.
+  - 시험 프로브가 `DBOverloadError`(세마포어 타임아웃) 또는 코루틴 취소(`asyncio.CancelledError`)를 겪어 성공/실패가 기록되지 않은 채 중단되더라도 데드락이 발생하지 않도록 `finally` 블록에서 `release_half_open_probe()`를 호출하여 슬롯을 즉시 반환하도록 구현했다.
   - `test_half_open_allows_strictly_single_probe_under_concurrency`, `test_half_open_probe_slot_released_on_cancellation_or_overload`, `test_circuit_breaker_single_probe_direct_unit` 단위 테스트로 검증했다.
 
 ### 5.2 슬라이딩 윈도우 Rate Limiter 429 카운터 오염 방지 (Check-Before-Increment)
@@ -223,11 +223,31 @@
   - `control_plane.py`에 `GET /chaos/audit` 엔드포인트를 구현했다(`admin_auth_middleware`에 의해 `X-Admin-Token` 인증 적용).
   - 전 게이트웨이 노드의 `/metrics`를 동시 조회(`fetch_metrics()`)하여 온라인 노드별로 아래 항목을 수학적으로 엄격 검증했다:
     - **Invariant 1 (요청 분류 불변식)**: `requests == rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked`
-    - **Invariant 2 (강한 DB 폴백 불변식)**: `db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + circuit_blocked`
+    - **Invariant 2 (강한 DB 폴백 불변식)**: `db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + policy_circuit_blocked` (여기서 `policy_circuit_blocked = circuit_blocked - pubkey_circuit_blocked`)
     - **부하 절감 및 관측 지표**: `db_load_reduction_percentage`(Single-Flight + L1 Double-Check + 서킷 차단 절감 비율), `cache_hit_ratio_pct`, `singleflight_coalescing_ratio_pct`, `circuit_state`
   - 전체 온라인 노드가 불변식을 통과했는지 여부를 최상위 `overall_invariant_pass: bool` 필드로 즉시 반환하도록 구현했다.
   - `test_chaos_audit_auth_protection`, `test_chaos_audit_healthy_and_degraded_nodes`, `test_chaos_audit_invariant_mismatch_failure` 단위 테스트로 검증했다.
-  - 최종 `pytest -v` 실행 결과 51 passed(12 deselected)를 달성했다.
+
+### 5.5 감사 결함 수정 및 불변식·복원력 무결성 보강 (Audit & Resilience Hardening)
+- **`/pubkey` 서킷 브레이커 차단 시 `pubkey_circuit_blocked` 분리 집계를 통한 Invariant 2 정합성 보장 및 `HALF_OPEN` 404 응답 시 정상 복구(`CLOSED`) 처리**:
+  - `gateway.py`의 PoP 공개키 조회 경로에서 서킷 브레이커 차단 시 `stats["circuit_blocked"]`뿐만 아니라 `stats["pubkey_circuit_blocked"]`를 독립 카운터로 분리 집계하도록 개선함.
+  - 공개키 미스 차단은 정책 DB 폴백 경로(`db_fallbacks`)와 무관하므로, `control_plane.py:chaos_audit`의 Invariant 2 방정식에서 `policy_circuit_blocked = circuit_blocked - pubkey_circuit_blocked`로 차감하여 `db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + policy_circuit_blocked` 정합성을 무결하게 보장함 (`tests/test_pop.py::test_pop_pubkey_circuit_breaker_invariant_2`).
+  - 또한 Policy DB가 `/pubkey` 조회에 대해 404(미등록 키)를 반환하는 경우, DB 인프라 자체는 정상 통신 가능한 상태이므로 `cb.record_failure()` 대신 `cb.record_success()`를 호출하여 `HALF_OPEN` 상태에서 `CLOSED`로 정상 복구되도록 처리함 (`tests/test_pop.py::test_pop_pubkey_404_half_open_transitions_to_closed`).
+- **`/auth` 헤더 누락(401) 및 클라이언트 연결 종료(`CancelledError`) 시 Invariant 1 무결성 보장**:
+  - `request.state.entered_pipeline` 플래그를 도입하여 필수 헤더(`Authorization`, `X-Nonce`, `X-SPIFFE-ID`) 누락으로 401 반환되는 조기 거부 요청이 완료 요청 카운터(`requests`)에 가산되는 현상을 차단함.
+  - 클라이언트 연결 조기 종료(`asyncio.CancelledError`)나 미들웨어/헤더 조기 반환 시 불필요한 메트릭 드리프트를 방지하여, Invariant 1 (`requests == rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked`)의 상호 배타적 분류 합계가 정확히 일치하도록 보장함 (`tests/test_pop.py::test_pop_missing_header_zero_drift_invariant_1`, `tests/test_singleflight.py::test_follower_cancellation_zero_drift_invariant_1`).
+- **`SLIDING_RL_LUA` 경계 가중치(`1` permille) 정규화 오차(`>` $\rightarrow$ `>=`) 수정**:
+  - `SLIDING_RL_LUA`에서 가중치 인자 정규화 조건식 `if weight >= 1 then weight = weight / 1000.0 end`로 수정함. 기존 `weight > 1` 조건으로 인해 윈도우 99.9% 경과 시점의 잔여 가중치 `1` permille(0.001)이 나눗셈 없이 1.0(100%)으로 오판정되어 정상 요청이 429로 거부되던 정규화 오차를 완전 해소함 (`tests/test_rate_limit.py::test_sliding_window_lua_weight_boundary_999`).
+- **Redis Streams 비정상 인코딩(Poison Message) 격리(`XACK`) 및 Catch-up 상한 보호**:
+  - `gateway.py`의 `_process_stream_messages`에서 스트림 키 디코딩 실패(손상된 바이트열/Poison Message) 발생 시 경고 로그를 남기고 즉시 `XACK` 처리하여 컨슈머 루프 행(Hang) 및 무한 재시도를 방지함 (`tests/test_stream_listener.py::test_stream_listener_undecodable_stream_key_acked_and_logged`).
+  - 파티션 복구 Catch-up 루프에 최대 배치 처리 상한(`max_claim_rounds = 100`, `max_catchup_batches = 100`)을 적용하여 비정상 스트림 쇄도 시 컨슈머 무한 루프 폭주를 원천 차단함.
+
+### 5.6 코드 위생 정리 및 테스트 격리 (Code Hygiene Cleanup)
+- **`[HYGIENE-01]`**: `control_plane.py:get_index`에서 인메모리 `index_html_cache`를 우선 반환하여 매 `GET /` 요청마다 발생하던 블로킹 디스크 I/O를 제거하고, 미적재 시에만 파일 읽기 폴백 수행.
+- **`[HYGIENE-02]`**: `tests/conftest.py:clean_gateway_state`에서 `stats["last_catchup"]` 6개 필드(`pending_count`, `pel_drained`, `autoclaimed`, `new_drained`, `duration_ms`, `timestamp`) 및 신규 카운터(`pubkey_circuit_blocked` 등)를 전수 리셋하여 테스트 간 텔레메트리 누수를 원천 차단.
+- **`[HYGIENE-03]`**: `gateway.py`의 중복 별칭 `release_half_open_probe_if_unrecorded()`를 제거하고 `release_half_open_probe()`로 단일화, `force_cb_state`의 미사용 `request: Request` 매개변수 제거.
+- **`[HYGIENE-04]`**: `control_plane.py`의 `TEST_INVALIDATE_KEY` 및 `gateway.py`의 `DUMMY_REDIS_URL`을 `os.getenv` 기본값을 갖는 모듈 전역 상수로 추출.
+- 단위 테스트 실행 결과: 총 59개 전건 통과 (`59 passed, 12 deselected`).
 
 
 
