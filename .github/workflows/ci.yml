@@ -24,7 +24,7 @@ jobs:
         if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
         
     # E2E scripts (test_scenarios, test_rl_fallback, measure_*) need the docker cluster.
-    # Do NOT run them in CI. Run only unit tests here.
+    # Run unit tests and chaos audit invariant verification here.
     - name: Run Unit Tests
       run: |
-        pytest tests/test_singleflight.py tests/test_rate_limit.py tests/test_pop.py -v
+        pytest tests/test_singleflight.py tests/test_rate_limit.py tests/test_pop.py tests/test_chaos_audit.py -v
