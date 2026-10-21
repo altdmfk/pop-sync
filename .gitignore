@@ -79,3 +79,8 @@ docker-compose.override.yml
 *.bak
 
 .venv*/
+
+# Presentation & PPT assets
+presentation/
+ppt/
+*.pptx
