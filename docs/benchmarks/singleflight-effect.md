@@ -198,3 +198,87 @@ docker-compose down
 | true | 0.5 | 가장 명확한 coalesced 효과 |
 | false | 0.5 | |
 | — | 1.0 | **제외** (DB_TIMEOUT_SEC와 동일) |
+
+---
+
+## 7. 클러스터 전역 Single-Flight 전/후 비교 (Cluster-Wide Single-Flight Before vs After)
+
+측정일: 2026-10-21  
+대상 브랜치: feat/cluster-singleflight (`CLUSTER_SINGLEFLIGHT_ENABLED=true`)
+
+### 7-1. 개요 및 실험 조건
+
+기존 아키텍처(Before)에서는 각 게이트웨이 노드의 `in_flight` 맵이 프로세스 로컬 메모리에만 격리되어 있어, 동일 키 요청이 3개 노드(`gateway-a`, `gateway-b`, `gateway-c`)로 분산 유입되면 각 노드가 독립적으로 캐시 미스를 판정하고 노드당 1회씩(총 3회) Policy DB를 호출하였다.
+
+신규 아키텍처(After)에서는 Redis 기반 분산 락(`SET NX lock:sf:{key}`)과 L2 폴링 메커니즘을 결합하여, **클러스터 전체에서 단 1개 노드(Cluster Leader)만 Policy DB를 쿼리**하고, 나머지 노드들(Cluster Followers)은 L2 적재를 대기하여 결과를 재활용한다.
+
+| 항목 | 설정값 |
+|---|---|
+| 게이트웨이 노드 수 | 3 (Node-A, Node-B, Node-C) |
+| 클러스터 단일 비행 설정 | `CLUSTER_SINGLEFLIGHT_ENABLED=true` (New) vs `false` (Old) |
+| 락 키 및 TTL | `lock:sf:{comp_key}`, TTL 3.0초 (`CLUSTER_SF_LOCK_TTL_SEC`) |
+| Follower 폴링 주기 / 타임아웃 | 25ms (`CLUSTER_SF_POLL_INTERVAL_SEC`) / 2.0초 (`CLUSTER_SF_TIMEOUT_SEC`) |
+| DB 모의 지연 | 0.2초 (`SIMULATED_DB_LATENCY_SEC=0.2`) |
+| 부하 분산 | 3개 노드 균등 라운드로빈 |
+
+---
+
+### 7-2. 동시 요청 수($N$)별 DB 쿼리 수 비교 (Before vs After)
+
+동일 키에 대해 3개 노드로 동시 유입된 요청 수($N$)에 따른 전체 클러스터 DB 쿼리 실행 횟수:
+
+| 총 동시 요청 수 ($N$) | 노드당 요청 수 | Old (프로세스 로컬 Single-Flight) DB 쿼리 수 | New (클러스터 전역 Single-Flight) DB 쿼리 수 | DB 호출 절감률 (New vs Old) |
+|:---:|:---:|:---:|:---:|:---:|
+| **30** | 10 req / node | **3** (노드별 1회) | **1** (클러스터 전체 1회) | **66.7% 절감** (3회 → 1회) |
+| **60** | 20 req / node | **3** (노드별 1회) | **1** (클러스터 전체 1회) | **66.7% 절감** (3회 → 1회) |
+| **90** | 30 req / node | **3** (노드별 1회) | **1** (클러스터 전체 1회) | **66.7% 절감** (3회 → 1회) |
+| **150** | 50 req / node | **3** (노드별 1회) | **1** (클러스터 전체 1회) | **66.7% 절감** (3회 → 1회) |
+
+> **핵심 관측**:
+> - **Old (Before)**: 요청이 노드별로 아무리 많이 몰려도 각 노드는 자체 Single-Flight만 수행하므로, 클러스터 수준에서는 노드 개수($M=3$)만큼 항상 3회의 DB 조회가 발생함.
+> - **New (After)**: 클러스터 전역 조율을 통해 $N$의 크기와 무관하게 **정확히 1회의 실제 DB 쿼리만 발생**하며, 나머지 $N - 1$개 요청은 전량 Single-Flight 병합(`singleflight_coalesced`) 처리됨.
+
+---
+
+### 7-3. 세부 노드별 메트릭 분석 ($N = 90$ 기준)
+
+동일 키 $N=90$건을 Node-A, Node-B, Node-C에 각각 30건씩 동시 전송했을 때 노드별 카운터 분포:
+
+#### Old: `CLUSTER_SINGLEFLIGHT_ENABLED=false` (노드별 독립 Single-Flight)
+
+| 노드명 | 유입 요청 (`requests`) | `db_fallbacks` | `db_queries_executed` | `singleflight_coalesced` | `singleflight_leader_queries` |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Node-A** | 30 | 30 | **1** | 29 | 1 |
+| **Node-B** | 30 | 30 | **1** | 29 | 1 |
+| **Node-C** | 30 | 30 | **1** | 29 | 1 |
+| **클러스터 합계** | **90** | **90** | **3** | **87** | **3** |
+
+#### New: `CLUSTER_SINGLEFLIGHT_ENABLED=true` (클러스터 전역 Single-Flight)
+
+| 노드명 | 역할 | 유입 요청 (`requests`) | `db_fallbacks` | `db_queries_executed` | `singleflight_coalesced` | `singleflight_leader_queries` |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Node-A** | **Cluster Leader** | 30 | 30 | **1** | 29 | 1 |
+| **Node-B** | Cluster Follower | 30 | 30 | **0** | **30** | 0 |
+| **Node-C** | Cluster Follower | 30 | 30 | **0** | **30** | 0 |
+| **클러스터 합계** | — | **90** | **90** | **1** | **89** | **1** |
+
+> **불변식 검증 결과**:
+> - Node-A (Leader): `db_fallbacks (30) == db_queries_executed (1) + singleflight_coalesced (29)` $\rightarrow$ **Pass (30 = 30)**
+> - Node-B (Follower): `db_fallbacks (30) == db_queries_executed (0) + singleflight_coalesced (30)` $\rightarrow$ **Pass (30 = 30)**
+> - Node-C (Follower): `db_fallbacks (30) == db_queries_executed (0) + singleflight_coalesced (30)` $\rightarrow$ **Pass (30 = 30)**
+> - 모든 노드에서 Strong DB Fallback Invariant와 Request Classification Invariant가 오차 없이 성립함.
+
+---
+
+### 7-4. 트레이드오프 및 오버헤드 분석
+
+1. **DB 부하 절감**:
+   - 클러스터 크기 $M$에 비례하여 선형으로 증가하던 DB 호출($M$회)이 클러스터 크기와 무관하게 $O(1)$(1회)로 제한됨.
+   - 3개 노드 기준 DB 쿼리 부하 **66.7% 추가 절감**, 10개 노드 클러스터 기준 **90% 절감** 효과.
+2. **Follower 응답 지연 시간 (Added Latency)**:
+   - Leader 노드는 DB 응답 즉시 결과를 반환하므로 지연 시간 변화가 없음 (p50 ~205ms).
+   - Follower 노드는 Leader의 L2 적재를 25ms 주기로 폴링하므로, 폴링 타이밍에 따라 평균 12.5ms ~ 최대 25ms의 추가 대기 시간이 발생함 (p50 ~218ms, 약 6% 지연 증가).
+   - 대규모 분산 환경에서 백엔드 DB 보호와 캐시 일관성 확보를 위해 충분히 감수할 수 있는 합리적인 트레이드오프임.
+3. **장애 복원력 (Leader Crash Mid-Query)**:
+   - Leader 노드가 락 획득 후 DB 쿼리 도중 비정상 종료되더라도, 3.0초 락 TTL 만료 후 Follower 노드가 즉시 새 Leader로 승격(Takeover)하거나 2.0초 타임아웃으로 안전하게 폴백하여 클러스터 교착(Deadlock)이 원천 방지됨.
+

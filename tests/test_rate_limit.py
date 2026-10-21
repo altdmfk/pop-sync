@@ -511,3 +511,38 @@ async def test_sliding_window_lua_weight_boundary_999(monkeypatch):
     assert captured_args[0][1][1] == "1"
 
 
+@pytest.mark.asyncio
+async def test_fixed_window_decr_rollback_logging(monkeypatch, caplog):
+    import logging
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(gateway, "RL_ALGORITHM", "fixed")
+    monkeypatch.setattr(gateway, "RL_LIMIT", 5)
+
+    mock_redis = MagicMock()
+
+    class MockPipeline:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        def incr(self, key):
+            pass
+
+        def expire(self, key, ttl):
+            pass
+
+        async def execute(self):
+            return [10]
+
+    mock_redis.pipeline.return_value = MockPipeline()
+    mock_redis.decr = AsyncMock(side_effect=RuntimeError("Redis connection dropped during decr"))
+
+    with patch("gateway.get_redis_client", return_value=mock_redis), \
+         patch("gateway.time.time", return_value=1000.0), \
+         caplog.at_level(logging.DEBUG):
+        result = await gateway.check_rate_limit("client-fail-rollback")
+
+    assert result is False
+    assert "Rate limit decr rollback failed for rl:client-fail-rollback:100: Redis connection dropped during decr" in caplog.text

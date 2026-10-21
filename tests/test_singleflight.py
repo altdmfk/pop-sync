@@ -97,6 +97,114 @@ async def test_leader_cancellation(mock_common_dependencies):
         assert stats["singleflight_coalesced"] == 1
 
 @pytest.mark.asyncio
+async def test_singleflight_off_cancellation_aborts_db_call(mock_common_dependencies, monkeypatch):
+    """
+    Regression test: When SINGLEFLIGHT_ENABLED is False, disconnecting a client
+    mid-request must propagate cancellation to abort the DB query, preventing
+    orphaned background execution and resource leaks.
+    """
+    import gateway
+    monkeypatch.setattr(gateway, "SINGLEFLIGHT_ENABLED", False)
+
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
+
+    db_interrupted = False
+
+    async def interruptible_db_call(*args, **kwargs):
+        nonlocal db_interrupted
+        try:
+            await asyncio.sleep(0.3)
+            return {"status": "allow", "role": "admin"}
+        except asyncio.CancelledError:
+            db_interrupted = True
+            raise
+
+    m_db.side_effect = interruptible_db_call
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {
+            "Authorization": "Bearer token",
+            "X-SPIFFE-ID": "spiffe://test_off_cancel",
+            "X-Nonce": "nonce-cancel-1"
+        }
+
+        req_task = asyncio.create_task(client.get("/auth", headers=headers))
+        await asyncio.sleep(0.05)
+
+        # Client disconnects mid-request
+        req_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await req_task
+
+        # Ensure event loop processes cancellation
+        await asyncio.sleep(0.05)
+
+        assert db_interrupted is True
+
+        # Assert mathematical invariants post-cancellation
+        assert stats["requests"] == (
+            stats["rate_limited"]
+            + stats["nonce_replays"]
+            + stats["pop_rejected"]
+            + stats["l1_hits"]
+            + stats["l2_hits"]
+            + stats["db_fallbacks"]
+            + stats["redis_outage_blocked"]
+        )
+        assert stats["db_fallbacks"] == (
+            stats["db_queries_executed"]
+            + stats["singleflight_coalesced"]
+            + stats["l1_double_check_hits"]
+            + (stats["circuit_blocked"] - stats["pubkey_circuit_blocked"])
+        )
+
+@pytest.mark.asyncio
+async def test_singleflight_on_leader_cancellation_does_not_abort_db_call(mock_common_dependencies):
+    """
+    Constraint verification: When SINGLEFLIGHT_ENABLED is True, leader cancellation
+    does NOT abort the DB call because asyncio.shield protects it for followers.
+    """
+    _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
+
+    db_interrupted = False
+
+    async def interruptible_db_call(*args, **kwargs):
+        nonlocal db_interrupted
+        try:
+            await asyncio.sleep(0.2)
+            return {"status": "allow", "role": "admin"}
+        except asyncio.CancelledError:
+            db_interrupted = True
+            raise
+
+    m_db.side_effect = interruptible_db_call
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {
+            "Authorization": "Bearer token",
+            "X-SPIFFE-ID": "spiffe://test_on_cancel",
+            "X-Nonce": "nonce-on-cancel-1"
+        }
+
+        leader_task = asyncio.create_task(client.get("/auth", headers=headers))
+        await asyncio.sleep(0.05)
+
+        follower_task = asyncio.create_task(client.get("/auth", headers=headers))
+        await asyncio.sleep(0.05)
+
+        leader_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader_task
+
+        follower_resp = await follower_task
+        assert follower_resp.status_code == 200
+        assert follower_resp.json()["policy"] == "admin"
+        assert db_interrupted is False
+
+@pytest.mark.asyncio
 async def test_loader_failure(mock_common_dependencies):
     _m_rl, _m_nonce, m_redis, m_db = mock_common_dependencies
     

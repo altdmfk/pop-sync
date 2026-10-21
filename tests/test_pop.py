@@ -3,6 +3,7 @@ import asyncio
 from httpx import AsyncClient, ASGITransport
 import uuid
 import base64
+import hashlib
 from unittest.mock import patch, AsyncMock
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -10,7 +11,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature, decode_dss_signature
 
-from gateway import app, l1_cache, stats, stats_lock, POP_EXECUTOR_WORKERS
+from gateway import app, l1_cache, stats, stats_lock, POP_EXECUTOR_WORKERS, generate_canonical_payload
 import gateway
 
 def generate_keypair():
@@ -18,15 +19,30 @@ def generate_keypair():
     pub = priv.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
     return priv, pub
 
-def sign_payload(priv, method, path, spiffe_id, nonce):
-    canonical = f"{method.upper()}\n{path}\n{spiffe_id}\n{nonce}".encode("utf-8")
+def sign_payload(priv, method, path, spiffe_id, nonce, query="", body=b"", body_digest=None):
+    if body_digest is None:
+        body_digest = hashlib.sha256(body).hexdigest()
+    elif body_digest.startswith("sha256="):
+        body_digest = body_digest.split("=", 1)[1]
+    canonical = generate_canonical_payload(
+        method,
+        path,
+        query=query,
+        body_digest=body_digest,
+        spiffe_id=spiffe_id,
+        nonce=nonce,
+    )
     sig = priv.sign(canonical, ec.ECDSA(hashes.SHA256()))
     r, s = decode_dss_signature(sig)
     raw_sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
     return base64.urlsafe_b64encode(raw_sig).decode().rstrip("=")
 
+@pytest.fixture
+def empty_body_digest():
+    return f"sha256={hashlib.sha256(b'').hexdigest()}"
+
 @pytest.mark.asyncio
-async def test_pop_valid_signature(mock_common_dependencies, monkeypatch):
+async def test_pop_valid_signature(mock_common_dependencies, monkeypatch, empty_body_digest):
     monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
     priv, pub = generate_keypair()
     monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
@@ -40,7 +56,8 @@ async def test_pop_valid_signature(mock_common_dependencies, monkeypatch):
             "Authorization": "Bearer token1",
             "X-SPIFFE-ID": spiffe_id,
             "X-Nonce": nonce,
-            "X-PoP-Signature": sig_b64
+            "X-PoP-Signature": sig_b64,
+            "X-Body-Digest": empty_body_digest,
         })
         
         assert res.status_code == 200
@@ -356,4 +373,146 @@ async def test_pop_signature_invalid_length_mod_4_equals_1(mock_common_dependenc
         assert "Invalid PoP Signature" in res.text
         assert stats["pop_rejected"] == 1
 
+
+@pytest.mark.asyncio
+async def test_pop_query_tampering_regression(mock_common_dependencies, monkeypatch, empty_body_digest):
+    """
+    Regression test (Task 4):
+    Sign a request for /auth?amount=10, then replay the same signature against
+    /auth?amount=10000 (same method, path, spiffe-id, nonce).
+    Assert that verification fails (401 Invalid PoP Signature), closing the
+    query-string tampering gap.
+    """
+    monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
+    priv, pub = generate_keypair()
+    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
+
+    spiffe_id = "spiffe://test/valid"
+    nonce = str(uuid.uuid4())
+    # Sign for /auth?amount=10
+    sig_b64 = sign_payload(priv, "GET", "/auth", spiffe_id, nonce, query="amount=10")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        # Replay the same signature against /auth?amount=10000
+        res = await client.get("/auth?amount=10000", headers={
+            "Authorization": "Bearer token1",
+            "X-SPIFFE-ID": spiffe_id,
+            "X-Nonce": nonce,
+            "X-PoP-Signature": sig_b64,
+            "X-Body-Digest": empty_body_digest,
+        })
+
+        assert res.status_code == 401
+        assert "Invalid PoP Signature" in res.text
+        assert stats["pop_rejected"] == 1
+        assert stats["pop_verified"] == 0
+        assert stats["requests"] == (
+            stats["rate_limited"] + stats["nonce_replays"] + stats["pop_rejected"] +
+            stats["l1_hits"] + stats["l2_hits"] + stats["db_fallbacks"] +
+            stats["redis_outage_blocked"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_pop_query_param_valid_signature(mock_common_dependencies, monkeypatch, empty_body_digest):
+    """Verify that a request with query parameters succeeds when signed correctly."""
+    monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
+    priv, pub = generate_keypair()
+    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
+
+    spiffe_id = "spiffe://test/valid"
+    nonce = str(uuid.uuid4())
+    sig_b64 = sign_payload(priv, "GET", "/auth", spiffe_id, nonce, query="amount=10")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.get("/auth?amount=10", headers={
+            "Authorization": "Bearer token1",
+            "X-SPIFFE-ID": spiffe_id,
+            "X-Nonce": nonce,
+            "X-PoP-Signature": sig_b64,
+            "X-Body-Digest": empty_body_digest,
+        })
+
+        assert res.status_code == 200
+        assert stats["pop_verified"] == 1
+        assert stats["pop_rejected"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pop_body_digest_mismatch(mock_common_dependencies, monkeypatch):
+    """Verify that a mismatched X-Body-Digest header fails with 400 Body digest mismatch."""
+    monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
+    priv, pub = generate_keypair()
+    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
+
+    spiffe_id = "spiffe://test/valid"
+    nonce = str(uuid.uuid4())
+    tampered_digest = "1" * 64
+    sig_b64 = sign_payload(priv, "GET", "/auth", spiffe_id, nonce, body_digest=tampered_digest)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.get("/auth", headers={
+            "Authorization": "Bearer token1",
+            "X-SPIFFE-ID": spiffe_id,
+            "X-Nonce": nonce,
+            "X-PoP-Signature": sig_b64,
+            "X-Body-Digest": f"sha256={tampered_digest}",
+        })
+
+        assert res.status_code == 400
+        assert "Body digest mismatch" in res.text
+        assert stats["pop_rejected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pop_body_digest_invalid_format(mock_common_dependencies, monkeypatch):
+    """Verify that a malformed X-Body-Digest header without sha256= prefix fails with 400."""
+    monkeypatch.setattr(gateway, "POP_VERIFY_ENABLED", True)
+    priv, pub = generate_keypair()
+    monkeypatch.setattr(gateway, "TEST_PUBLIC_KEY", pub, raising=False)
+
+    spiffe_id = "spiffe://test/valid"
+    nonce = str(uuid.uuid4())
+    sig_b64 = sign_payload(priv, "GET", "/auth", spiffe_id, nonce)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        res = await client.get("/auth", headers={
+            "Authorization": "Bearer token1",
+            "X-SPIFFE-ID": spiffe_id,
+            "X-Nonce": nonce,
+            "X-PoP-Signature": sig_b64,
+            "X-Body-Digest": "invalid_digest_without_prefix",
+        })
+
+        assert res.status_code == 400
+        assert "Missing or invalid X-Body-Digest header" in res.text
+        assert stats["pop_rejected"] == 1
+
+def test_generate_canonical_payload_explicit_args_validation():
+    # 0 args: valid (method, path + kwargs)
+    payload0 = generate_canonical_payload('GET', '/auth', query='foo=1')
+    assert b'GET\n/auth\nfoo=1\n' in payload0
+
+    # 2 args: valid (method, path, spiffe_id, nonce)
+    payload2 = generate_canonical_payload('GET', '/auth', 'spiffe://user', 'nonce-1')
+    assert b'GET\n/auth\n\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nspiffe://user\nnonce-1' == payload2
+
+    # 4 args: valid (method, path, query, body_digest, spiffe_id, nonce)
+    payload4 = generate_canonical_payload('GET', '/auth', 'q=1', 'sha256=digest', 'spiffe://user', 'nonce-1')
+    assert b'GET\n/auth\nq=1\ndigest\nspiffe://user\nnonce-1' == payload4
+
+    # 1 arg: INVALID -> raises TypeError
+    with pytest.raises(TypeError) as exc1:
+        generate_canonical_payload('GET', '/auth', 'single_extra_arg')
+    assert 'generate_canonical_payload() accepts 2, 4, or 6 positional arguments (3 given)' in str(exc1.value)
+
+    # 3 args: INVALID -> raises TypeError
+    with pytest.raises(TypeError) as exc3:
+        generate_canonical_payload('GET', '/auth', 'arg1', 'arg2', 'arg3')
+    assert 'generate_canonical_payload() accepts 2, 4, or 6 positional arguments (5 given)' in str(exc3.value)
+
+    # 5 args: INVALID -> raises TypeError
+    with pytest.raises(TypeError) as exc5:
+        generate_canonical_payload('GET', '/auth', '1', '2', '3', '4', '5')
+    assert 'generate_canonical_payload() accepts 2, 4, or 6 positional arguments (7 given)' in str(exc5.value)
 

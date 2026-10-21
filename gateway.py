@@ -7,10 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import hashlib
 import hmac
+import inspect
 import logging
 import os
 import threading
 import time
+import uuid
 from typing import Any, Optional, Tuple
 
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
@@ -77,6 +79,10 @@ redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 db_url    = os.getenv("DB_URL",    "http://localhost:8000")
 DB_MODE   = os.getenv("DB_MODE",   "sync")
 SINGLEFLIGHT_ENABLED = os.getenv("SINGLEFLIGHT_ENABLED", "true").lower() == "true"
+CLUSTER_SINGLEFLIGHT_ENABLED = os.getenv("CLUSTER_SINGLEFLIGHT_ENABLED", "true").lower() == "true"
+CLUSTER_SF_LOCK_TTL_SEC      = _float("CLUSTER_SF_LOCK_TTL_SEC", 3.0)
+CLUSTER_SF_POLL_INTERVAL_SEC = _float("CLUSTER_SF_POLL_INTERVAL_SEC", 0.025)
+CLUSTER_SF_TIMEOUT_SEC       = _float("CLUSTER_SF_TIMEOUT_SEC", 2.0)
 
 STREAM_GROUP = f"gateway_group_{node_name}"
 
@@ -428,8 +434,7 @@ async def check_rate_limit(client_id: str) -> bool:
 
     Redis path (normal): uses RL_ALGORITHM ("sliding" or "fixed") with Check-Before-Increment.
     Local fallback path (Redis down): always uses sliding approximation with
-    RL_FALLBACK_LIMIT as the threshold.  Errors from this path are re-raised so
-    the caller can decide (currently: 503 for Redis failure, 429 for RL exceeded).
+    RL_FALLBACK_LIMIT as the threshold.
     """
     now = time.time()
     window_key = int(now) // RL_WINDOW_SEC
@@ -449,15 +454,16 @@ async def check_rate_limit(client_id: str) -> bool:
             return int(res) == 1 or (int(res) <= RL_LIMIT and int(res) != 0)
         else:
             key = f"rl:{client_id}:{window_key}"
-            async with get_redis_client().pipeline(transaction=True) as pipe:
+            r = get_redis_client()
+            async with r.pipeline(transaction=True) as pipe:
                 pipe.incr(key)
                 pipe.expire(key, RL_WINDOW_SEC * RL_EXPIRE_MULTIPLIER)
                 results = await pipe.execute()
             if results[0] > RL_LIMIT:
                 try:
-                    await get_redis_client().decr(key)
-                except Exception:
-                    pass
+                    await r.decr(key)
+                except Exception as e:
+                    logging.debug(f"Rate limit decr rollback failed for {key}: {e}")
                 return False
             return True
 
@@ -534,13 +540,47 @@ async def db_async_call(key: str, sid: str, res: str):
     resp.raise_for_status()
     return resp.json()
 
+async def release_cluster_lock(client: Optional[Redis], lock_key: str, lock_token: str):
+    """Safely release the cluster single-flight lock using fencing token comparison."""
+    if client is None:
+        return
+    try:
+        release_script = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+"""
+        if hasattr(client, "eval"):
+            res = client.eval(release_script, 1, lock_key, lock_token)
+            if inspect.isawaitable(res):
+                await res
+        elif hasattr(client, "get") and hasattr(client, "delete"):
+            curr_val = client.get(lock_key)
+            if inspect.isawaitable(curr_val):
+                curr_val = await curr_val
+            if curr_val is not None:
+                norm_val = curr_val.decode("utf-8") if isinstance(curr_val, bytes) else str(curr_val)
+                if norm_val == lock_token:
+                    del_res = client.delete(lock_key)
+                    if inspect.isawaitable(del_res):
+                        await del_res
+    except BaseException as e:
+        logging.warning(f"Failed to release cluster singleflight lock {lock_key}: {e}")
+
 async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future, use_singleflight: bool = True):
+    lock_key = f"lock:sf:{comp_key}"
+    lock_token = f"{node_name}:{uuid.uuid4()}"
+    is_cluster_leader = False
+
     try:
         if use_singleflight:
             cached_policy = l1_cache.get(comp_key)
             if cached_policy is not None:
                 with stats_lock:
                     stats["l1_double_check_hits"] += 1
+                    stats["singleflight_leader_queries"] -= 1
                 if not fut.done():
                     fut.set_result({
                         "status": "deny" if cached_policy == "DENY" else "allow",
@@ -548,6 +588,80 @@ async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future,
                         "policy": cached_policy,
                     })
                 return
+
+            if CLUSTER_SINGLEFLIGHT_ENABLED:
+                # Fast pre-check: see if another node already populated L2
+                try:
+                    r_client = get_redis_client()
+                    l2_val = await r_client.get(f"policy:{comp_key}")
+                    if l2_val:
+                        val = l2_val.decode() if isinstance(l2_val, bytes) else str(l2_val)
+                        l1_cache.set(comp_key, val)
+                        with stats_lock:
+                            stats["singleflight_coalesced"] += 1
+                            stats["singleflight_leader_queries"] -= 1
+                        if not fut.done():
+                            fut.set_result({
+                                "status": "deny" if val == "DENY" else "allow",
+                                "source": "L2",
+                                "policy": val,
+                            })
+                        return
+                except Exception as e:
+                    logging.warning(f"L2 pre-check error (Redis down?): {e}")
+
+                # Attempt to elect this node as the cluster leader for comp_key
+                try:
+                    r_client = get_redis_client()
+                    acquired = await r_client.set(
+                        lock_key,
+                        lock_token,
+                        nx=True,
+                        px=max(1, int(round(CLUSTER_SF_LOCK_TTL_SEC * 1000))),
+                    )
+                    is_cluster_leader = bool(acquired)
+                except Exception as e:
+                    logging.warning(f"Cluster single-flight lock acquire failed: {e}")
+                    is_cluster_leader = True
+
+                # If follower, wait for the cluster leader to populate L2
+                if not is_cluster_leader:
+                    start_wait = time.time()
+                    while time.time() - start_wait < CLUSTER_SF_TIMEOUT_SEC:
+                        await asyncio.sleep(CLUSTER_SF_POLL_INTERVAL_SEC)
+                        try:
+                            r_client = get_redis_client()
+                            l2_val = await r_client.get(f"policy:{comp_key}")
+                            if l2_val:
+                                val = l2_val.decode() if isinstance(l2_val, bytes) else str(l2_val)
+                                l1_cache.set(comp_key, val)
+                                with stats_lock:
+                                    stats["singleflight_coalesced"] += 1
+                                    stats["singleflight_leader_queries"] -= 1
+                                if not fut.done():
+                                    fut.set_result({
+                                        "status": "deny" if val == "DENY" else "allow",
+                                        "source": "L2",
+                                        "policy": val,
+                                    })
+                                return
+
+                            # Check if leader lock has expired or vanished
+                            lock_exists = await r_client.exists(lock_key)
+                            if not lock_exists:
+                                # Leader released or crashed without populating L2; attempt takeover
+                                takeover = await r_client.set(
+                                    lock_key,
+                                    lock_token,
+                                    nx=True,
+                                    px=max(1, int(round(CLUSTER_SF_LOCK_TTL_SEC * 1000))),
+                                )
+                                if takeover:
+                                    is_cluster_leader = True
+                                    break
+                        except Exception as e:
+                            logging.warning(f"Error polling cluster singleflight L2: {e}")
+                            break
 
         with stats_lock:
             stats["db_queries_executed"] += 1
@@ -601,9 +715,17 @@ async def db_loader_task(comp_key: str, sid: str, res: str, fut: asyncio.Future,
         if isinstance(e, asyncio.CancelledError):
             raise
     finally:
-        cb.release_half_open_probe()
-        if in_flight.get(comp_key) is fut:
-            in_flight.pop(comp_key, None)
+        try:
+            if is_cluster_leader and CLUSTER_SINGLEFLIGHT_ENABLED:
+                try:
+                    client = get_redis_client()
+                    await asyncio.shield(release_cluster_lock(client, lock_key, lock_token))
+                except BaseException as e:
+                    logging.warning(f"Failed to release cluster lock: {e}")
+        finally:
+            cb.release_half_open_probe()
+            if in_flight.get(comp_key) is fut:
+                in_flight.pop(comp_key, None)
 
 async def _process_stream_messages(messages, active_stream_client, active_redis_client):
     for msg_id, msg_data in messages:
@@ -832,9 +954,46 @@ async def measure_latency(request: Request, call_next):
                 stats["latency_sum"] += duration
                 stats["total_latency_ms"] += duration * 1000.0
 
-def generate_canonical_payload(method: str, path: str, spiffe_id: str, nonce: str) -> bytes:
-    # Omitting Host, Query, Timestamp, Body since /auth is GET and uses single-use nonce
-    canonical_str = f"{method.upper()}\n{path}\n{spiffe_id}\n{nonce}"
+def generate_canonical_payload(
+    method: str,
+    path: str,
+    *args,
+    query: str = "",
+    body_digest: Optional[str] = None,
+    spiffe_id: str = "",
+    nonce: str = "",
+    body: bytes = b"",
+) -> bytes:
+    """
+    Constructs deterministic canonical payload for PoP signature binding (Scope B).
+    Binds HTTP Method, Path, Query string, Body digest, SPIFFE ID, and Nonce.
+    Timestamp and Host remain out of scope for Scope B lightweight verification.
+
+    Format:
+    "{HTTP_METHOD}\n{PATH}\n{QUERY}\n{BODY_DIGEST}\n{X-SPIFFE-ID}\n{X-Nonce}"
+    """
+    if len(args) not in (0, 2, 4):
+        raise TypeError(
+            f"generate_canonical_payload() accepts 2, 4, or 6 positional arguments ({len(args) + 2} given)"
+        )
+
+    if len(args) == 2:
+        # Backward compatibility: called as (method, path, spiffe_id, nonce)
+        spiffe_id = args[0]
+        nonce = args[1]
+    elif len(args) == 4:
+        # Called as (method, path, query, body_digest, spiffe_id, nonce)
+        query = args[0]
+        body_digest = args[1]
+        spiffe_id = args[2]
+        nonce = args[3]
+
+    if body_digest is None:
+        body_digest = hashlib.sha256(body).hexdigest()
+    elif body_digest.startswith("sha256="):
+        body_digest = body_digest.split("=", 1)[1]
+
+    canonical_str = f"{method.upper()}\n{path}\n{query}\n{body_digest}\n{spiffe_id}\n{nonce}"
     return canonical_str.encode("utf-8")
 
 def verify_pop_signature(public_key_pem: str, signature: bytes, canonical_payload: bytes) -> bool:
@@ -868,7 +1027,8 @@ async def auth(
     x_spiffe_id: str = Header(None),
     x_res: str = Header("resource"),
     x_act: str = Header("read"),
-    x_pop_signature: str = Header(None)
+    x_pop_signature: str = Header(None),
+    x_body_digest: str = Header(None)
 ):
     if not authorization or not x_nonce or not x_spiffe_id:
         raise HTTPException(status_code=401, detail="Missing Headers")
@@ -1003,7 +1163,31 @@ async def auth(
                 stats["pop_rejected"] += 1
             raise HTTPException(status_code=401, detail="Invalid PoP Signature")
 
-        canonical_payload = generate_canonical_payload(request.method, request.url.path, x_spiffe_id, x_nonce)
+        body_bytes = await request.body()
+        computed_body_hash = hashlib.sha256(body_bytes).hexdigest()
+
+        if x_body_digest:
+            if not x_body_digest.startswith("sha256="):
+                with stats_lock:
+                    stats["pop_rejected"] += 1
+                raise HTTPException(status_code=400, detail="Missing or invalid X-Body-Digest header")
+            claimed_digest = x_body_digest.split("=", 1)[1]
+            if not hmac.compare_digest(computed_body_hash, claimed_digest):
+                with stats_lock:
+                    stats["pop_rejected"] += 1
+                raise HTTPException(status_code=400, detail="Body digest mismatch")
+            body_digest_val = claimed_digest
+        else:
+            body_digest_val = computed_body_hash
+
+        canonical_payload = generate_canonical_payload(
+            method=request.method,
+            path=request.url.path,
+            query=request.url.query,
+            body_digest=body_digest_val,
+            spiffe_id=x_spiffe_id,
+            nonce=x_nonce
+        )
 
         is_valid = await asyncio.get_running_loop().run_in_executor(
             get_pop_executor(),
@@ -1085,7 +1269,26 @@ async def auth(
         raise
 
     try:
-        return await asyncio.shield(fut)
+        # When single-flight is ON, asyncio.shield is needed so that if the leader
+        # client disconnects (raising CancelledError), the underlying DB query
+        # and shared Future continue running in the background, allowing waiting
+        # followers to receive the result rather than having their query aborted.
+        # When single-flight is OFF, there are no followers waiting on this Future/task.
+        # Shielding here would orphan the DB task upon client disconnect, wasting
+        # backend DB connections, semaphore slots, and compute (resource leak).
+        # Therefore, cancellation propagates normally to abort the DB task.
+        if SINGLEFLIGHT_ENABLED:
+            return await asyncio.shield(fut)
+        else:
+            try:
+                return await fut
+            except asyncio.CancelledError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                raise
     except DBOverloadError as e:
         logging.warning(str(e))
         return JSONResponse(status_code=503, content={"status": "error", "message": "Service Unavailable - DB Overload"})
@@ -1120,6 +1323,7 @@ async def get_metrics():
         "node": node_name,
         "db_mode": DB_MODE,
         "singleflight_enabled": SINGLEFLIGHT_ENABLED,
+        "cluster_singleflight_enabled": CLUSTER_SINGLEFLIGHT_ENABLED,
         "rl_algorithm": RL_ALGORITHM,
         "pop_verify_enabled": POP_VERIFY_ENABLED,
         "half_open_probe_active": cb.is_probe_active,
