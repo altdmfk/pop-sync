@@ -171,7 +171,7 @@
 ### 4.12 알려진 잔여 과제
 - **서킷 브레이커 HALF_OPEN 동시 시험 요청 1건 제한 미구현**: `HALF_OPEN` 상태에서 별도의 단일 프로브 세마포어를 두지 않아 동시 캐시 미스 요청이 함께 DB를 조회하는 문제가 있었다. (→ 5.1(v1.0.0)에서 원자적 단일 프로브 게이트 `_half_open_probe_in_flight`로 해결 완료)
 - **XAUTOCLAIM/미사용 컨슈머 그룹 정리 미구현**: `stream_listener()`는 노드 고유의 컨슈머 그룹(`gateway_group_{node_name}`)에 대해 자신의 PEL(`"0"`)만 재처리하며, 영구 이탈한 다른 컨슈머의 미확인 메시지를 인계받는 `XAUTOCLAIM`이나 미사용 컨슈머 그룹 삭제 로직은 구현되어 있지 않았다. (→ `XAUTOCLAIM`은 5.3(v1.0.0)에서 구현 완료됨; 미사용 컨슈머 그룹 정리는 고정 노드 클러스터 특성상 현행 유지)
-- **클러스터 전역 Single-Flight 미지원**: `in_flight` 맵은 각 게이트웨이 프로세스 내부 메모리에만 존재하므로, 동일 키 요청이 서로 다른 게이트웨이 노드로 분산 유입될 경우 노드별로 각각 1회씩 DB 호출이 발생한다.
+- **클러스터 전역 Single-Flight 미지원**: `in_flight` 맵은 각 게이트웨이 프로세스 내부 메모리에만 존재하므로, 동일 키 요청이 서로 다른 게이트웨이 노드로 분산 유입될 경우 노드별로 각각 1회씩 DB 호출이 발생한다. (→ 6.1(v1.1.0)에서 Redis 분산 락 및 L2 폴링 기반 클러스터 전역 Single-Flight로 해결 완료)
 
 ---
 
@@ -249,5 +249,78 @@
 - **`[HYGIENE-04]`**: `control_plane.py`의 `TEST_INVALIDATE_KEY` 및 `gateway.py`의 `DUMMY_REDIS_URL`을 `os.getenv` 기본값을 갖는 모듈 전역 상수로 추출.
 - 단위 테스트 실행 결과: 총 59개 전건 통과 (`59 passed, 12 deselected`).
 
+---
 
+## 6. 5차 리팩토링: 클러스터 전역 단일 비행 및 보안·복원력 고도화 (v1.1.0, 2026-10-21)
 
+### 6.1 Redis 분산 락 및 L2 폴링 기반 클러스터 전역 Single-Flight 구현
+- **대상 파일 및 함수**: `gateway.py:release_cluster_lock`, `gateway.py:db_loader_task`, `gateway.py:get_metrics`, `gateway.py:CLUSTER_SINGLEFLIGHT_ENABLED`, `gateway.py:CLUSTER_SF_LOCK_TTL_SEC`, `gateway.py:CLUSTER_SF_POLL_INTERVAL_SEC`, `gateway.py:CLUSTER_SF_TIMEOUT_SEC`, `.env.example`, `docker-compose.yml`, `docs/cluster-singleflight-design.md`, `docs/benchmarks/singleflight-effect.md`, `tests/test_cluster_singleflight.py`, `tests/test_cluster_singleflight_e2e.py`, `tests/conftest.py:clean_gateway_state`
+- **기존 문제**:
+  - 기존 Single-Flight는 노드 내부의 `in_flight` 인메모리 딕셔너리(`dict[str, asyncio.Future]`)에서만 요청을 병합했다.
+  - 3개 노드(`gateway-a`, `gateway-b`, `gateway-c`) 분산 환경에서 동일 키 요청이 여러 노드로 분산 유입되면 각 노드가 로컬 캐시 미스를 판정했다. 그 결과 노드마다 1회씩(총 3회) Policy DB를 호출하여 백엔드 DB에 중복 쿼리 부하가 발생했다 (`4.12 알려진 잔여 과제` 참조).
+- **수정 내용 및 결과**:
+  - `gateway.py`에 Redis 분산 락과 L2 캐시 폴링을 결합한 클러스터 전역 Single-Flight(`CLUSTER_SINGLEFLIGHT_ENABLED`, 기본값 `True`)를 구현했다.
+    - **L2 선행 조회**: DB 호출 전에 `await r_client.get(f"policy:{comp_key}")`를 확인한다. 다른 노드가 이미 적재했다면 즉시 반환하고 `stats["singleflight_coalesced"] += 1` 및 `stats["singleflight_leader_queries"] -= 1`을 기록한다.
+    - **Cluster Leader 선출 (SET NX)**: `await r_client.set(lock_key, lock_token, nx=True, px=CLUSTER_SF_LOCK_TTL_SEC * 1000)` 명령으로 락 선점을 시도한다 (`lock_key = f"lock:sf:{comp_key}"`, `lock_token = f"{node_name}:{uuid.uuid4()}"`, 기본 TTL `3.0s`). 락을 획득한 노드만 Leader가 되어 Policy DB를 조회하고 L1 및 L2(`policy:{comp_key}`)에 결과를 적재한다.
+    - **Cluster Follower L2 폴링 및 인계**: 락 선점에 실패한 Follower 노드는 `CLUSTER_SF_POLL_INTERVAL_SEC`(기본 25ms) 간격으로 최대 `CLUSTER_SF_TIMEOUT_SEC`(기본 2.0s) 동안 L2 캐시를 폴링한다. 결과를 확인하면 로컬 `in_flight` Future를 완료한다. Leader 노드가 비정상 종료되어 락이 소멸(`not lock_exists`)하면 대기 중인 Follower가 락을 선점하여 DB 조회를 이어받는다.
+    - **펜싱 토큰 원자적 락 해제 (`release_cluster_lock`)**: DB 조회가 끝나면 원자적 Lua 스크립트를 실행한다. 자신이 발급한 고유 `lock_token`과 일치할 때만 락을 삭제한다. `asyncio.shield`로 보호하여 취소 시에도 락이 해제되도록 했다.
+    - **Redis 장애 시 로컬 폴백**: Redis 통신 장애가 발생하면 노드 로컬 Single-Flight로 자동 전환하여 가용성을 유지한다.
+    - **관측 지표 및 불변식 정합성**: L2 회수 시 `stats["singleflight_coalesced"] += 1`을 기록하고 `stats["singleflight_leader_queries"] -= 1`을 차감한다. 이를 통해 Invariant 1(`requests == sum(classified)`) 및 Invariant 2(`db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + policy_circuit_blocked`) 정합성을 유지한다.
+  - `docs/benchmarks/singleflight-effect.md` 실측 결과, 3개 노드 클러스터에서 동일 키 동시 요청 90건 유입 시 전체 DB 호출이 3회에서 1회로 66.7% 감소했다.
+  - `tests/test_cluster_singleflight.py` 10개 단위 테스트 및 `tests/test_cluster_singleflight_e2e.py` E2E 테스트로 검증했다.
+
+### 6.2 PoP 정규화 페이로드 Query String 및 Body Digest 바인딩 확장 (Scope B 보안 강화)
+- **대상 파일 및 함수**: `gateway.py:generate_canonical_payload`, `gateway.py:auth`, `tests/test_pop.py`, `tests/test_chaos_audit.py`, `README.md`
+- **기존 문제**:
+  - 기존 Scope B PoP 서명 검증은 Method, Path, Nonce, SPIFFE ID 4개 필드만 서명 페이로드로 바인딩했다.
+  - Query String(`?role=admin` 등)이나 요청 본문(`POST /auth` JSON 페이로드)이 중간에서 변조되거나 `X-Body-Digest` 헤더가 조작되어도 서명 검증을 통과하는 취약점이 있었다.
+- **수정 내용 및 결과**:
+  - `gateway.py:generate_canonical_payload` 및 `gateway.py:verify_pop_signature`의 정규화 규격을 Method, Path, Query String, Body Digest, SPIFFE ID, Nonce 6개 필드로 확장했다.
+    - **정규화 문자열 형식**: `f"{method.upper()}\n{path}\n{canonical_query}\n{body_digest}\n{spiffe_id}\n{nonce}"`
+    - **Body Digest 규격**: 클라이언트가 전송한 `X-Body-Digest` 헤더(`sha256=<hex_digest>`)와 실제 요청 본문의 SHA-256 다이제스트를 `hmac.compare_digest`로 상수 시간 비교한다. 본문이 비어있으면 `EMPTY_BODY_DIGEST`(`sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`)를 적용한다.
+    - **Query 정규화**: 쿼리 파라미터를 알파벳 오름차순으로 정렬(`parse_qsl` → `sorted` → `urlencode`)하여 파라미터 순서 불일치로 인한 오탐을 방지한다.
+  - **본문 해시 사전 검증**: `X-Body-Digest` 접두사(`sha256=`)가 없거나 요청 본문과 일치하지 않으면 Nonce를 소진한 후 `400 Bad Request`(`"Missing or invalid X-Body-Digest header"` 또는 `"Body digest mismatch"`)를 반환한다(`pop_rejected += 1`). 고비용 비대칭 암호 연산(ECDSA P-256 verify) 전에 무효 요청을 차단하여 CPU 낭비를 막는다.
+  - `tests/test_pop.py`에 바디 다이제스트 누락 및 불일치 400 반환(`test_pop_signature_missing_body_digest_header_returns_400`, `test_pop_signature_body_digest_mismatch_returns_400`, `test_pop_signature_valid_request_with_body_digest_and_query_succeeds`) 및 쿼리 변조 401 차단(`test_pop_signature_query_tampering_rejected`) 테스트를 추가하여 동작을 확인했다.
+
+### 6.3 Single-Flight OFF 모드 클라이언트 취소 시 백엔드 DB 쿼리 중단 정합성 회복
+- **대상 파일 및 함수**: `gateway.py:auth_endpoint`, `tests/test_singleflight.py:test_singleflight_disabled_client_cancellation_aborts_db`
+- **기존 문제**:
+  - `SINGLEFLIGHT_ENABLED=False`(단일 비행 비활성화) 모드에서 DB 조회 코루틴을 `db_loader_task()` 비동기 태스크로 분리하고 `asyncio.shield()`로 감싸 실행했다.
+  - 이로 인해 클라이언트 연결이 끊겨도(`CancelledError`) 백엔드 DB 쿼리가 취소되지 않고 실행되었다. 단일 비행 비활성화 모드임에도 불필요한 백엔드 DB 자원이 소모되는 문제가 있었다 (`README.md 알려진 한계점` 참조).
+- **수정 내용 및 결과**:
+  - `gateway.py:auth_endpoint`의 `singleflight_mode == "off"` 분기에서 `asyncio.shield`를 제거했다. 클라이언트 요청 컨텍스트에서 `await db_loader_task(...)`를 직접 실행하도록 변경했다.
+  - 클라이언트가 연결을 끊으면 `asyncio.CancelledError`가 DB 조회 코루틴으로 전파되어 백엔드 호출이 즉시 중단된다.
+  - `tests/test_singleflight.py::test_singleflight_disabled_client_cancellation_aborts_db` 단위 테스트를 추가하여 OFF 모드에서 클라이언트 취소 시 DB 조회가 즉시 중단됨을 검증했다.
+  - `README.md`의 한계점 목록에서 관련 항목을 제거했다.
+
+### 6.4 Rate Limiter 고정 윈도우 decr 예외 로깅 보강 및 Redis TIME 단일 시간 소스 검증
+- **대상 파일 및 함수**: `gateway.py:check_rate_limit`, `tests/test_rate_limit.py:test_fixed_window_decr_rollback_logging`, `tests/conftest.py:mock_common_dependencies`, `docs/benchmarks/rate-limit-sliding.md`, `README.md`
+- **기존 문제**:
+  - `check_rate_limit`의 고정 윈도우(`fixed`) 방식에서 한도 초과 시 실행되는 `decr` 롤백 블록이 `except Exception: pass`로 예외를 처리했다. 이로 인해 Redis 장애나 타임아웃 발생 시 롤백 실패를 관측하기 어려웠다.
+  - 또한 노드 로컬의 `time.time()`을 기준으로 윈도우를 계산하면 노드 간 시계 오차로 인해 윈도우 경계 판단에 편차가 발생할 수 있었다.
+- **수정 내용 및 결과**:
+  - `check_rate_limit`의 `decr` 롤백 블록에 `logging.debug(f"Rate limit decr rollback failed for {key}: {e}")` 출력을 추가했다.
+  - `tests/conftest.py:mock_common_dependencies`에 `m_redis.time` 모의 객체를 추가하여 Redis `TIME` 명령 기반의 시간 일관성 검증을 지원하도록 했다.
+  - `tests/test_rate_limit.py::test_fixed_window_decr_rollback_logging` 단위 테스트를 추가하여 롤백 실패 로그 출력을 확인했다.
+  - `docs/benchmarks/rate-limit-sliding.md` 및 `README.md`에 Redis `TIME` 단일 시간 소스 사용 시의 트레이드오프(0.2~0.5ms 지연 시간 추가 대비 시계 동기화 효과)를 분석하고 관련 한계점을 정리했다.
+
+### 6.5 9대 카오스 복원력 시나리오 연속 검증 및 수학적 불변식 감사 스위트 확장
+- **대상 파일 및 함수**: `tests/test_chaos_audit.py`, `tests/conftest.py:e2e_cluster`, `.github/workflows/ci.yml`
+- **기존 문제**:
+  - 기존 단위 테스트는 각 시나리오를 파일별로 나누어 검증했다. README에 정리된 9대 카오스 시나리오를 단일 파이프라인에서 순차 실행한 뒤 카운터 오차가 없는지 `GET /chaos/audit`으로 점검하는 회귀 테스트가 없었다.
+  - 감사 엔드포인트의 분모 0, 순환소수 반올림, 실수형 카운터 유입 등 경계 조건 검증도 부족했다.
+- **수정 내용 및 결과**:
+  - `tests/test_chaos_audit.py`를 작성하여 9대 카오스 시나리오를 연속 실행하는 통합 단위 테스트(`test_chaos_audit_back_to_back_9_scenarios_unit`)를 구현했다. 실행 후 Invariant 1과 Invariant 2의 카운터 오차가 0인지, `overall_invariant_pass`가 `True`인지 검증한다.
+  - 감사 엔드포인트 수식 경계 테스트 7건(`test_audit_edge_case_zero_denominators`, `test_audit_edge_case_repeating_fractions_rounding`, `test_audit_edge_case_bankers_rounding_halfway`, `test_audit_edge_case_100_percent_saturation_boundary`, `test_audit_edge_case_float_counter_immunity`, `test_sliding_window_rate_limiter_lua_weight_boundary_math`, `test_local_sliding_window_fallback_truncation_edge_case`)을 추가했다.
+  - `tests/conftest.py`에 클러스터 E2E 테스트 픽스처(`e2e_cluster`)를 구현하고, E2E 시나리오 테스트(`test_chaos_audit_e2e_cluster_back_to_back_9_scenarios`)를 추가했다.
+  - `.github/workflows/ci.yml`의 CI 실행 항목에 `tests/test_chaos_audit.py`를 추가했다.
+
+### 6.6 의도적 미적용 항목
+- **PoP kid 헤더 다중 키 파싱 및 하드웨어 Attestation 검증**: Scope B 경량 구현 범위와 데모 환경 제약(단일 키 운용)을 고려하여 이번 범위에서 제외하고 기존 규격을 유지한다.
+- **클러스터 Single-Flight Follower 대기 방식의 Redis Pub/Sub 전환**: 25ms L2 폴링 대비 커넥션 오버헤드와 채널 구독 복잡성을 고려하여 폴링 방식을 유지한다.
+
+### 6.7 알려진 잔여 과제
+- **클러스터 Single-Flight Follower 폴링 지연**: Follower 노드는 Leader의 L2 적재를 25ms 간격으로 폴링하므로, 캐시 미스 시 Leader 대비 평균 12.5ms에서 최대 25ms의 대기 시간이 추가된다.
+- **Leader 비정상 종료 시 인계 대기 시간**: Leader 노드가 락 선점 후 DB 조회 중 비정상 종료(`SIGKILL` 등)되면, 락 TTL(3.0초) 또는 폴링 타임아웃(2.0초) 만료까지 Follower가 대기한 후 락을 인계받으므로 일시적인 지연이 발생할 수 있다.
+
+- 단위 테스트 실행 결과: 총 85개 전건 통과 (`85 passed, 14 deselected`).
