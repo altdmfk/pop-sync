@@ -324,3 +324,24 @@
 - **Leader 비정상 종료 시 인계 대기 시간**: Leader 노드가 락 선점 후 DB 조회 중 비정상 종료(`SIGKILL` 등)되면, 락 TTL(3.0초) 또는 폴링 타임아웃(2.0초) 만료까지 Follower가 대기한 후 락을 인계받으므로 일시적인 지연이 발생할 수 있다.
 
 - 단위 테스트 실행 결과: 총 85개 전건 통과 (`85 passed, 14 deselected`).
+
+---
+
+## 7. 6차 리팩토링: 프로덕션 호환성(PEP 프록시 모드) 및 고가용성(HA) 지원 고도화 (v1.2.0, 2026-10-22)
+
+### 7.1 비동기 리버스 프록시(PEP) 패스스루 토글 모드 구현 (`UPSTREAM_URL`)
+- **대상 파일 및 함수**: `gateway.py:auth`, `.env.example`, `tests/test_production_ha.py`
+- **기존 문제**: 게이트웨이가 순수 인가 판정(PDP) 결과 JSON만 반환하도록 고정되어 있어, Envoy `ext_authz`와 같은 별도 외부 프록시 없이는 단독으로 백엔드 실서버(Upstream)로 비즈니스 트래픽을 중계(PEP)할 수 없었다.
+- **수정 내용 및 결과**: `UPSTREAM_URL` 환경변수 기반 토글 모드를 구현했다. 미설정 시에는 기존 PDP 응답을 100% 유지하며, 설정 시에는 6단계 파이프라인 통과 후 `DENY` 정책은 `403 Forbidden`으로 즉시 차단하고 `allow`/`degraded_allow` 요청만 공유 `httpx.AsyncClient` 풀을 통해 Upstream으로 비동기 패스스루 포워딩한다. 검증된 신원 헤더(`X-Authenticated-SPIFFE-ID`, `X-Policy-Decision`, `X-Auth-Source`)를 주입하며, Upstream 타임아웃(`504`)/연결 실패(`502`)를 Policy DB 서킷 브레이커 및 2대 불변식 카운터와 분리하여 정합성을 보존했다.
+
+### 7.2 GSLB/ALB 페일오버 연동을 위한 딥 헬스체크(`GET /health`) 고도화
+- **대상 파일 및 함수**: `gateway.py:health_check`, `tests/conftest.py`, `tests/test_production_ha.py`
+- **기존 문제**: `/health` 엔드포인트가 의존 인프라(Redis) 상태나 네트워크 고립 여부와 무관하게 정적 `200 OK`를 반환하여, 중앙 Redis 마비나 노드 고립 시 상위 로드밸런서(GSLB/ALB)가 장애 노드를 감지하고 Standby로 페일오버할 수 없었다.
+- **수정 내용 및 결과**: `/health` 호출 시 `is_partitioned` 고립 여부를 우선 확인하고, `0.2s`(`HEALTHCHECK_PING_TIMEOUT_SEC`) 타임아웃 제한을 둔 `redis_client.ping()`을 수행하도록 개선했다. 고립 상태이거나 Redis 응답 불가 시 즉시 `503 Service Unavailable`을 반환하여 상위 계층의 자동 페일오버를 유도한다.
+
+### 7.3 Redis Sentinel 기반 마스터 동적 재연결(HA) 지원
+- **대상 파일 및 함수**: `gateway.py:get_redis_client`, `gateway.py:parse_sentinel_hosts`, `.env.example`, `tests/test_production_ha.py`
+- **기존 문제**: 단일 `REDIS_URL` 연결만 지원하여 중앙 Redis가 단일 장애점(SPOF)이 될 수 있었고, 마스터 노드 장애 시 자동 승격된 새 마스터로 동적 전환할 수 없었다.
+- **수정 내용 및 결과**: `USE_REDIS_SENTINEL`, `REDIS_SENTINEL_HOSTS`, `REDIS_SENTINEL_MASTER_NAME` 설정을 추가하고, 활성화 시 `redis.asyncio.sentinel.Sentinel`의 `master_for()`를 통해 현재 활성 마스터 클라이언트를 동적으로 획득하도록 구현했다. Sentinel 마스터 클라이언트 초기화 시에도 `NONCE_LUA`와 `SLIDING_RL_LUA` 스크립트가 자동 등록되도록 통합했다.
+
+- 단위 테스트 실행 결과: 총 93개 전건 통과 (`93 passed, 14 deselected`).

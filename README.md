@@ -404,12 +404,34 @@ source .venv/bin/activate  # (Windows: .\.venv\Scripts\activate)
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
 
-# 단위 및 경계 테스트 실행 (Docker 불필요, Mock 기반으로 59개 테스트 즉시 실행)
+# 단위 및 경계 테스트 실행 (Docker 불필요, Mock 기반으로 93개 테스트 즉시 실행)
 pytest -v
 
 # E2E 시나리오 테스트 실행 (실제 Docker 클러스터 구동 필요)
 pytest -m e2e
 ```
+
+---
+
+## 프로덕션 적용 시 고려사항 및 스코프 (Production Considerations & Scope)
+
+### 1) L7 트래픽 프록시 계층 분리 및 PEP 토글 (`UPSTREAM_URL`)
+- **PDP 인가 엔진 모드 (기본값)**: `UPSTREAM_URL`이 설정되지 않은 경우, 게이트웨이는 순수 정책 결정 지점(PDP)으로 동작하여 6단계 파이프라인 검증 후 인가 결과 JSON(`200 OK`)만을 반환한다. 이는 Envoy, Nginx 등 엔터프라이즈 L7 프록시의 `ext_authz` 필터와 연동하는 아키텍처에 최적화되어 있다.
+- **PEP 비동기 리버스 프록시 모드 (`UPSTREAM_URL` 활성화)**: `UPSTREAM_URL` 환경변수가 설정되면 자체 정책 집행 지점(PEP) 패스스루 모드로 동작한다.
+  - 인가 거부(`DENY`) 시에는 Upstream으로 요청을 전달하지 않고 게이트웨이 레벨에서 즉시 `403 Forbidden` JSON을 반환한다.
+  - 인가 허용(`allow` 또는 `degraded_allow`) 시에는 Hop-by-hop 헤더 및 내부 관리자 토큰(`x-admin-token`)을 안전하게 제거하고, 검증된 신원 컨텍스트 헤더(`X-Authenticated-SPIFFE-ID`, `X-Policy-Decision`, `X-Auth-Source`)를 주입하여 지연 초기화 커넥션 풀(`httpx.AsyncClient`)을 통해 백엔드 Upstream 서버로 비동기 패스스루 포워딩한다. 별도의 외부 프록시 계층 없이 단독 인프라로 즉시 배포할 수 있다.
+
+### 2) 클라이언트 암호학적 서명 요구사항 (Client-Side Overhead)
+- **PoP 비대칭 서명 검증(`POP_VERIFY_ENABLED=true`)**: ECDSA P-256 비대칭 키 기반 서명 생성 및 검증은 리플레이 및 토큰 탈취 공격을 원천 무력화하지만, 클라이언트 측 Web Crypto API 또는 WebAuthn 기반 서명 SDK 도입이 필수적이며 클라이언트/서버 양측의 암호학적 연산 오버헤드를 수반한다.
+- **선별 적용 권장**: 따라서 일반 웹 트래픽 전체에 전면 적용하기보다는 **금융/결제 API (FAPI 규격 준수), 제로 트러스트(Zero Trust) 엔터프라이즈 환경, 대규모 트래픽이 집중되는 선착순 주문/티켓팅 등 고보안·고트래픽 핵심 비즈니스 API**에 선별적으로 적용하는 것을 권장한다.
+
+### 3) 시스템 레벨 가용성(HA) 및 다중 리전 동기화 제약
+- **Redis SPOF 대응 및 딥 헬스체크**:
+  - `USE_REDIS_SENTINEL=true` 활성화 시 Redis Sentinel 클러스터를 통해 마스터 장애 발생 시 자동 승격된 신규 마스터로 동적 재연결하여 단일 장애점(SPOF)을 제거한다.
+  - `GET /health` 엔드포인트는 `0.2s` 타임아웃 제한의 Redis `ping()` 검사와 네트워크 파티션(고립) 상태를 실시간 판별하는 딥 헬스체크를 수행한다. 장애 감지 시 즉시 `503 Service Unavailable`을 반환하여 상위 GSLB 및 L4/L7 로드밸런서(ALB)가 비정상 노드를 신속하게 감지하고 Standby 클러스터로 자동 페일오버하도록 보장한다.
+- **Multi-Region Active-Active 한계**:
+  - 원자적 Nonce 소진(Redis Lua)과 클러스터 분산 락(`SET NX`)은 엄격한 강한 일관성(Strong Consistency)을 전제한다. 대륙 간/원거리 리전 간 Active-Active 구성 시 물리적 광속 한계로 인한 네트워크 왕복 지연(RTT 10~50ms+)이 발생하여 전체 요청 레이턴시가 급격히 저하된다.
+  - 따라서 **1ms 미만 지연 시간을 보장하는 동일 리전 Multi-AZ(다중 가용 영역) 환경에서의 Active-Active** 구성 또는, **GSLB 기반 Multi-Region Active-Standby** 구성을 권장한다.
 
 ---
 
