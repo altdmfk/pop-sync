@@ -12,6 +12,9 @@ os.environ["ADMIN_SECRET_TOKEN"] = "super-secret-admin"
 def clean_gateway_state():
     """Autouse fixture ensuring clean gateway state across all test modules."""
     import gateway
+    gateway.UPSTREAM_URL = ""
+    gateway.USE_REDIS_SENTINEL = False
+    gateway.is_partitioned = False
     gateway.POP_VERIFY_ENABLED = False
     gateway.SINGLEFLIGHT_ENABLED = True
     gateway.CLUSTER_SINGLEFLIGHT_ENABLED = True
@@ -45,6 +48,9 @@ def clean_gateway_state():
 
     yield
 
+    gateway.UPSTREAM_URL = ""
+    gateway.USE_REDIS_SENTINEL = False
+    gateway.is_partitioned = False
     gateway.POP_VERIFY_ENABLED = False
     gateway.SINGLEFLIGHT_ENABLED = True
     gateway.CLUSTER_SINGLEFLIGHT_ENABLED = True
@@ -108,6 +114,7 @@ def mock_common_dependencies():
          
         m_rl.return_value = True
         m_nonce.return_value = True
+        m_redis.ping = AsyncMock(return_value=True)
         m_redis.get = AsyncMock(return_value=None)
         m_redis.set = AsyncMock(return_value=True)
         m_redis.setex = AsyncMock(return_value=True)
