@@ -20,10 +20,11 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 import httpx
 from redis.asyncio import Redis
+from redis.asyncio.sentinel import Sentinel
 import uvicorn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -74,8 +75,10 @@ DB_TIMEOUT_SEC               = _float("DB_TIMEOUT_SEC", 1.0)
 DB_SEMAPHORE_ACQUIRE_TIMEOUT = _float("DB_SEMAPHORE_ACQUIRE_TIMEOUT", 0.1)
 MAX_DB_WORKERS               = _int("MAX_DB_WORKERS", 5)
 
-node_name = os.getenv("NODE_NAME", "Node-X")
-redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+NODE_NAME: str = os.getenv("NODE_NAME", "Node-X")
+node_name: str = NODE_NAME
+REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_url: str = REDIS_URL
 db_url    = os.getenv("DB_URL",    "http://localhost:8000")
 DB_MODE   = os.getenv("DB_MODE",   "sync")
 SINGLEFLIGHT_ENABLED = os.getenv("SINGLEFLIGHT_ENABLED", "true").lower() == "true"
@@ -83,6 +86,16 @@ CLUSTER_SINGLEFLIGHT_ENABLED = os.getenv("CLUSTER_SINGLEFLIGHT_ENABLED", "true")
 CLUSTER_SF_LOCK_TTL_SEC      = _float("CLUSTER_SF_LOCK_TTL_SEC", 3.0)
 CLUSTER_SF_POLL_INTERVAL_SEC = _float("CLUSTER_SF_POLL_INTERVAL_SEC", 0.025)
 CLUSTER_SF_TIMEOUT_SEC       = _float("CLUSTER_SF_TIMEOUT_SEC", 2.0)
+
+UPSTREAM_URL: str = os.getenv("UPSTREAM_URL", "").strip()
+UPSTREAM_TIMEOUT_SEC: float = float(os.getenv("UPSTREAM_TIMEOUT_SEC", "3.0"))
+
+HEALTHCHECK_PING_TIMEOUT_SEC: float = float(os.getenv("HEALTHCHECK_PING_TIMEOUT_SEC", "0.2"))
+
+USE_REDIS_SENTINEL: bool = os.getenv("USE_REDIS_SENTINEL", "false").lower() == "true"
+REDIS_SENTINEL_HOSTS: str = os.getenv("REDIS_SENTINEL_HOSTS", "localhost:26379")
+REDIS_SENTINEL_MASTER_NAME: str = os.getenv("REDIS_SENTINEL_MASTER_NAME", "mymaster")
+REDIS_SENTINEL_SOCKET_TIMEOUT: float = float(os.getenv("REDIS_SENTINEL_SOCKET_TIMEOUT", "0.5"))
 
 STREAM_GROUP = f"gateway_group_{node_name}"
 
@@ -99,6 +112,7 @@ nonce_script = None
 rl_script    = None
 sync_http_client: Optional[httpx.Client] = None
 async_db_client: Optional[httpx.AsyncClient] = None
+async_http_client: Optional[httpx.AsyncClient] = None
 
 def get_async_db_client() -> httpx.AsyncClient:
     global async_db_client
@@ -118,12 +132,82 @@ def get_sync_http_client() -> httpx.Client:
         )
     return sync_http_client
 
+def get_async_http_client() -> httpx.AsyncClient:
+    global async_http_client
+    if async_http_client is None or (isinstance(async_http_client, httpx.AsyncClient) and async_http_client.is_closed):
+        async_http_client = httpx.AsyncClient(
+            timeout=UPSTREAM_TIMEOUT_SEC,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        )
+    return async_http_client
+
+def parse_sentinel_hosts(hosts_str: str) -> list[tuple[str, int]]:
+    """Parse comma-separated 'host:port' string into a list of (host, port) tuples.
+
+    Raises:
+        ValueError: If format is invalid, empty, or port is missing/not an integer.
+    """
+    if not hosts_str or not hosts_str.strip():
+        raise ValueError("Empty sentinel hosts string")
+
+    hosts: list[tuple[str, int]] = []
+    parts = [p.strip() for p in hosts_str.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("No sentinel hosts found in hosts string")
+
+    for part in parts:
+        if part.startswith("[") and "]:" in part:
+            host = part[1:part.rfind("]:")].strip()
+            port_str = part[part.rfind("]:") + 2:].strip()
+        elif ":" in part:
+            host_port = part.rsplit(":", 1)
+            host = host_port[0].strip()
+            port_str = host_port[1].strip()
+        else:
+            raise ValueError(f"Malformed sentinel host (missing port): {part}")
+
+        if not host or not port_str:
+            raise ValueError(f"Malformed sentinel host: {part}")
+
+        try:
+            port = int(port_str)
+            if port <= 0 or port > 65535:
+                raise ValueError(f"Invalid port number: {port}")
+        except ValueError as e:
+            raise ValueError(f"Invalid port for sentinel host '{part}': {e}") from e
+
+        hosts.append((host, port))
+    return hosts
+
+def _create_redis_connection(socket_timeout: Optional[float] = None, decode_responses: bool = True) -> Redis:
+    if USE_REDIS_SENTINEL:
+        sentinels = parse_sentinel_hosts(REDIS_SENTINEL_HOSTS)
+        timeout = socket_timeout if socket_timeout is not None else REDIS_SENTINEL_SOCKET_TIMEOUT
+        sentinel = Sentinel(
+            sentinels,
+            socket_timeout=timeout,
+            decode_responses=decode_responses,
+        )
+        return sentinel.master_for(
+            REDIS_SENTINEL_MASTER_NAME,
+            socket_timeout=timeout,
+            decode_responses=decode_responses,
+        )
+    else:
+        timeout = socket_timeout if socket_timeout is not None else REDIS_TIMEOUT_SEC
+        target_url = REDIS_URL or redis_url
+        return Redis.from_url(target_url, socket_timeout=timeout, decode_responses=decode_responses)
+
 def get_redis_client() -> Redis:
     global redis_client, nonce_script, rl_script
     if redis_client is None:
-        redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
+        redis_client = _create_redis_connection()
         nonce_script = redis_client.register_script(NONCE_LUA)
         rl_script    = redis_client.register_script(SLIDING_RL_LUA)
+    elif nonce_script is None or rl_script is None:
+        if hasattr(redis_client, "register_script"):
+            nonce_script = redis_client.register_script(NONCE_LUA)
+            rl_script    = redis_client.register_script(SLIDING_RL_LUA)
     return redis_client
 
 def get_pop_executor() -> ThreadPoolExecutor:
@@ -862,16 +946,16 @@ async def stream_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, stream_redis_client, sync_http_client, async_db_client
+    global redis_client, stream_redis_client, sync_http_client, async_db_client, async_http_client
     global db_semaphore, db_executor, nonce_script, rl_script, pop_executor
 
     db_semaphore = asyncio.Semaphore(MAX_DB_WORKERS)
     db_executor = ThreadPoolExecutor(max_workers=MAX_DB_WORKERS)
     pop_executor = ThreadPoolExecutor(max_workers=POP_EXECUTOR_WORKERS)
-    redis_client = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
+    redis_client = _create_redis_connection()
     nonce_script = redis_client.register_script(NONCE_LUA)
     rl_script    = redis_client.register_script(SLIDING_RL_LUA)
-    stream_redis_client = Redis.from_url(redis_url, socket_timeout=STREAM_SOCKET_TIMEOUT)
+    stream_redis_client = _create_redis_connection(socket_timeout=STREAM_SOCKET_TIMEOUT)
     sync_http_client = httpx.Client(
         timeout=DB_TIMEOUT_SEC,
         limits=httpx.Limits(max_connections=MAX_DB_WORKERS, max_keepalive_connections=MAX_DB_WORKERS),
@@ -895,6 +979,8 @@ async def lifespan(app: FastAPI):
         sync_http_client.close()
     if async_db_client is not None and not async_db_client.is_closed:
         await async_db_client.aclose()
+    if async_http_client is not None and not async_http_client.is_closed:
+        await async_http_client.aclose()
     if db_executor is not None:
         db_executor.shutdown(wait=False, cancel_futures=True)
     if pop_executor is not None:
@@ -1019,7 +1105,92 @@ def verify_pop_signature(public_key_pem: str, signature: bytes, canonical_payloa
         logging.warning(f"Signature verify error: {e}")
         return False
 
-@app.get("/auth")
+HOP_BY_HOP_HEADERS = frozenset([
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "upgrade",
+])
+SENSITIVE_FORWARD_HEADERS = frozenset([
+    "x-admin-token",
+])
+
+async def _forward_or_respond(
+    request: Request,
+    decision: dict,
+    x_spiffe_id: str,
+) -> Response:
+    if not UPSTREAM_URL:
+        return JSONResponse(status_code=200, content=decision)
+
+    status = decision.get("status")
+    policy = decision.get("policy")
+    source = decision.get("source", "UNKNOWN")
+
+    if status == "deny" or policy == "DENY":
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "deny",
+                "policy": "DENY",
+                "source": source,
+                "message": "Access Denied by Policy",
+            },
+        )
+
+    target_path = request.headers.get("x-target-path") or request.url.path
+    clean_target = target_path.lstrip('/')
+    target_url = f"{UPSTREAM_URL.rstrip('/')}/{clean_target}"
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
+
+    forward_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() not in SENSITIVE_FORWARD_HEADERS
+    }
+    forward_headers["X-Authenticated-SPIFFE-ID"] = x_spiffe_id
+    forward_headers["X-Policy-Decision"] = status or "allow"
+    forward_headers["X-Auth-Source"] = source
+
+    body = await request.body()
+    content = body if body else None
+    client = get_async_http_client()
+
+    try:
+        upstream_resp = await client.request(
+            method=request.method,
+            url=target_url,
+            headers=forward_headers,
+            content=content,
+            timeout=UPSTREAM_TIMEOUT_SEC,
+        )
+        resp_headers = {
+            k: v for k, v in upstream_resp.headers.items()
+            if k.lower() not in HOP_BY_HOP_HEADERS
+        }
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+        )
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=504,
+            content={"status": "error", "message": "Upstream Timeout"},
+        )
+    except httpx.RequestError:
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "message": "Bad Gateway - Upstream Unreachable"},
+        )
+
+@app.api_route("/auth", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def auth(
     request: Request,
     authorization: str = Header(None),
@@ -1076,7 +1247,7 @@ async def auth(
                 r_client = get_redis_client()
                 l2_val = await r_client.get(f"policy:{pubkey_key}")
                 if l2_val:
-                    pubkey_pem = l2_val.decode()
+                    pubkey_pem = l2_val.decode() if isinstance(l2_val, bytes) else str(l2_val)
                     l1_cache.set(pubkey_key, pubkey_pem)
             except Exception as e:
                 logging.debug(f"L2 pubkey cache read bypassed: {e}")
@@ -1213,7 +1384,8 @@ async def auth(
         with stats_lock:
             stats["l1_hits"] += 1
         ret_status = "deny" if cached_policy == "DENY" else "allow"
-        return {"status": ret_status, "source": "L1", "policy": cached_policy}
+        decision = {"status": ret_status, "source": "L1", "policy": cached_policy}
+        return await _forward_or_respond(request, decision, x_spiffe_id)
 
     try:
         r_client = get_redis_client()
@@ -1221,10 +1393,11 @@ async def auth(
         if l2_val:
             with stats_lock:
                 stats["l2_hits"] += 1
-            val = l2_val.decode()
+            val = l2_val.decode() if isinstance(l2_val, bytes) else str(l2_val)
             l1_cache.set(comp_key, val)
             ret_status = "deny" if val == "DENY" else "allow"
-            return {"status": ret_status, "source": "L2", "policy": val}
+            decision = {"status": ret_status, "source": "L2", "policy": val}
+            return await _forward_or_respond(request, decision, x_spiffe_id)
     except Exception as e:
         logging.warning(f"L2 cache fetch failed (Redis down?): {e}")
 
@@ -1235,13 +1408,14 @@ async def auth(
                 stats["singleflight_coalesced"] += 1
                 stats["db_fallbacks"] += 1
             try:
-                return await asyncio.shield(fut)
+                decision = await asyncio.shield(fut)
             except DBOverloadError:
                 return JSONResponse(status_code=503, content={"status": "error", "message": "Service Unavailable - DB Overload"})
             except Exception:
                 with stats_lock:
                     stats["circuit_state"] = cb.current_state
-                return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"})
+                decision = {"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"}
+            return await _forward_or_respond(request, decision, x_spiffe_id)
 
     can_exec, current_state = cb.can_execute()
     if not can_exec:
@@ -1249,7 +1423,8 @@ async def auth(
             stats["circuit_state"] = current_state
             stats["db_fallbacks"] += 1
             stats["circuit_blocked"] += 1
-        return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation"})
+        decision = {"status": "degraded_allow", "source": "Fallback_Degradation"}
+        return await _forward_or_respond(request, decision, x_spiffe_id)
 
     try:
         fut = asyncio.get_running_loop().create_future()
@@ -1278,10 +1453,10 @@ async def auth(
         # backend DB connections, semaphore slots, and compute (resource leak).
         # Therefore, cancellation propagates normally to abort the DB task.
         if SINGLEFLIGHT_ENABLED:
-            return await asyncio.shield(fut)
+            decision = await asyncio.shield(fut)
         else:
             try:
-                return await fut
+                decision = await fut
             except asyncio.CancelledError:
                 task.cancel()
                 try:
@@ -1296,11 +1471,49 @@ async def auth(
         logging.warning(f"DB fallback failed: {e}")
         with stats_lock:
             stats["circuit_state"] = cb.current_state
-        return JSONResponse(status_code=200, content={"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"})
+        decision = {"status": "degraded_allow", "source": "Fallback_Degradation_PostFail"}
+
+    return await _forward_or_respond(request, decision, x_spiffe_id)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    async with partition_lock:
+        current_partitioned = is_partitioned
+    if current_partitioned:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "node": NODE_NAME,
+                "redis": "isolated",
+                "detail": "Node Isolated",
+                "circuit_state": cb.current_state,
+            },
+        )
+
+    try:
+        r_client = get_redis_client()
+        await asyncio.wait_for(r_client.ping(), timeout=HEALTHCHECK_PING_TIMEOUT_SEC)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "healthy",
+                "node": NODE_NAME,
+                "redis": "connected",
+                "circuit_state": cb.current_state,
+            },
+        )
+    except (asyncio.TimeoutError, Exception):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "node": NODE_NAME,
+                "redis": "disconnected",
+                "detail": "Redis Unhealthy",
+                "circuit_state": cb.current_state,
+            },
+        )
 
 @app.get("/metrics")
 async def get_metrics():
@@ -1376,8 +1589,8 @@ async def set_redis(state: str):
         new_redis = Redis.from_url(DUMMY_REDIS_URL, socket_timeout=REDIS_DOWN_SOCKET_TIMEOUT)
         new_stream = Redis.from_url(DUMMY_REDIS_URL, socket_timeout=REDIS_DOWN_SOCKET_TIMEOUT)
     else:
-        new_redis = Redis.from_url(redis_url, socket_timeout=REDIS_TIMEOUT_SEC)
-        new_stream = Redis.from_url(redis_url, socket_timeout=STREAM_SOCKET_TIMEOUT)
+        new_redis = _create_redis_connection()
+        new_stream = _create_redis_connection(socket_timeout=STREAM_SOCKET_TIMEOUT)
 
     new_nonce_script = new_redis.register_script(NONCE_LUA)
     new_rl_script    = new_redis.register_script(SLIDING_RL_LUA)
@@ -1427,6 +1640,8 @@ if __name__ == "__main__":
     parser.add_argument("--db-mode", default="sync", choices=["sync", "async"])
     args, _ = parser.parse_known_args()
     os.environ["NODE_NAME"] = args.node
+    NODE_NAME = args.node
+    node_name = args.node
     os.environ["DB_MODE"] = args.db_mode
     uvicorn.run("gateway:app", host="0.0.0.0", port=args.port)
 
