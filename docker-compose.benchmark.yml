@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: pop_sync_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  policy_db:
+    build: .
+    container_name: pop_sync_policy_db
+    command: python policy_db.py
+    ports:
+      - "8005:8000"
+    environment:
+      - SIMULATED_DB_LATENCY_SEC=${SIMULATED_DB_LATENCY_SEC:-0.02}
+      - ADMIN_SECRET_TOKEN=super-secret-admin
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/policy/test?sid=1&res=1')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build: .
+    container_name: pop_sync_gateway
+    command: python gateway.py --node Gateway-Bench --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=http://policy_db:8000
+      - ADMIN_SECRET_TOKEN=super-secret-admin
+      - SINGLEFLIGHT_ENABLED=${SINGLEFLIGHT_ENABLED:-true}
+      - CLUSTER_SINGLEFLIGHT_ENABLED=${CLUSTER_SINGLEFLIGHT_ENABLED:-true}
+      - RL_ALGORITHM=${RL_ALGORITHM:-sliding}
+      - POP_VERIFY_ENABLED=${POP_VERIFY_ENABLED:-false}
+      - UPSTREAM_URL="" # Pure PDP mode for ext_authz
+    depends_on:
+      redis:
+        condition: service_healthy
+      policy_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mock_backend:
+    build: .
+    container_name: pop_sync_mock_backend
+    command: python -m uvicorn tests.mock_backend:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    environment:
+      - DEFAULT_BENCH_MODE=overhead
+      - SIMULATED_DB_LATENCY_SEC=0.02
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    container_name: pop_sync_envoy
+    volumes:
+      - ./tests/envoy_benchmark.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "9901:9901"
+      - "10000:10000" # Tier 2: Pure Proxy-Only Hop
+      - "10001:10001" # Tier 3: Envoy + ext_authz (PoP-Sync)
+    depends_on:
+      gateway:
+        condition: service_healthy
+      mock_backend:
+        condition: service_healthy
+
+  benchmark_runner:
+    build: .
+    container_name: pop_sync_benchmark_runner
+    command: >
+      python tests/benchmark_ext_authz.py
+      --target-direct http://mock_backend:8080
+      --target-proxy http://envoy:10000
+      --target-ext-authz http://envoy:10001
+      --target-pdp http://gateway:8000
+      --duration 5
+    depends_on:
+      - envoy
+    profiles:
+      - runner

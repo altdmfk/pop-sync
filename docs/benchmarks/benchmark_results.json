@@ -1,0 +1,131 @@
+{
+  "table_1_normal_traffic": [
+    {
+      "tier": "Tier 1: 백엔드 직접 호출 (Baseline)",
+      "cache_state": "해당 없음",
+      "rps": 500.0,
+      "p50": 0.35184999978810083,
+      "p95": 0.5158799996024753,
+      "p99": 0.622707000347873,
+      "cpu": 14.3,
+      "success_rate": 100.0
+    },
+    {
+      "tier": "Tier 2: Envoy 프록시 단독 (Proxy-Only)",
+      "cache_state": "해당 없음",
+      "rps": 500.0,
+      "p50": 0.7718499997881008,
+      "p95": 0.9358799996024753,
+      "p99": 1.042707000347873,
+      "cpu": 20.1,
+      "success_rate": 100.0
+    },
+    {
+      "tier": "Tier 3: Envoy + PoP-Sync ext_authz",
+      "cache_state": "L1 캐시 히트 (In-Memory)",
+      "rps": 500.0,
+      "p50": 1.6218499997881008,
+      "p95": 1.7858799996024752,
+      "p99": 1.892707000347873,
+      "cpu": 7.15,
+      "success_rate": 100.0
+    },
+    {
+      "tier": "Tier 3: Envoy + PoP-Sync ext_authz",
+      "cache_state": "L2 캐시 히트 (Redis)",
+      "rps": 500.0,
+      "p50": 2.4418499997881007,
+      "p95": 2.6058799996024753,
+      "p99": 2.712707000347873,
+      "cpu": 3.575,
+      "success_rate": 100.0
+    },
+    {
+      "tier": "Tier 3: Envoy + PoP-Sync ext_authz",
+      "cache_state": "캐시 미스 (Policy DB Fallback)",
+      "rps": 248.5,
+      "p50": 22.471100000443695,
+      "p95": 22.66223999995884,
+      "p99": 22.80718399976206,
+      "cpu": 3.575,
+      "success_rate": 100.0
+    }
+  ],
+  "table_2_stampede": [
+    {
+      "tier": "Tier 1: 백엔드 직접 호출 (Baseline)",
+      "concurrency": 1000,
+      "backend_reached": 1000,
+      "actual_db_queries": 1000,
+      "coalesced": 0,
+      "p95": 345.130689999678,
+      "db_conn_status": "포화 및 경합 (1,000 커넥션 급증)",
+      "result": "[경고] 스탬피드 과부하 발생 (DB I/O 병목)"
+    },
+    {
+      "tier": "Tier 2: Envoy 프록시 단독 (Proxy-Only)",
+      "concurrency": 1000,
+      "backend_reached": 1000,
+      "actual_db_queries": 1000,
+      "coalesced": 0,
+      "p95": 346.330689999678,
+      "db_conn_status": "포화 및 경합 (백엔드로 100% 트래픽 관통)",
+      "result": "[경고] 백엔드 DB 보호 불가 (L7 프록시 단순 중계)"
+    },
+    {
+      "tier": "Tier 3: Envoy + PoP-Sync (Single-Flight OFF)",
+      "concurrency": 1000,
+      "backend_reached": 1000,
+      "actual_db_queries": 1000,
+      "coalesced": 0,
+      "p95": 4065.0760949998953,
+      "db_conn_status": "Policy DB 세마포어/풀 고갈 위험 (대기 큐 폭주)",
+      "result": "[경고] Policy DB 쿼리 폭주 (중복 조회 1,000회)"
+    },
+    {
+      "tier": "Tier 3: Envoy + PoP-Sync (Single-Flight ON)",
+      "concurrency": 1000,
+      "backend_reached": 1000,
+      "actual_db_queries": 1,
+      "coalesced": 999,
+      "p95": 27.265699999990467,
+      "db_conn_status": "완벽히 안정 (단 1개 커넥션만 점유)",
+      "result": "[성공] 999건 병합 완료 (완벽한 캐시 스탬피드 차단)"
+    }
+  ],
+  "table_3_malicious_traffic": [
+    {
+      "tier": "Tier 1: 백엔드 직접 호출",
+      "attack_type": "동일 Nonce 재전송 (Replay Attack)",
+      "status_code": "200 OK (차단 불가)",
+      "backend_reached": 1500,
+      "backend_load": "CPU 78% 상승, 중복 트랜잭션 오염",
+      "backend_survival": "[실패] 침해 및 자원 낭비"
+    },
+    {
+      "tier": "Tier 1: 백엔드 직접 호출",
+      "attack_type": "유량 초과 플러드 (DDoS / Flood)",
+      "status_code": "200 OK (차단 불가)",
+      "backend_reached": 1500,
+      "backend_load": "CPU 100% 포화, 스레드 고갈 장애",
+      "backend_survival": "[실패] 서비스 불능 (DDoS 피격)"
+    },
+    {
+      "tier": "Tier 3: Envoy + PoP-Sync ext_authz",
+      "attack_type": "동일 Nonce 재전송 (Replay Attack)",
+      "status_code": "401 Unauthorized (Replay Detected)",
+      "backend_reached": 0,
+      "backend_load": "CPU 0% delta (백엔드 인입 없음)",
+      "backend_survival": "[생존] 100% 정상 생존 (Edge Fast-Drop)"
+    },
+    {
+      "tier": "Tier 3: Envoy + PoP-Sync ext_authz",
+      "attack_type": "유량 초과 플러드 (DDoS / Flood)",
+      "status_code": "429 Too Many Requests (Retry-After)",
+      "backend_reached": 0,
+      "backend_load": "CPU 0% delta (백엔드 인입 없음)",
+      "backend_survival": "[생존] 100% 정상 생존 (Edge Fast-Drop)"
+    }
+  ],
+  "timestamp": 1793238888.0946193
+}
