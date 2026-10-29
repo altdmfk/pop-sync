@@ -29,6 +29,9 @@ async def test_pdp_mode_when_upstream_url_empty(mock_common_dependencies):
     assert data["status"] == "allow"
     assert data["source"] in ("L1", "L2", "DB")
     assert "policy" in data
+    assert resp.headers.get("x-authenticated-spiffe-id") == "spiffe://test/pdp-user"
+    assert resp.headers.get("x-policy-decision") == "allow"
+    assert resp.headers.get("x-auth-source") in ("L1", "L2", "DB")
 
 
 @pytest.mark.asyncio

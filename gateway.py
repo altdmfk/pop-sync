@@ -1126,12 +1126,18 @@ async def _forward_or_respond(
     decision: dict,
     x_spiffe_id: str,
 ) -> Response:
-    if not UPSTREAM_URL:
-        return JSONResponse(status_code=200, content=decision)
-
     status = decision.get("status")
     policy = decision.get("policy")
     source = decision.get("source", "UNKNOWN")
+
+    decision_headers = {
+        "X-Authenticated-SPIFFE-ID": x_spiffe_id,
+        "X-Policy-Decision": status or "allow",
+        "X-Auth-Source": source,
+    }
+
+    if not UPSTREAM_URL:
+        return JSONResponse(status_code=200, headers=decision_headers, content=decision)
 
     if status == "deny" or policy == "DENY":
         return JSONResponse(
