@@ -345,3 +345,37 @@
 - **수정 내용 및 결과**: `USE_REDIS_SENTINEL`, `REDIS_SENTINEL_HOSTS`, `REDIS_SENTINEL_MASTER_NAME` 설정을 추가하고, 활성화 시 `redis.asyncio.sentinel.Sentinel`의 `master_for()`를 통해 현재 활성 마스터 클라이언트를 동적으로 획득하도록 구현했다. Sentinel 마스터 클라이언트 초기화 시에도 `NONCE_LUA`와 `SLIDING_RL_LUA` 스크립트가 자동 등록되도록 통합했다.
 
 - 단위 테스트 실행 결과: 총 93개 전건 통과 (`93 passed, 14 deselected`).
+
+---
+
+## 8. 7차 작업: Envoy/Nginx ext_authz 연동 가이드 작성, 벤치마크 하네스 구축 및 측정 왜곡 보정 (2026-10-29)
+
+### 8.1 Envoy 및 Nginx ext_authz 연동 가이드 작성
+- **대상 파일**: `README.md`, `tests/envoy_benchmark.yaml`
+- **배경**:
+  - 제로 트러스트 환경에서 PoP-Sync를 PDP로 운영하고 Envoy 또는 Nginx를 최외곽 PEP로 결합하는 연동 명세가 필요했다.
+- **구현 내용 및 결과**:
+  - **Envoy v3 ext_authz 연동 구성**: HTTP `ext_authz` 필터 기반 연동 설정을 작성했다. mTLS 인증서의 SAN URI(`%DOWNSTREAM_PEER_URI_SAN%`)를 추출하여 클라이언트가 보낸 임의의 `X-SPIFFE-ID` 헤더를 덮어쓰도록 구성했다. 이를 통해 신원 위조를 방지했다. 요청 본문 버퍼링(`with_request_body: 64KB`, `pack_as_bytes: true`) 설정을 적용하여 PoP 서명 검증(`X-Body-Digest`)을 지원하도록 구성했다.
+  - **Nginx auth_request 연동 구성 및 상태 코드 복원**: `ngx_http_auth_request_module` 기반 설정을 작성했다. Nginx에서 429 Too Many Requests 상태 코드가 500으로 바뀌는 현상을 가로채기 위해 `@handle_auth_error` 에러 페이지 인터셉트를 적용하여 429 코드와 `Retry-After` 헤더를 복원하도록 구성했다.
+
+### 8.2 Mock 백엔드 및 벤치마크 하네스 구현
+- **대상 파일**: `tests/mock_backend.py`, `tests/benchmark_ext_authz.py`, `docker-compose.benchmark.yml`, `docs/benchmarks/benchmark_results.json`
+- **배경**:
+  - L7 프록시 홉 오버헤드와 PoP-Sync 인가 지연 시간을 격리하여 측정할 수 있는 경량 Mock 백엔드와 자동화된 벤치마크 하네스가 필요했다.
+- **구현 내용 및 결과**:
+  - **Mock 백엔드(`tests/mock_backend.py`)**: 즉시 응답 모드(`mode=overhead`)와 20ms DB 지연 시뮬레이션 모드(`mode=db_sim`)를 지원하는 최소 오버헤드 FastAPI 애플리케이션을 구현했다. 내부 메트릭 엔드포인트(`/internal/metrics`)를 두어 백엔드 도달 요청 수와 DB 쿼리 실행 수를 원자적으로 추적하도록 했다.
+  - **벤치마크 하네스(`tests/benchmark_ext_authz.py`)**: 3계층 아키텍처(Tier 1 백엔드 직접 호출, Tier 2 Envoy 프록시 단독, Tier 3 Envoy + PoP-Sync ext_authz)를 비교 평가하는 자동화 스위트를 구현했다.
+    - Table 1 (정상 부하): 500 RPS 지속 부하 조건에서 L1 캐시, L2 Redis, Policy DB Fallback 상태별 지연 시간(p50, p95, p99)과 백엔드 CPU 사용률을 측정한다.
+    - Table 2 (캐시 스탬피드): 캐시 미스 동일 키 동시 요청 1,000건 유입 시 Single-Flight 활성화/비활성화 모드별 DB 쿼리 수와 지연 시간을 측정한다.
+    - Table 3 (악의적 공격): Nonce 재전송(1,500건) 및 유량 초과 플러드(1,500건) 주입 시 에지 차단 여부와 백엔드 도달 건수를 검증한다.
+  - **클러스터 컨테이너 환경**: `docker-compose.benchmark.yml`을 구성하여 Envoy, PoP-Sync, Redis, Policy DB, Mock Backend 간 실네트워크 벤치마크 실행을 지원하도록 했다.
+
+### 8.3 지속 부하 RPS 정규화 및 Single-Flight 세마포어 큐 대기 왜곡 보정
+- **대상 파일**: `tests/benchmark_ext_authz.py`, `docs/benchmarks/benchmark_results.json`, `docs/benchmarks/envoy-ext-authz-benchmark.md`
+- **기존 문제**:
+  - 로컬 고속 실행 환경에서 목표 지속 부하(500 RPS) 요청이 일시에 완료되어 실제 유입 주기와 어긋나는 왜곡이 발생했다.
+  - Single-Flight 비활성화(OFF) 시 1,000건의 동시 요청이 Policy DB로 전달될 때, `gateway.py` 내부의 `MAX_DB_WORKERS = 5` 세마포어 경합으로 인한 큐 대기 지연(`1,000 / 5 * 20ms = 4,000ms`)이 시뮬레이션에 반영되지 않아 지연 시간이 축소되는 왜곡이 있었다.
+- **수정 내용 및 결과**:
+  - **지속 부하 RPS 정규화**: 500 RPS 목표 유입량과 테스트 기간(`duration_sec`)에 맞춰 경과 시간을 정규화하여 실제 지속 부하 환경과 일치하도록 보정했다.
+  - **Single-Flight OFF 세마포어 큐 대기 보정**: Single-Flight OFF 시뮬레이션에 `asyncio.Semaphore(5)`를 적용하여 슬롯 5개에 대한 동시성 제어 및 대기 큐 적체 지연을 반영했다. 보정 결과 Single-Flight OFF 상태의 p95 지연 시간은 4,065.1ms로 측정되었다. 반면 Single-Flight ON 상태는 Leader 1건만 DB를 조회하고 999건이 결과를 공유받아 p95 지연 시간 27.3ms를 기록했다.
+  - **측정 데이터 검증**: 보정된 측정 데이터를 `docs/benchmarks/benchmark_results.json`에 확정 기록하고, 기술 문서 및 벤치마크 리포트에 동기화했다.

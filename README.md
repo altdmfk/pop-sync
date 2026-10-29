@@ -11,14 +11,14 @@ Policy DB 장애 감지 시 OPEN 상태로 전환하여 연쇄 장애를 차단�
 
 ### L1/L2 캐시 및 단일 비행
 정책 조회는 다단계로 동작한다. 노드 로컬의 L1(OrderedDict LRU, 지연 만료)을 확인하고, 없으면 중앙 Redis(L2)를 조회한다. 모두 캐시 미스일 때 Policy DB를 호출한다.
-`SINGLEFLIGHT_ENABLED` 및 `CLUSTER_SINGLEFLIGHT_ENABLED`가 기본 활성화되어 있다. 노드 내부의 `in_flight` Future 병합뿐 아니라, Redis 분산 락(`SET NX lock:sf:{key}`)과 L2 폴링 메커니즘을 통해 클러스터 전역에서도 동일 키 동시 DB 호출을 1회로 병합하여 백엔드 DB 과부하를 방지한다 (효과 검증: docs/benchmarks/singleflight-effect.md).
-
+`SINGLEFLIGHT_ENABLED` 및 `CLUSTER_SINGLEFLIGHT_ENABLED`가 기본 활성화되어 있다. 노드 내부의 `in_flight` Future 병합뿐 아니라, Redis 분산 락(`SET NX lock:sf:{key}`)과 L2 폴링 메커니즘을 통해 클러스터 전역에서도 동일 키 동시 DB 호출을 1회로 병합하여 백엔드 DB 과부하를 방지한다 (단일 노드 실측: docs/benchmarks/singleflight-effect.md, Envoy ext_authz 연동 실측: docs/benchmarks/envoy-ext-authz-benchmark.md).
+ 
 ### 스트림 기반 무효화 동기화
 네트워크 단절 발생 시 지연되었던 Redis Stream 대기 메시지(PEL)를 누락분부터 연속 적용한다. 이를 통해 최종 일관성을 유지한다.
-
+ 
 ### O(1) 유량 제한 및 Nonce 리플레이 방어
 `RL_ALGORITHM` 설정으로 유량 제한 방식을 결정한다(기본값 `sliding`). `sliding` 방식은 Lua 스크립트 기반 가중 합산 근사치로 동작하며, `fixed` 방식은 Redis Pipeline을 사용한다 (경계 버스트 측정 결과: docs/benchmarks/rate-limit-sliding.md). 유량 제한은 노드 단위가 아닌 클라이언트 ID(`SPIFFE ID`) 기준의 클러스터 전역 한도를 적용한다.
-Lua 스크립트 기반 원자적 Nonce 소진으로 DDoS와 리플레이 공격을 방어한다.
+Lua 스크립트 기반 Nonce 중복 검증으로 리플레이 공격을 방어한다 (Envoy 에지 차단 실측: docs/benchmarks/envoy-ext-authz-benchmark.md).
 
 ### PoP 검증 (Scope B)
 FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERIFY_ENABLED` 기본값 `False`). Policy DB에서 공개키를 조회하여 노드 캐시(L1/L2)에 보관한다. 리플레이 방지를 위해 Nonce 검증 통과 후에 서명 검증을 수행한다. 통계 분류를 위해 서명 누락과 검증 실패 카운터를 별도로 집계한다.
@@ -58,7 +58,7 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
    │     ├─ Redis 정상: 클러스터 전역 Sliding/Fixed (50 req / 10s) 초과 ──> 429 Too Many Requests (rate_limited +1)
    │     └─ Redis 장애: 노드 로컬 슬라이딩 윈도우 (15 req / 10s) 초과 ───> 429 Too Many Requests (rate_limited +1)
    │
-   ├─ 3. 원자적 Nonce 소진 (※ 고비용 암호 연산 전에 실행하여 Nonce 즉시 소진)
+   ├─ 3. Nonce 중복 검증 (고비용 암호 연산 전에 실행하여 사용 처리)
    │     ├─ Redis 장애/타임아웃 (분산 락 불가 → 데이터 오염 방지) ─────────> 503 Fail-Closed (redis_outage_blocked +1)
    │     └─ 중복 Nonce (EXISTS == 1) ────────────────────────────────────> 401 Replay Detected (nonce_replays +1)
    │
@@ -102,14 +102,14 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
 
 | # | 시나리오명 | 트리거 (API / 설정) | 핵심 방어 메커니즘 | 기대 HTTP 응답 및 상태 | 핵심 관측 메트릭 |
 | :-: | :--- | :--- | :--- | :--- | :--- |
-| **1** | **중복 요청 및 리플레이 방어** | `POST /chaos/nonce` | Redis Lua 원자적 Nonce 소진 (`NONCE_LUA`) | 1개 노드 `200 OK`, 다른 노드 `401 Replay Detected` (Redis 장애 시 양쪽 `503`) | `nonce_replays +1` (장애 시 `redis_outage_blocked +1`) |
+| **1** | **중복 요청 및 리플레이 방어** | `POST /chaos/nonce` | Redis Lua 기반 Nonce 중복 검증 (`NONCE_LUA`) | 1개 노드 `200 OK`, 다른 노드 `401 Replay Detected` (Redis 장애 시 양쪽 `503`) | `nonce_replays +1` (장애 시 `redis_outage_blocked +1`) |
 | **2** | **대규모 DDoS 및 경계 버스트 방어** | `POST /chaos/ddos` (60건 동시 폭주) | Check-Before-Increment O(1) 가중 합산 슬라이딩 윈도우 (`50 req / 10s`) | 첫 실행 `200` 50건 / `429` 10건, 연속 실행 시 `429` 60건 차단 | `rate_limited` 증가, `Retry-After: 10` 헤더 |
 | **3** | **동일 키 폭주 및 클러스터 전역 단일 비행 병합** | `POST /chaos/same_key_burst` (`count=50`) | Redis 분산 락(`SET NX`) 기반 Leader 선출 + Follower L2 폴링 및 In-Flight Future 병합 (`asyncio.shield`) | 전 노드 요청 모두 `200 OK`, **클러스터 전체에서 실제 DB 쿼리는 1회만 실행** (노드별 중복 쿼리 방지) | 클러스터 전체 `db_queries_executed = 1`, `singleflight_coalesced = N - 1` |
 | **4** | **백엔드 DB 장애 격리 및 서킷 브레이커** | `POST /chaos/db/down` → `/chaos/db/up` | 3-State 서킷 브레이커, HALF_OPEN 단일 프로브 원자적 게이팅, 2.0s 디바운스 | 캐시 히트는 `200 OK(L1/L2)`, 캐시 미스는 `200 OK(degraded_allow)` 폴백 | `circuit_state: OPEN`, `circuit_blocked` 증가 |
 | **5** | **중앙 Redis 장애 및 로컬 생존 모드** | `POST /chaos/redis/down` → `/chaos/redis/up` | 로컬 Rate Limit 폴백(`15 req / 10s`) + Nonce `503 Fail-Closed` | 노드당 한도(15건) 초과분은 `429`, 통과분(15건)은 Nonce 단계에서 `503` 차단 | `local_rl_size` 활성화, `redis_outage_blocked` 증가, Invariant `PASS` |
 | **6** | **네트워크 파티션 및 PEL 긴급 복구** | `POST /chaos/partition/Node-B/isolate` → `heal` | 고립 노드 `503` 차단(Split-Brain 방어) + 복구 시 Stream PEL(`"0"`) 드레인 및 XAUTOCLAIM 유휴 회수 | 단절 중 `/auth`는 `503 Node Isolated`, 복구 즉시 누락 무효화 일괄 반영 | `is_partitioned: true→false`, `last_catchup` 상세 지표 기록 |
 | **7** | **실시간 캐시 무효화 스트림 전파** | `POST /chaos/invalidate` | Redis Streams `XADD` (`maxlen~10000`) + 노드별 `XREADGROUP` | 전 노드의 L1 및 L2 캐시에서 대상 정책 키 즉시 삭제 및 `XACK` | 전 노드 `l1_cache_size` 감소 후 재조회 시 `source: "DB"` |
-| **8** | **ECDSA P-256 PoP 서명 검증** | `POP_VERIFY_ENABLED=true` | Nonce 선행 소진 후 Query/Body Digest 바인딩 ECDSA 검증 및 `/pubkey` 서킷 연동 | 정상 `200`, 서명 누락/바디 다이제스트 오류 `400`, 위변조/미등록 키 `401`, DB 서킷 OPEN 시 `503` | `pop_verified` / `pop_rejected` 분리 집계 |
+| **8** | **ECDSA P-256 PoP 서명 검증** | `POP_VERIFY_ENABLED=true` | Nonce 검증 통과 후 Query/Body Digest 바인딩 ECDSA 검증 및 `/pubkey` 서킷 연동 | 정상 `200`, 서명 누락/바디 다이제스트 오류 `400`, 위변조/미등록 키 `401`, DB 서킷 OPEN 시 `503` | `pop_verified` / `pop_rejected` 분리 집계 |
 | **9** | **정책 거부(DENY) 인가 검증** | `X-Res: restricted` 또는 `.../deny` | DB `status: "deny"` 명시적 판별 및 `"DENY"` 캐싱 | `200 OK` (`{"status": "deny", "policy": "DENY"}`) 반환 및 L1/L2 캐싱 | 후속 요청 시 L1/L2에서 `"DENY"` 즉시 반환 |
 
 ---
@@ -158,7 +158,7 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
     }
     ```
     → 요청이 분산 유입되어도 클러스터 전역 한도 50건만 허용되고 나머지 10건은 `429`로 차단된다.
-  - **10초 이내 재실행 시**: 윈도우 한도가 소진되어 `{"status": "flooded", "responses": {"429": 60}}`으로 전건 차단된다.
+  - **10초 이내 재실행 시**: 윈도우 한도를 초과하여 `{"status": "flooded", "responses": {"429": 60}}`으로 전건 차단된다.
   - **경계 버스트 실측 비교 (`docs/benchmarks/rate-limit-sliding.md`)**:
     - 윈도우 변경 0.5초 전 50건, 변경 직후 0.5초 후 50건(총 1초간 100건) 전송 시:
     - **`fixed` 모드**: 윈도우 리셋으로 직전 50건과 직후 50건이 모두 통과하여 총 100건이 허용된다.
@@ -206,9 +206,9 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
      - PoP 공개키 조회 캐시 미스(`/pubkey`)의 경우, 미인가 접근을 막기 위해 저하 허용 대신 **`503 Service Unavailable` [Fail-Closed]**로 안전하게 차단한다.
   3. **`HALF_OPEN` 원자적 단일 프로브 및 자동 복구 (`CB_RESET_TIMEOUT_SEC = 10s`)**:
      - 마지막 실패로부터 10초가 지나면 서킷 브레이커는 `HALF_OPEN` 상태로 전이된다.
-     - 동시 유입된 다수의 캐시 미스 요청 중 단 1개의 요청만 프로브로 선점되어 Policy DB 조회를 시도한다. 후속 요청들은 대기 없이 즉시 `degraded_allow`로 처리되어 백엔드 중복 조회를 방지한다.
+     - 동시 유입된 다수의 캐시 미스 요청 중 요청 1개만 프로브로 선점되어 Policy DB 조회를 시도한다. 후속 요청들은 대기 없이 즉시 `degraded_allow`로 처리되어 백엔드 중복 조회를 방지한다.
      - **성공 시**: `cb.record_success()`가 호출되어 즉시 `CLOSED` 상태로 복구되고(실패 카운트 리셋, 프로브 슬롯 반환), 정상 응답을 반환한다.
-     - **실패 시**: `HALF_OPEN` 상태에서는 디바운스 없이 단 1회 실패로 즉시 다시 `OPEN` 상태로 전이된다.
+     - **실패 시**: `HALF_OPEN` 상태에서는 디바운스 없이 1회 실패 시 다시 `OPEN` 상태로 전이된다.
   4. **상태 진동 방지 2.0초 디바운스 (`CB_DEBOUNCE_SEC = 2.0s`)**:
      - 서킷 브레이커는 `CLOSED` 상태 전이 직후 2.0초 이내에 도착하는 지연 실패 신호를 무시한다. 복구 직후 서킷이 다시 `OPEN`으로 튀지 않고 안정적으로 `CLOSED`를 유지한다.
   5. **세마포어 벌크헤드 (`MAX_DB_WORKERS = 5`)**:
@@ -291,13 +291,13 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
 
 | 세부 케이스 | 요청 파라미터 / 변조 내용 | 게이트웨이 처리 동작 | 기대 HTTP 응답 | 관측 메트릭 |
 | :--- | :--- | :--- | :--- | :--- |
-| **8-1. 정상 서명** | 유효한 개인키로 6개 정규화 필드 서명 | Rate Limit 통과 → Nonce 소진 → 공개키 조회(L1/L2/DB) → 서명 성공 | `200 OK` (`{"status": "allow", "source": "L1\|L2\|DB"}`) | `pop_verified +1` |
-| **8-2. 서명 헤더 누락** | `X-PoP-Signature` 미포함 | Nonce 소진 직후 헤더 검사에서 거부 | `400 Bad Request` (`"Missing PoP Signature"`) | `pop_rejected +1` |
-| **8-3. 바디 다이제스트 오류** | `X-Body-Digest` 접두사 누락 또는 본문 해시 불일치 | Nonce 소진 직후 SHA-256 해시 검증 실패 시 거부 | `400 Bad Request` (`"Missing or invalid X-Body-Digest header"` 또는 `"Body digest mismatch"`) | `pop_rejected +1` |
+| **8-1. 정상 서명** | 유효한 개인키로 6개 정규화 필드 서명 | Rate Limit 통과 → Nonce 사용 처리 → 공개키 조회(L1/L2/DB) → 서명 성공 | `200 OK` (`{"status": "allow", "source": "L1\|L2\|DB"}`) | `pop_verified +1` |
+| **8-2. 서명 헤더 누락** | `X-PoP-Signature` 미포함 | Nonce 사용 처리 직후 헤더 검사에서 거부 | `400 Bad Request` (`"Missing PoP Signature"`) | `pop_rejected +1` |
+| **8-3. 바디 다이제스트 오류** | `X-Body-Digest` 접두사 누락 또는 본문 해시 불일치 | Nonce 사용 처리 직후 SHA-256 해시 검증 실패 시 거부 | `400 Bad Request` (`"Missing or invalid X-Body-Digest header"` 또는 `"Body digest mismatch"`) | `pop_rejected +1` |
 | **8-4. 페이로드 위변조 / 타인 키** | 경로나 쿼리 위변조, 또는 타인 개인키로 서명 | 공개키 검증 시 해시 불일치 (`InvalidSignature`) | `401 Unauthorized` (`"Invalid PoP Signature"`) | `pop_rejected +1` |
 | **8-5. 미등록 클라이언트 키** | `X-SPIFFE-ID: spiffe://test/nokey` | Policy DB `GET /pubkey`가 `404 Key not found` 반환 | `401 Unauthorized` (`"Unknown Key ID"`) | `pop_rejected +1` |
 | **8-6. 리플레이된 Nonce 공격** | 이미 사용된 `X-Nonce` + 서명 전송 | Nonce 검사 단계에서 즉시 차단 (ECDSA 연산 전에 차단하여 CPU 낭비 방지) | `401 Unauthorized` (`"Replay Detected"`) | `nonce_replays +1` (`pop_rejected`는 `0` 유지) |
-| **8-7. DB 장애 중 공개키 캐시 미스** | 서킷 `OPEN` 상태에서 캐시에 없는 ID로 요청 | Nonce 소진 후 `/pubkey` DB 폴백 전 `cb.can_execute()`에서 차단 (Fail-Closed) | `503 Service Unavailable` (`"Service Unavailable - Key Fetch Failed"`) | `circuit_blocked +1`, `pubkey_circuit_blocked +1`, `pop_rejected +1` |
+| **8-7. DB 장애 중 공개키 캐시 미스** | 서킷 `OPEN` 상태에서 캐시에 없는 ID로 요청 | Nonce 사용 처리 후 `/pubkey` DB 폴백 전 `cb.can_execute()`에서 차단 (Fail-Closed) | `503 Service Unavailable` (`"Service Unavailable - Key Fetch Failed"`) | `circuit_blocked +1`, `pubkey_circuit_blocked +1`, `pop_rejected +1` |
 
 ---
 
@@ -421,17 +421,547 @@ pytest -m e2e
   - 인가 거부(`DENY`) 시에는 Upstream으로 요청을 전달하지 않고 게이트웨이 레벨에서 즉시 `403 Forbidden` JSON을 반환한다.
   - 인가 허용(`allow` 또는 `degraded_allow`) 시에는 Hop-by-hop 헤더 및 내부 관리자 토큰(`x-admin-token`)을 안전하게 제거하고, 검증된 신원 컨텍스트 헤더(`X-Authenticated-SPIFFE-ID`, `X-Policy-Decision`, `X-Auth-Source`)를 주입하여 지연 초기화 커넥션 풀(`httpx.AsyncClient`)을 통해 백엔드 Upstream 서버로 비동기 패스스루 포워딩한다. 별도의 외부 프록시 계층 없이 단독 인프라로 즉시 배포할 수 있다.
 
-### 2) 클라이언트 암호학적 서명 요구사항 (Client-Side Overhead)
-- **PoP 비대칭 서명 검증(`POP_VERIFY_ENABLED=true`)**: ECDSA P-256 비대칭 키 기반 서명 생성 및 검증은 리플레이 및 토큰 탈취 공격을 원천 무력화하지만, 클라이언트 측 Web Crypto API 또는 WebAuthn 기반 서명 SDK 도입이 필수적이며 클라이언트/서버 양측의 암호학적 연산 오버헤드를 수반한다.
-- **선별 적용 권장**: 따라서 일반 웹 트래픽 전체에 전면 적용하기보다는 **금융/결제 API (FAPI 규격 준수), 제로 트러스트(Zero Trust) 엔터프라이즈 환경, 대규모 트래픽이 집중되는 선착순 주문/티켓팅 등 고보안·고트래픽 핵심 비즈니스 API**에 선별적으로 적용하는 것을 권장한다.
+### 2) 클라이언트 암호 연산 요구사항
+- **PoP 비대칭 서명 검증(`POP_VERIFY_ENABLED=true`)**: ECDSA P-256 비대칭 키 기반 서명 생성 및 검증은 리플레이 및 토큰 탈취 공격을 방지하지만, 클라이언트 측 Web Crypto API 또는 WebAuthn 기반 서명 SDK 도입이 필요하며 클라이언트와 서버 양측의 암호 연산 오버헤드가 발생한다.
+- **선별 적용 권장**: 일반 웹 트래픽 전체보다는 금융/결제 API, 제로 트러스트 엔터프라이즈 환경, 대규모 트래픽이 집중되는 주문/티켓팅 등 고보안·고트래픽 API에 선별 적용하는 구성을 권장한다.
 
-### 3) 시스템 레벨 가용성(HA) 및 다중 리전 동기화 제약
-- **Redis SPOF 대응 및 딥 헬스체크**:
+### 3) 시스템 가용성 및 다중 리전 동기화 제약
+- **Redis SPOF 대응 및 헬스체크**:
   - `USE_REDIS_SENTINEL=true` 활성화 시 Redis Sentinel 클러스터를 통해 마스터 장애 발생 시 자동 승격된 신규 마스터로 동적 재연결하여 단일 장애점(SPOF)을 제거한다.
-  - `GET /health` 엔드포인트는 `0.2s` 타임아웃 제한의 Redis `ping()` 검사와 네트워크 파티션(고립) 상태를 실시간 판별하는 딥 헬스체크를 수행한다. 장애 감지 시 즉시 `503 Service Unavailable`을 반환하여 상위 GSLB 및 L4/L7 로드밸런서(ALB)가 비정상 노드를 신속하게 감지하고 Standby 클러스터로 자동 페일오버하도록 보장한다.
+  - `GET /health` 엔드포인트는 `0.2s` 타임아웃 제한의 Redis `ping()` 검사와 네트워크 파티션 고립 상태를 실시간 판별하는 헬스체크를 수행한다. 장애 감지 시 즉시 `503 Service Unavailable`을 반환하여 상위 GSLB 및 L4/L7 로드밸런서(ALB)가 비정상 노드를 감지하고 Standby 클러스터로 자동 페일오버하도록 보장한다.
 - **Multi-Region Active-Active 한계**:
-  - 원자적 Nonce 소진(Redis Lua)과 클러스터 분산 락(`SET NX`)은 엄격한 강한 일관성(Strong Consistency)을 전제한다. 대륙 간/원거리 리전 간 Active-Active 구성 시 물리적 광속 한계로 인한 네트워크 왕복 지연(RTT 10~50ms+)이 발생하여 전체 요청 레이턴시가 급격히 저하된다.
-  - 따라서 **1ms 미만 지연 시간을 보장하는 동일 리전 Multi-AZ(다중 가용 영역) 환경에서의 Active-Active** 구성 또는, **GSLB 기반 Multi-Region Active-Standby** 구성을 권장한다.
+  - Redis Lua 기반 Nonce 중복 검증과 클러스터 분산 락(`SET NX`)은 일관성을 전제한다. 대륙 간 또는 원거리 리전 간 Active-Active 구성 시 네트워크 왕복 지연(RTT 10~50ms+)으로 전체 요청 지연 시간이 증가한다.
+  - 따라서 동일 리전 Multi-AZ 환경에서의 Active-Active 구성이나 GSLB 기반 Multi-Region Active-Standby 구성을 권장한다.
+
+---
+
+## Envoy / Nginx 연동 가이드
+
+본 가이드는 프로덕션 환경에서 PoP-Sync를 PDP로 동작시키고 Envoy 및 Nginx를 PEP로 구성하여 제로 트러스트 아키텍처를 구현하는 연동 명세다.
+
+PoP-Sync는 순수 PDP 모드(`UPSTREAM_URL` 미설정 시)에서 `/auth` 엔드포인트를 통해 6단계 검증 파이프라인(유량 제어, 1회용 Nonce 리플레이 방지, ECDSA PoP 서명 검증, 다단계 캐시 및 Policy DB 단일 비행 인가)을 수행한다. 검증 결과에 따라 표준 HTTP 상태 코드(`200 OK`, `401 Unauthorized`, `403 Forbidden`, `429 Too Many Requests`) 및 검증된 신원 컨텍스트 헤더를 PEP 프록시로 반환한다.
+
+---
+
+### 1. 아키텍처 및 신뢰 경계
+
+#### 1.1 아키텍처 및 데이터 흐름
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                             Zero-Trust Security Domain                                           │
+│                                                                                                                  │
+│  [ External / Untrusted ]           [ Ingress PEP Layer ]                          [ Control Plane / PDP ]       │
+│  ┌───────────────────────┐          ┌──────────────────────┐                       ┌─────────────────────────┐   │
+│  │    Workload Client    │          │  Envoy / Nginx (PEP) │                       │     PoP-Sync (PDP)      │   │
+│  │                       │          │                      │                       │                         │   │
+│  │ 1. Client TLS Cert    │──(mTLS)─►│ 2. Terminate mTLS    │                       │ 4. 6-Stage Pipeline:    │   │
+│  │    (SAN: spiffe://..) │          │    Verify X.509 Cert │                       │    - Per-SPIFFE RateLim │   │
+│  │ 2. Authorization      │          │ 3. Header Sanitize   │──(ext_authz /auth)───►│    - Atomic Nonce Check │   │
+│  │    X-Nonce            │          │    Extract SAN URI   │                       │    - ECDSA PoP Verify   │   │
+│  │    X-PoP-Signature    │          │    Inject X-SPIFFE-ID│                       │    - L1/L2 Cache / DB   │   │
+│  │    (X-Body-Digest)    │          │    Buffer Body       │                       │                         │   │
+│  └───────────────────────┘          └──────────┬───────────┘                       └────────────┬────────────┘   │
+│                                                │                                                │                │
+│                                                │◄─────── 200 OK / Context Headers ──────────────┘                │
+│                                                │         (X-Authenticated-SPIFFE-ID)                             │
+│                                                │         (X-Policy-Decision, X-Auth-Source)                      │
+│                                                │         [or 401/403/429 Fast-Block]                             │
+│                                                │                                                                 │
+│                                                ▼ (Forward with Verified Context)                                 │
+│                                     ┌──────────────────────┐                                                     │
+│                                     │   Backend Service    │                                                     │
+│                                     │   (Target Upstream)  │                                                     │
+│                                     │                      │                                                     │
+│                                     │ Executes Business    │                                                     │
+│                                     │ Logic securely       │                                                     │
+│                                     └──────────────────────┘                                                     │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.2 신뢰 경계 메커니즘
+
+1. **상호 TLS(mTLS) 인증 종료 및 신원 검증**:
+   - 인프라 최외곽의 PEP(Envoy/Nginx)는 클라이언트와의 TCP 연결 시 상호 TLS(mTLS)를 요구(`require_client_certificate: true` / `ssl_verify_client on`)한다.
+   - 사설 인증기관(Private CA)이 서명한 X.509 클라이언트 인증서의 유효성을 검증한다. 인증서의 SAN URI(예: `spiffe://example.org/ns/prod/sa/order-service`)에서 워크로드 고유 식별자(SPIFFE ID)를 추출한다.
+
+2. **클라이언트 헤더 위조 차단 및 헤더 정제**:
+   - 외부 클라이언트가 상위 권한의 SPIFFE ID를 도용하기 위해 HTTP 요청 헤더에 임의로 `X-SPIFFE-ID: spiffe://example.org/ns/prod/sa/admin`을 조작하여 전송할 수 있다.
+   - PEP 계층은 클라이언트가 전송한 임의의 `X-SPIFFE-ID` 헤더를 신뢰하지 않는다. mTLS 핸드셰이크 단계에서 추출 및 검증된 SAN URI 값으로 해당 헤더를 덮어쓴다(OVERWRITE). 이를 통해 하위 PDP 및 백엔드로 전달되는 신원 정보의 무결성을 보장한다.
+
+3. **인가 서브요청 전달**:
+   - PEP는 원본 비즈니스 요청의 본문 및 인가 메타데이터 헤더(`Authorization`, `X-Nonce`, 정제된 `X-SPIFFE-ID`, `X-Res`, `X-Act`, `X-PoP-Signature`, `X-Body-Digest`)를 조합하여 PoP-Sync(`/auth`)로 외부 인가 요청을 전송한다.
+   - PoP-Sync는 SPIFFE ID 기반 슬라이딩 윈도우 유량 제한, Redis 기반 Nonce 중복 검증, 공개키 기반 PoP ECDSA 서명 검증, 다단계 캐시 인가 정책 조회를 순차적으로 수행한다.
+
+4. **인가 컨텍스트 전파 및 백엔드 보호**:
+   - PoP-Sync가 `200 OK`를 반환하면, 응답 헤더로 인가 컨텍스트(`X-Authenticated-SPIFFE-ID`, `X-Policy-Decision`, `X-Auth-Source`)를 PEP로 전달한다.
+   - PEP는 이 헤더들을 백엔드 서버(`backend_service`)로 주입하여 전달한다. 백엔드 서비스는 추가 암호 연산이나 DB 재조회 없이 신뢰할 수 있는 주체 정보와 권한을 즉시 활용한다.
+   - 인가 거부(`403`), 리플레이 탐지(`401`), 유량 초과(`429`) 발생 시 PEP 레벨에서 즉시 요청을 차단(Fail-Closed)하여 백엔드 자원을 보호한다.
+
+---
+
+### 2. Envoy 설정 (`envoy.yaml`)
+
+Envoy v3 API 규격을 준수하며, `ext_authz` HTTP 필터를 사용하여 PoP-Sync와 연동하는 프로덕션 설정이다. Fail-Closed 정책, 명시적 타임아웃, 원본 요청 본문 바이너리 버퍼링(`with_request_body`), 컨텍스트 헤더 업스트림 전파를 지원한다.
+
+```yaml
+# ==============================================================================
+# Envoy v3 Production Configuration for PoP-Sync ext_authz (PEP Mode)
+# ==============================================================================
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+
+static_resources:
+  listeners:
+    - name: ingress_listener
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8443
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: "/etc/envoy/certs/server.crt"
+                    private_key:
+                      filename: "/etc/envoy/certs/server.key"
+                validation_context:
+                  trusted_ca:
+                    filename: "/etc/envoy/certs/ca.crt"
+                  # 제로 트러스트 mTLS 강제: 유효한 클라이언트 인증서가 없으면 TLS 레벨에서 즉시 연결 종료
+                  require_client_certificate: true
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: protected_service
+                      domains: ["*"]
+                      # [신뢰 경계 핵심] 클라이언트 헤더 스푸핑 차단:
+                      # mTLS 인증서의 SAN URI(%DOWNSTREAM_PEER_URI_SAN%)를 추출하여
+                      # 클라이언트가 보낸 임의의 X-SPIFFE-ID를 강제로 덮어쓴다 (OVERWRITE).
+                      request_headers_to_add:
+                        - header:
+                            key: "x-spiffe-id"
+                            value: "%DOWNSTREAM_PEER_URI_SAN%"
+                          append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: backend_service
+                            timeout: 5.0s
+                http_filters:
+                  # ------------------------------------------------------------
+                  # PoP-Sync External Authorization Filter (HTTP ext_authz)
+                  # ------------------------------------------------------------
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      # Fail-Closed 정책: PoP-Sync 장애나 타임아웃 발생 시 요청을 통과시키지 않고 차단
+                      failure_mode_allow: false
+                      # 인가 서비스 통신 장애 시 클라이언트에 명시적 503 반환
+                      status_on_error:
+                        code: ServiceUnavailable
+                      http_service:
+                        server_uri:
+                          uri: "http://127.0.0.1:8000/auth"
+                          cluster: pop_sync_service
+                          timeout: 0.25s # 250ms 명시적 타임아웃으로 빠른 장애 격리(Fast-Fail) 보장
+                        authorization_request:
+                          # PoP-Sync의 6단계 파이프라인 검증에 필수적인 원본 요청 헤더 전달
+                          allowed_headers:
+                            patterns:
+                              - exact: "authorization"
+                              - exact: "x-nonce"
+                              - exact: "x-spiffe-id"
+                              - exact: "x-res"
+                              - exact: "x-act"
+                              - exact: "x-pop-signature"
+                              - exact: "x-body-digest"
+                              - exact: "content-type"
+                        authorization_response:
+                          # 200 OK 승인 시 PoP-Sync가 발급한 컨텍스트 헤더를 Backend Upstream으로 주입
+                          allowed_upstream_headers:
+                            patterns:
+                              - exact: "x-authenticated-spiffe-id"
+                              - exact: "x-policy-decision"
+                              - exact: "x-auth-source"
+                          # 401/429 차단 시 PoP-Sync의 레이트 리밋 헤더 및 에러 응답을 클라이언트로 투명하게 노출
+                          allowed_client_headers_on_error:
+                            patterns:
+                              - exact: "retry-after"
+                              - exact: "content-type"
+                      # --------------------------------------------------------
+                      # PoP ECDSA 페이로드 서명 검증을 위한 요청 본문 버퍼링 설정
+                      # --------------------------------------------------------
+                      with_request_body:
+                        max_request_bytes: 65536 # 64KB까지 요청 본문을 인메모리 버퍼링하여 PoP-Sync로 전달
+                        allow_partial_message: false # 전체 페이로드가 수신되지 않으면 인가 요청을 진행하지 않음
+                        pack_as_bytes: true # 바이너리 원본 페이로드를 그대로 보존하여 SHA-256 해시 정합성 보장
+
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # --------------------------------------------------------------------------
+    # PoP-Sync PDP Service Cluster (FastAPI /auth)
+    # --------------------------------------------------------------------------
+    - name: pop_sync_service
+      type: STATIC
+      connect_timeout: 0.25s
+      load_assignment:
+        cluster_name: pop_sync_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8000
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {} # 고성능 HTTP/1.1 커넥션 풀링 유지
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1024
+            max_pending_requests: 1024
+            max_requests: 2048
+
+    # --------------------------------------------------------------------------
+    # Protected Business Backend Service Cluster
+    # --------------------------------------------------------------------------
+    - name: backend_service
+      type: STATIC
+      connect_timeout: 0.5s
+      load_assignment:
+        cluster_name: backend_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8080
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+```
+
+---
+
+### 3. Nginx 설정 (`nginx.conf`)
+
+Nginx 공식 `ngx_http_auth_request_module`을 활용한 프로덕션 구성이다. 내부 서브요청(`/_pop_auth`)을 통한 비동기 인가 검증, `auth_request_set` 기반 컨텍스트 주입, 그리고 Nginx에서 `429 Too Many Requests` 상태 코드가 `500 Internal Server Error`로 바뀌는 현상을 처리하는 에러 인터셉트 구성을 포함한다.
+
+```nginx
+# ==============================================================================
+# Nginx Production Configuration for PoP-Sync auth_request (PEP Mode)
+# ==============================================================================
+
+events {
+    worker_connections 2048;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    # 업스트림 커넥션 풀 정의
+    upstream pop_sync_upstream {
+        server 127.0.0.1:8000 max_fails=3 fail_timeout=10s;
+        keepalive 64; # PDP 인가 서버 커넥션 재사용
+    }
+
+    upstream backend_upstream {
+        server 127.0.0.1:8080 max_fails=3 fail_timeout=10s;
+        keepalive 128; # 백엔드 실서버 커넥션 풀 유지
+    }
+
+    server {
+        listen 8443 ssl http2;
+        server_name api.enterprise.internal;
+
+        # ----------------------------------------------------------------------
+        # 1. mTLS 클라이언트 인증서 검증
+        # ----------------------------------------------------------------------
+        ssl_certificate         /etc/nginx/certs/server.crt;
+        ssl_certificate_key     /etc/nginx/certs/server.key;
+        ssl_client_certificate  /etc/nginx/certs/ca.crt;
+        ssl_verify_client       on;
+        ssl_verify_depth        2;
+
+        # ----------------------------------------------------------------------
+        # 2. 제로 트러스트 신뢰 경계: 헤더 스푸핑 차단 및 검증 신원 바인딩
+        # 클라이언트가 임의로 조작해 전송한 X-SPIFFE-ID 헤더를 차단하고,
+        # mTLS 검증이 완료된 X.509 주체 식별자($ssl_client_s_dn 또는 SAN 파싱값)로 강제 바인딩한다.
+        # ----------------------------------------------------------------------
+        set $sanitized_spiffe_id $ssl_client_s_dn;
+
+        # ----------------------------------------------------------------------
+        # 3. 비즈니스 API 메인 엔드포인트 (PEP 실행 지점)
+        # ----------------------------------------------------------------------
+        location / {
+            # PoP-Sync 인가 서브요청 실행
+            auth_request /_pop_auth;
+
+            # [인가 컨텍스트 캡처] PoP-Sync가 반환한 응답 헤더 캡처
+            auth_request_set $auth_spiffe    $upstream_http_x_authenticated_spiffe_id;
+            auth_request_set $auth_decision  $upstream_http_x_policy_decision;
+            auth_request_set $auth_source    $upstream_http_x_auth_source;
+            auth_request_set $auth_status    $upstream_status;
+            auth_request_set $auth_retry     $upstream_http_retry_after;
+
+            # [Nginx 429 상태 코드 복원]
+            # auth_request 모듈은 2xx는 통과, 401/403은 해당 코드로 종료하지만,
+            # 429(Rate Limit) 등 기타 상태 코드는 500으로 변환된다.
+            # 이를 가로채서 PoP-Sync 원본 상태 코드로 복원하기 위해 에러 페이지를 인터셉트한다.
+            error_page 401 = @handle_401;
+            error_page 403 = @handle_403;
+            error_page 500 = @handle_auth_error;
+
+            # 200 OK 승인 시: 백엔드로 검증된 신원 컨텍스트 헤더를 주입하여 프록시 포워딩
+            proxy_pass http://backend_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+
+            proxy_set_header X-Authenticated-SPIFFE-ID $auth_spiffe;
+            proxy_set_header X-Policy-Decision         $auth_decision;
+            proxy_set_header X-Auth-Source             $auth_source;
+
+            # 원본 요청 메타데이터 전달
+            proxy_set_header Host               $host;
+            proxy_set_header X-Real-IP          $remote_addr;
+            proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto  $scheme;
+        }
+
+        # ----------------------------------------------------------------------
+        # 4. PoP-Sync PDP 인가 서브요청 전용 내부 엔드포인트
+        # ----------------------------------------------------------------------
+        location = /_pop_auth {
+            internal; # 외부 직접 접근 차단
+            proxy_pass http://pop_sync_upstream/auth;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+
+            # 서브요청 본문 전송 비활성화 (헤더 기반 빠른 인가 판정)
+            proxy_pass_request_body off;
+            proxy_set_header Content-Length "";
+
+            # 원본 요청 메서드 및 PoP-Sync 6단계 검증 필수 헤더 전달
+            proxy_method $request_method;
+            proxy_set_header Authorization     $http_authorization;
+            proxy_set_header X-Nonce           $http_x_nonce;
+            proxy_set_header X-SPIFFE-ID       $sanitized_spiffe_id; # 스푸핑 방지된 검증 신원 전달
+            proxy_set_header X-Res             $http_x_res;
+            proxy_set_header X-Act             $http_x_act;
+            proxy_set_header X-PoP-Signature   $http_x_pop_signature;
+            proxy_set_header X-Body-Digest     $http_x_body_digest;
+            proxy_set_header X-Original-URI    $request_uri;
+
+            # PDP 타임아웃 제한 (250ms 내 미응답 시 Fail-Closed 차단)
+            proxy_connect_timeout 250ms;
+            proxy_read_timeout    250ms;
+            proxy_send_timeout    250ms;
+        }
+
+        # ----------------------------------------------------------------------
+        # 5. 상태 코드 매핑 핸들러: 401, 403 및 왜곡된 429 복원 처리
+        # ----------------------------------------------------------------------
+        location @handle_auth_error {
+            # PoP-Sync가 429 Too Many Requests를 반환했으나 Nginx가 500으로 감싼 경우:
+            # 캡처된 $auth_status를 판별하여 정확한 429 상태 코드와 Retry-After 헤더를 복원하여 반환
+            if ($auth_status = 429) {
+                add_header Retry-After $auth_retry always;
+                add_header Content-Type application/json always;
+                return 429 '{"status":"error","message":"Too Many Requests"}';
+            }
+            # 그 외 PDP 서버 통신 불가/오류 시 Fail-Closed 503 반환
+            add_header Content-Type application/json always;
+            return 503 '{"status":"error","message":"External Authorization Service Unavailable"}';
+        }
+
+        location @handle_401 {
+            add_header Content-Type application/json always;
+            return 401 '{"status":"error","message":"Unauthorized or Replay Detected"}';
+        }
+
+        location @handle_403 {
+            add_header Content-Type application/json always;
+            return 403 '{"status":"deny","message":"Access Denied by Policy"}';
+        }
+    }
+}
+```
+
+#### Nginx 요청 본문 처리 한계 및 Envoy 권장 사항
+> [!WARNING] Nginx `auth_request` 모듈의 요청 본문 누락 제약
+> Nginx의 표준 모듈인 `ngx_http_auth_request_module`은 서브요청 생성 시 클라이언트의 HTTP 요청 본문(Request Body)을 서브요청으로 전달하지 못합니다. 따라서 본문 전송을 비활성화(`proxy_pass_request_body off; proxy_set_header Content-Length "";`)해야 합니다.
+> 
+> 이로 인해 클라이언트 페이로드의 SHA-256 해시를 검증하는 요청 본문 무결성 바인딩 PoP 서명 검증(`X-Body-Digest` 및 Method, Path, Query, Body Digest 정규화 서명)을 Nginx 기본 구성만으로는 수행할 수 없습니다.
+> 
+> 반면 Envoy는 `ext_authz` HTTP 필터에서 `with_request_body` 설정(`max_request_bytes: 65536`, `pack_as_bytes: true`)을 기본 제공합니다. 원본 요청 본문을 손실 없이 인가 서버로 전달합니다. 따라서 본문 변조 방지 및 페이로드 바인딩 PoP 검증이 필요한 환경에서는 Envoy를 PEP로 사용할 것을 권장합니다.
+
+---
+
+### 4. 연동 검증 curl 테스트
+
+시나리오별 `curl -i` 명령으로 PEP 프록시와 PoP-Sync(PDP) 간 연동 동작을 검증할 수 있습니다.
+
+#### 4.1 정상 인가 요청 (`200 OK`)
+유효한 Bearer 인증 토큰과 고유한 1회용 Nonce를 포함하여 요청을 전송합니다. PoP-Sync는 6단계 파이프라인 검증 후 `200 OK`를 반환합니다. PEP 프록시는 이를 수신하여 백엔드로 `X-Authenticated-SPIFFE-ID`, `X-Policy-Decision`, `X-Auth-Source` 헤더를 주입해 전달합니다.
+
+```bash
+# 유효한 1회용 Nonce 생성 및 정상 API 호출
+TEST_NONCE="nonce-valid-$(date +%s%N)"
+
+curl -i -X GET "https://api.enterprise.internal:8443/api/v1/orders/ORD-7701" \
+  --cacert /etc/envoy/certs/ca.crt \
+  --cert /etc/envoy/certs/client.crt \
+  --key /etc/envoy/certs/client.key \
+  -H "Authorization: Bearer valid-user-token-xyz" \
+  -H "X-Nonce: ${TEST_NONCE}" \
+  -H "X-Res: order" \
+  -H "X-Act: read"
+```
+
+**기대 HTTP 응답:**
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Thu, 29 Oct 2026 01:30:00 GMT
+Transfer-Encoding: chunked
+X-Authenticated-SPIFFE-ID: spiffe://example.org/ns/prod/sa/order-service
+X-Policy-Decision: allow
+X-Auth-Source: L1
+
+{
+  "order_id": "ORD-7701",
+  "status": "APPROVED",
+  "resource": "order",
+  "message": "Business transaction processed successfully"
+}
+```
+- **검증 포인트**:
+  - 클라이언트가 임의의 `X-SPIFFE-ID`를 전달하지 않아도 PEP가 클라이언트 mTLS 인증서의 SAN URI를 추출하여 주입한 뒤 PDP 인가를 통과합니다.
+  - 응답 헤더로 `X-Authenticated-SPIFFE-ID` 및 `X-Auth-Source`가 백엔드와 클라이언트로 전달됨을 확인합니다.
+
+---
+
+#### 4.2 리플레이 공격 방어 검증 (`401 Unauthorized`)
+동일한 `X-Nonce` 값을 60초 윈도우 내에 2회 연속 전송하여 중복 요청 차단을 검증합니다.
+
+```bash
+# 고정 Nonce를 이용한 1회차 호출 (정상 통과)
+REPLAY_NONCE="nonce-replay-attack-sample-1234"
+
+echo "=== 1회차 정상 요청 전송 ==="
+curl -i -s -o /dev/null -w "1회차 HTTP 응답 코드: %{http_code}\n" -X GET "https://api.enterprise.internal:8443/api/v1/orders/ORD-7701" \
+  --cacert /etc/envoy/certs/ca.crt \
+  --cert /etc/envoy/certs/client.crt \
+  --key /etc/envoy/certs/client.key \
+  -H "Authorization: Bearer valid-user-token-xyz" \
+  -H "X-Nonce: ${REPLAY_NONCE}"
+
+echo "=== 2회차 리플레이 공격 요청 전송 (동일 Nonce 재사용) ==="
+curl -i -X GET "https://api.enterprise.internal:8443/api/v1/orders/ORD-7701" \
+  --cacert /etc/envoy/certs/ca.crt \
+  --cert /etc/envoy/certs/client.crt \
+  --key /etc/envoy/certs/client.key \
+  -H "Authorization: Bearer valid-user-token-xyz" \
+  -H "X-Nonce: ${REPLAY_NONCE}"
+```
+
+**2회차 기대 HTTP 응답:**
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+Date: Thu, 29 Oct 2026 01:30:01 GMT
+Content-Length: 35
+
+{"detail":"Replay Detected"}
+```
+- **검증 포인트**:
+  - PoP-Sync 파이프라인 3단계에서 Redis Lua 스크립트(`NONCE_LUA`)가 `EXISTS == 1`을 감지하여 암호 연산 진입 전에 차단합니다.
+  - PEP 프록시는 백엔드로 요청을 전달하지 않고 클라이언트에 즉시 `401 Unauthorized`를 반환합니다.
+
+---
+
+#### 4.3 유량 제한 초과 방어 검증 (`429 Too Many Requests`)
+슬라이딩 윈도우 유량 제한 한도를 초과하도록 연속 버스트 요청을 전송합니다.
+
+```bash
+# 연속 15회 버스트 요청 전송
+echo "=== 슬라이딩 윈도우 유량 초과 버스트 전송 ==="
+for i in $(seq 1 15); do
+  BURST_NONCE="nonce-burst-$(date +%s%N)-$i"
+  curl -i -s -o /dev/null -w "요청 #$i: HTTP %{http_code}\n" -X GET "https://api.enterprise.internal:8443/api/v1/orders/ORD-7701" \
+    --cacert /etc/envoy/certs/ca.crt \
+    --cert /etc/envoy/certs/client.crt \
+    --key /etc/envoy/certs/client.key \
+    -H "Authorization: Bearer valid-user-token-xyz" \
+    -H "X-Nonce: ${BURST_NONCE}"
+done
+
+# 마지막 초과 요청 상세 확인
+curl -i -X GET "https://api.enterprise.internal:8443/api/v1/orders/ORD-7701" \
+  --cacert /etc/envoy/certs/ca.crt \
+  --cert /etc/envoy/certs/client.crt \
+  --key /etc/envoy/certs/client.key \
+  -H "Authorization: Bearer valid-user-token-xyz" \
+  -H "X-Nonce: nonce-burst-exceeded"
+```
+
+**유량 초과 시 기대 HTTP 응답:**
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 10
+Date: Thu, 29 Oct 2026 01:30:02 GMT
+Content-Length: 53
+
+{"status":"error","message":"Too Many Requests"}
+```
+- **검증 포인트**:
+  - PoP-Sync 파이프라인 2단계에서 Redis 슬라이딩 카운터(`SLIDING_RL_LUA`)가 임계치 초과를 감지하여 `429 Too Many Requests` 및 `Retry-After: 10` 헤더를 반환합니다.
+  - Envoy의 `allowed_client_headers_on_error` 및 Nginx의 `@handle_auth_error` 처리가 동작하여 클라이언트에게 `429` 상태 코드와 `Retry-After` 헤더를 전달합니다.
+
+---
+
+### 5. Envoy + ext_authz 성능 벤치마크 요약
+
+Envoy PEP와 PoP-Sync PDP 연동 환경에서 측정한 성능 지표 요약이다. 상세 측정 데이터 및 분석 내용은 `docs/benchmarks/envoy-ext-authz-benchmark.md`를 참고한다.
+
+1. **정상 트래픽 인가 오버헤드 (500 RPS 지속 부하)**:
+   - Envoy L7 프록시 홉 오버헤드는 p50 기준 0.42ms이다.
+   - L1 캐시 히트 시 PoP-Sync 인가 지연은 0.85ms이며, 총 p50 지연 시간은 1.62ms(p99 1.89ms)이다.
+   - 캐시 미스 시 Policy DB 커넥션 풀(`MAX_DB_WORKERS = 5`, 20ms 지연) 세마포어 한계로 처리량이 248.5 RPS로 제한된다.
+
+2. **동일 키 폭주 방어 (Single-Flight)**:
+   - 캐시되지 않은 동일 키로 동시 요청 1,000건 유입 시, Single-Flight를 통해 999건을 병합하여 실제 DB 조회를 1건으로 제한한다.
+   - p95 지연 시간은 Single-Flight 비활성화 시 4,065.1ms에서 활성화 시 27.3ms로 단축된다.
+
+3. **악의적 공격 에지 차단**:
+   - 중복 Nonce 리플레이 공격(1,500건)과 유량 초과 플러드 공격(1,500건)을 Envoy 에지에서 전건 차단한다.
+   - 백엔드 도달 건수 0건을 유지하며, 백엔드 CPU 사용률 변동은 0%이다.
 
 ---
 
