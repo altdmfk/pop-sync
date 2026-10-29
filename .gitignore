@@ -81,6 +81,8 @@ docker-compose.override.yml
 .venv*/
 
 # Presentation & PPT assets
-presentation/
+presentation/*
+!presentation/PoP_Sync_Presentation_final.pptx
 ppt/
 *.pptx
+!presentation/PoP_Sync_Presentation_final.pptx

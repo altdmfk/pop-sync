@@ -11,14 +11,14 @@ Policy DB 장애 감지 시 OPEN 상태로 전환하여 연쇄 장애를 차단�
 
 ### L1/L2 캐시 및 단일 비행
 정책 조회는 다단계로 동작한다. 노드 로컬의 L1(OrderedDict LRU, 지연 만료)을 확인하고, 없으면 중앙 Redis(L2)를 조회한다. 모두 캐시 미스일 때 Policy DB를 호출한다.
-`SINGLEFLIGHT_ENABLED` 및 `CLUSTER_SINGLEFLIGHT_ENABLED`가 기본 활성화되어 있다. 노드 내부의 `in_flight` Future 병합뿐 아니라, Redis 분산 락(`SET NX lock:sf:{key}`)과 L2 폴링 메커니즘을 통해 클러스터 전역에서도 동일 키 동시 DB 호출을 1회로 병합하여 백엔드 DB 과부하를 방지한다 (단일 노드 실측: docs/benchmarks/singleflight-effect.md, Envoy ext_authz 연동 실측: docs/benchmarks/envoy-ext-authz-benchmark.md).
+`SINGLEFLIGHT_ENABLED` 및 `CLUSTER_SINGLEFLIGHT_ENABLED`가 기본 활성화되어 있다. 노드 내부의 `in_flight` Future 병합뿐 아니라, Redis 분산 락(`SET NX lock:sf:{key}`)과 L2 폴링 메커니즘을 통해 클러스터 전역에서도 동일 키 동시 DB 호출을 1회로 병합하여 백엔드 DB 과부하를 방지한다 (단일 노드 실측: docs/benchmarks/singleflight-effect.md, Envoy ext_authz 연동 하네스 시뮬레이션: docs/benchmarks/envoy-ext-authz-benchmark.md).
  
 ### 스트림 기반 무효화 동기화
 네트워크 단절 발생 시 지연되었던 Redis Stream 대기 메시지(PEL)를 누락분부터 연속 적용한다. 이를 통해 최종 일관성을 유지한다.
  
 ### O(1) 유량 제한 및 Nonce 리플레이 방어
 `RL_ALGORITHM` 설정으로 유량 제한 방식을 결정한다(기본값 `sliding`). `sliding` 방식은 Lua 스크립트 기반 가중 합산 근사치로 동작하며, `fixed` 방식은 Redis Pipeline을 사용한다 (경계 버스트 측정 결과: docs/benchmarks/rate-limit-sliding.md). 유량 제한은 노드 단위가 아닌 클라이언트 ID(`SPIFFE ID`) 기준의 클러스터 전역 한도를 적용한다.
-Lua 스크립트 기반 Nonce 중복 검증으로 리플레이 공격을 방어한다 (Envoy 에지 차단 실측: docs/benchmarks/envoy-ext-authz-benchmark.md).
+Lua 스크립트 기반 Nonce 중복 검증으로 리플레이 공격을 방어한다 (Envoy 에지 차단 하네스 시뮬레이션: docs/benchmarks/envoy-ext-authz-benchmark.md).
 
 ### PoP 검증 (Scope B)
 FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERIFY_ENABLED` 기본값 `False`). Policy DB에서 공개키를 조회하여 노드 캐시(L1/L2)에 보관한다. 리플레이 방지를 위해 Nonce 검증 통과 후에 서명 검증을 수행한다. 통계 분류를 위해 서명 누락과 검증 실패 카운터를 별도로 집계한다.
@@ -64,11 +64,11 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
    │
    ├─ 4. PoP 서명 검증 (POP_VERIFY_ENABLED=true 시 활성화)
    │     ├─ X-PoP-Signature 헤더 누락 ───────────────────────────────────> 400 Missing PoP Signature (pop_rejected +1)
-   │     ├─ X-Body-Digest 접두사 누락 / 바디 다이제스트 불일치 ──────────> 400 Bad Request (pop_rejected +1)
    │     ├─ 공개키 조회 (L1 → L2 → Policy DB /pubkey)
    │     │     ├─ 서킷 브레이커 OPEN 상태 ───────────────────────────────> 503 Key Fetch Failed [Fail-Closed] (circuit_blocked +1, pubkey_circuit_blocked +1, pop_rejected +1)
    │     │     ├─ 미등록 SPIFFE ID (DB 404) ─────────────────────────────> 401 Unknown Key ID (pop_rejected +1)
    │     │     └─ 공개키 획득 성공 (L1/L2 적재)
+   │     ├─ X-Body-Digest `sha256=` 접두사 오류 / 본문 해시 불일치 ───────────> 400 Bad Request (pop_rejected +1)
    │     ├─ 정규화 서명 검증 (Method + Path + Query + BodyDigest + SPIFFE + Nonce)
    │     │     └─ 서명 불일치 (InvalidSignature) ────────────────────────> 401 Invalid PoP Signature (pop_rejected +1)
    │     └─ 서명 검증 성공 ──────────────────────────────────────────────> pop_verified +1 후 다음 단계 진행
@@ -110,7 +110,7 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
 | **6** | **네트워크 파티션 및 PEL 긴급 복구** | `POST /chaos/partition/Node-B/isolate` → `heal` | 고립 노드 `503` 차단(Split-Brain 방어) + 복구 시 Stream PEL(`"0"`) 드레인 및 XAUTOCLAIM 유휴 회수 | 단절 중 `/auth`는 `503 Node Isolated`, 복구 즉시 누락 무효화 일괄 반영 | `is_partitioned: true→false`, `last_catchup` 상세 지표 기록 |
 | **7** | **실시간 캐시 무효화 스트림 전파** | `POST /chaos/invalidate` | Redis Streams `XADD` (`maxlen~10000`) + 노드별 `XREADGROUP` | 전 노드의 L1 및 L2 캐시에서 대상 정책 키 즉시 삭제 및 `XACK` | 전 노드 `l1_cache_size` 감소 후 재조회 시 `source: "DB"` |
 | **8** | **ECDSA P-256 PoP 서명 검증** | `POP_VERIFY_ENABLED=true` | Nonce 검증 통과 후 Query/Body Digest 바인딩 ECDSA 검증 및 `/pubkey` 서킷 연동 | 정상 `200`, 서명 누락/바디 다이제스트 오류 `400`, 위변조/미등록 키 `401`, DB 서킷 OPEN 시 `503` | `pop_verified` / `pop_rejected` 분리 집계 |
-| **9** | **정책 거부(DENY) 인가 검증** | `X-Res: restricted` 또는 `.../deny` | DB `status: "deny"` 명시적 판별 및 `"DENY"` 캐싱 | `200 OK` (`{"status": "deny", "policy": "DENY"}`) 반환 및 L1/L2 캐싱 | 후속 요청 시 L1/L2에서 `"DENY"` 즉시 반환 |
+| **9** | **정책 거부(DENY) 인가 검증** | `GET /auth` + `X-Res: restricted` 또는 SPIFFE ID `.../deny` | DB `status: "deny"` 명시적 판별 및 `"DENY"` 캐싱 | `200 OK` (`{"status": "deny", "policy": "DENY"}`) 반환 및 L1/L2 캐싱 | 후속 요청 시 L1/L2에서 `"DENY"` 즉시 반환 |
 
 ---
 
@@ -185,21 +185,22 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
 - **실행하지 않고 확인하는 결과**:
   ```json
   {
-    "total_requests": 50,
-    "db_queries": 1,
-    "coalesced": 49,
-    "duration_ms": 12.4
+    "node": "Node-A",
+    "count": 50,
+    "delta_db_queries_executed": 1,
+    "delta_singleflight_coalesced": 49,
+    "delta_l1_hits": 0
   }
   ```
-  → 50개 요청이 동시에 도달해도 DB 쿼리는 1회만 발생하며, 나머지 49개 요청은 첫 번째 쿼리 결과를 공유받아 모두 정상 응답을 받는다.
+  → (위 값은 `POST /chaos/same_key_burst` 응답 형식을 보여주는 예시 값이며 실측 벤치마크가 아니다.) 50개 요청이 동시에 도달해도 DB 쿼리는 1회만 발생하며, 나머지 49개 요청은 첫 번째 쿼리 결과를 공유받아 모두 정상 응답을 받는다.
 
 ---
 
 ### 시나리오 4: 백엔드 DB 장애 격리 및 서킷 브레이커
 - **검증 목적**: Policy DB 장애 시 게이트웨이 스레드 풀이 타임아웃 대기로 고갈되는 연쇄 장애와 상태 진동을 방지하고, 장애 복구 시 안전하게 복귀하는지 검증한다.
-- **실행 흐름 (`POST /chaos/db/down` → `/chaos/db/up` / `tests/test_scenarios.py::test_circuit_breaker_trip`)**:
+- **실행 흐름 (`POST /chaos/db/down` → `/chaos/db/up` / `tests/test_scenarios.py::test_circuit_breaker`)**:
   1. **DB 장애 발생 및 `OPEN` 전환**:
-     - Policy DB 장애 시 5회 연속 실패(`CB_FAILURE_THRESHOLD = 5`)가 발생하면 서킷 브레이커는 즉시 `OPEN` 상태로 전환된다.
+     - Policy DB 장애 시 3회 연속 실패(`CB_MAX_FAILURES = 3`)가 발생하면 서킷 브레이커는 즉시 `OPEN` 상태로 전환된다.
   2. **`OPEN` 상태에서의 요청 처리**:
      - 캐시 히트(L1/L2) 요청은 정상 응답(`source: "L1"` 또는 `"L2"`)을 반환한다.
      - 캐시 미스 요청은 DB 조회를 차단하고 즉시 저하 허용(`200 OK`, `status: "degraded_allow"`, `source: "Fallback_Degradation"`)으로 응답한다.
@@ -256,7 +257,7 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
        - **Step B — 장기 유휴 메시지 자동 회수 (`XAUTOCLAIM`)**: 다른 컨슈머에서 장시간(`STREAM_CLAIM_MIN_IDLE_MS`, 기본 60,000ms) 미확인 상태로 방치된 메시지를 `XAUTOCLAIM`으로 인계받아 캐시 삭제 및 `XACK`를 수행한다.
        - **Step C — 단절 기간 누적 신규 메시지 처리 (`ID = ">"`)**: 단절 동안 스트림에 누적된 메시지들을 `XREADGROUP ... COUNT 100`으로 빈 배치가 반환될 때까지 반복 조회하여 캐시 삭제 및 `XACK`를 완료한다.
 - **실행하지 않고 확인하는 결과**:
-  - 복구 후 `Node-B`의 `/metrics`를 조회하면 `stats.last_catchup`에 동기화 결과가 기록된다:
+  - 복구 후 `Node-B`의 `/metrics`를 조회하면 `stats.last_catchup`에 동기화 결과가 기록된다 (아래 수치는 형식을 보여주는 예시 값이며 실측 벤치마크가 아니다):
     ```json
     "last_catchup": {
       "pending_count": 4,
@@ -285,15 +286,14 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
 ### 시나리오 8: ECDSA P-256 PoP 서명 검증 (Scope B)
 - **검증 목적**: `POP_VERIFY_ENABLED=true` 환경에서 클라이언트가 전송한 ECDSA P-256 서명과 본문 다이제스트를 검증하여 위변조를 차단하고, 리플레이 방지와 서킷 브레이커 연동이 설계대로 동작하는지 확인한다.
 - **서명 정규화 규격**:
-  - 클라이언트는 Method, Path, 정렬된 Query String, SHA-256 Body Digest, SPIFFE ID, Nonce 6개 필드를 개행 문자(`
-`)로 결합하여 개인키(P-256)로 서명(`X-PoP-Signature: <base64>`)한다.
+  - 클라이언트는 Method, Path, 정렬된 Query String, SHA-256 Body Digest, SPIFFE ID, Nonce 6개 필드를 개행 문자(`\n`)로 결합하여 개인키(P-256)로 서명(`X-PoP-Signature: <base64>`)한다.
 - **세부 검증 케이스**:
 
 | 세부 케이스 | 요청 파라미터 / 변조 내용 | 게이트웨이 처리 동작 | 기대 HTTP 응답 | 관측 메트릭 |
 | :--- | :--- | :--- | :--- | :--- |
 | **8-1. 정상 서명** | 유효한 개인키로 6개 정규화 필드 서명 | Rate Limit 통과 → Nonce 사용 처리 → 공개키 조회(L1/L2/DB) → 서명 성공 | `200 OK` (`{"status": "allow", "source": "L1\|L2\|DB"}`) | `pop_verified +1` |
 | **8-2. 서명 헤더 누락** | `X-PoP-Signature` 미포함 | Nonce 사용 처리 직후 헤더 검사에서 거부 | `400 Bad Request` (`"Missing PoP Signature"`) | `pop_rejected +1` |
-| **8-3. 바디 다이제스트 오류** | `X-Body-Digest` 접두사 누락 또는 본문 해시 불일치 | Nonce 사용 처리 직후 SHA-256 해시 검증 실패 시 거부 | `400 Bad Request` (`"Missing or invalid X-Body-Digest header"` 또는 `"Body digest mismatch"`) | `pop_rejected +1` |
+| **8-3. 바디 다이제스트 오류** | `X-Body-Digest` 헤더의 `sha256=` 접두사 오류 또는 본문 해시 불일치 (헤더를 생략하면 서버가 본문 해시를 직접 계산) | 공개키 조회 후 ECDSA 검증 전에 SHA-256 해시 검증 실패 시 거부 | `400 Bad Request` (`"Missing or invalid X-Body-Digest header"` 또는 `"Body digest mismatch"`) | `pop_rejected +1` |
 | **8-4. 페이로드 위변조 / 타인 키** | 경로나 쿼리 위변조, 또는 타인 개인키로 서명 | 공개키 검증 시 해시 불일치 (`InvalidSignature`) | `401 Unauthorized` (`"Invalid PoP Signature"`) | `pop_rejected +1` |
 | **8-5. 미등록 클라이언트 키** | `X-SPIFFE-ID: spiffe://test/nokey` | Policy DB `GET /pubkey`가 `404 Key not found` 반환 | `401 Unauthorized` (`"Unknown Key ID"`) | `pop_rejected +1` |
 | **8-6. 리플레이된 Nonce 공격** | 이미 사용된 `X-Nonce` + 서명 전송 | Nonce 검사 단계에서 즉시 차단 (ECDSA 연산 전에 차단하여 CPU 낭비 방지) | `401 Unauthorized` (`"Replay Detected"`) | `nonce_replays +1` (`pop_rejected`는 `0` 유지) |
@@ -303,7 +303,7 @@ FIDO2 모델을 간소화한 ECDSA P-256 서명 검증을 지원한다(`POP_VERI
 
 ### 시나리오 9: 정책 거부(DENY) 인가 검증
 - **검증 목적**: 권한이 없는 클라이언트(`X-Res: restricted` 또는 `.../deny`)의 요청에 대해 백엔드 Policy DB가 명시적으로 거부(`status: "deny"`)를 반환할 때, 게이트웨이가 이를 올바르게 판별하여 정상 응답(`200 OK`, `status: "deny"`)으로 처리하고 캐싱하는지 검증한다.
-- **실행 흐름 (`POST /chaos/policy/deny` / `tests/test_scenarios.py::test_policy_deny_caching`)**:
+- **실행 흐름 (`GET /auth` + `X-Res: restricted` 직접 호출. 전용 chaos 엔드포인트와 E2E 테스트는 없으며, PEP 모드의 DENY 403 차단은 `tests/test_production_ha.py::test_pep_mode_blocks_forwarding_on_deny`로 검증)**:
   1. 클라이언트가 접근이 제한된 리소스(`X-Res: restricted`)로 `GET /auth`를 요청한다.
   2. 캐시 미스 발생 시 게이트웨이는 Policy DB `GET /policy`를 조회한다.
   3. Policy DB는 규칙에 따라 `{"status": "deny", "policy": "DENY"}`를 반환한다.
@@ -502,7 +502,7 @@ PoP-Sync는 순수 PDP 모드(`UPSTREAM_URL` 미설정 시)에서 `/auth` 엔드
 
 ### 2. Envoy 설정 (`envoy.yaml`)
 
-Envoy v3 API 규격을 준수하며, `ext_authz` HTTP 필터를 사용하여 PoP-Sync와 연동하는 프로덕션 설정이다. Fail-Closed 정책, 명시적 타임아웃, 원본 요청 본문 바이너리 버퍼링(`with_request_body`), 컨텍스트 헤더 업스트림 전파를 지원한다.
+Envoy v3 API 규격을 준수하며, `ext_authz` HTTP 필터를 사용하여 PoP-Sync와 연동하는 프로덕션 설정이다. Fail-Closed 정책, 명시적 타임아웃, 원본 요청 본문 바이너리 버퍼링(`with_request_body`), 컨텍스트 헤더 업스트림 전파를 지원한다. 예시의 PoP-Sync 포트(`8000`)는 단독 배포를 가정한 값이며, 본 저장소의 `docker-compose.yml`에서는 Gateway가 8001~8003, Policy DB가 8000을 사용하므로 환경에 맞게 변경한다.
 
 ```yaml
 # ==============================================================================
@@ -895,9 +895,9 @@ curl -i -X GET "https://api.enterprise.internal:8443/api/v1/orders/ORD-7701" \
 HTTP/1.1 401 Unauthorized
 Content-Type: application/json
 Date: Thu, 29 Oct 2026 01:30:01 GMT
-Content-Length: 35
+Content-Length: 46
 
-{"detail":"Replay Detected"}
+{"status":"error","message":"Replay Detected"}
 ```
 - **검증 포인트**:
   - PoP-Sync 파이프라인 3단계에서 Redis Lua 스크립트(`NONCE_LUA`)가 `EXISTS == 1`을 감지하여 암호 연산 진입 전에 차단합니다.
@@ -909,9 +909,9 @@ Content-Length: 35
 슬라이딩 윈도우 유량 제한 한도를 초과하도록 연속 버스트 요청을 전송합니다.
 
 ```bash
-# 연속 15회 버스트 요청 전송
+# 기본 한도(`RL_LIMIT=50`, 10초)만큼 연속 50회 요청을 전송한 뒤 51번째 요청부터 429 확인
 echo "=== 슬라이딩 윈도우 유량 초과 버스트 전송 ==="
-for i in $(seq 1 15); do
+for i in $(seq 1 50); do
   BURST_NONCE="nonce-burst-$(date +%s%N)-$i"
   curl -i -s -o /dev/null -w "요청 #$i: HTTP %{http_code}\n" -X GET "https://api.enterprise.internal:8443/api/v1/orders/ORD-7701" \
     --cacert /etc/envoy/certs/ca.crt \
@@ -936,7 +936,7 @@ HTTP/1.1 429 Too Many Requests
 Content-Type: application/json
 Retry-After: 10
 Date: Thu, 29 Oct 2026 01:30:02 GMT
-Content-Length: 53
+Content-Length: 48
 
 {"status":"error","message":"Too Many Requests"}
 ```
@@ -948,20 +948,20 @@ Content-Length: 53
 
 ### 5. Envoy + ext_authz 성능 벤치마크 요약
 
-Envoy PEP와 PoP-Sync PDP 연동 환경에서 측정한 성능 지표 요약이다. 상세 측정 데이터 및 분석 내용은 `docs/benchmarks/envoy-ext-authz-benchmark.md`를 참고한다.
+Envoy PEP와 PoP-Sync PDP 연동 시나리오를 `tests/benchmark_ext_authz.py` 하네스로 산출한 지표 요약이다. 기본 실행(인프로세스 ASGI 모드)에서는 Tier 2/3 지연 시간이 Tier 1 측정값에 고정 상수(Envoy 홉 +0.42ms, PoP-Sync L1 인가 +0.85ms, Redis RTT +0.82ms, DB I/O +20.85ms)를 가산한 모델링 값이며, Single-Flight ON/OFF 비교도 하네스 내부 asyncio 시뮬레이션이다. 따라서 아래 수치는 실제 Envoy·Redis 네트워크 구성의 실측이 아니다. 실측은 `docker-compose.benchmark.yml` 환경에서 재현해야 한다. 산출 방식과 한계는 `docs/benchmarks/envoy-ext-authz-benchmark.md`를 참고한다. 게이트웨이 코드 자체의 Single-Flight 효과 실측은 `docs/benchmarks/singleflight-effect.md`가 근거다.
 
-1. **정상 트래픽 인가 오버헤드 (500 RPS 지속 부하)**:
-   - Envoy L7 프록시 홉 오버헤드는 p50 기준 0.42ms이다.
-   - L1 캐시 히트 시 PoP-Sync 인가 지연은 0.85ms이며, 총 p50 지연 시간은 1.62ms(p99 1.89ms)이다.
-   - 캐시 미스 시 Policy DB 커넥션 풀(`MAX_DB_WORKERS = 5`, 20ms 지연) 세마포어 한계로 처리량이 248.5 RPS로 제한된다.
+1. **정상 트래픽 인가 오버헤드 (500 RPS 지속 부하, 모델링 값)**:
+   - Envoy L7 프록시 홉 오버헤드는 p50 기준 0.42ms로 가정했다.
+   - L1 캐시 히트 시 PoP-Sync 인가 지연은 0.85ms로 가정했으며, 합산 p50은 1.62ms(p99 1.89ms)이다.
+   - 캐시 미스 시 Policy DB 커넥션 풀(`MAX_DB_WORKERS = 5`, 20ms 지연)의 이론 한계 처리량은 약 250 RPS이며, 하네스는 248.5 RPS를 상수로 사용한다.
 
-2. **동일 키 폭주 방어 (Single-Flight)**:
-   - 캐시되지 않은 동일 키로 동시 요청 1,000건 유입 시, Single-Flight를 통해 999건을 병합하여 실제 DB 조회를 1건으로 제한한다.
-   - p95 지연 시간은 Single-Flight 비활성화 시 4,065.1ms에서 활성화 시 27.3ms로 단축된다.
+2. **동일 키 폭주 방어 (Single-Flight, 시뮬레이션)**:
+   - 캐시되지 않은 동일 키로 동시 요청 1,000건이 유입되는 상황을 시뮬레이션하면, Single-Flight ON에서는 999건이 병합되어 DB 조회가 1건으로 제한된다.
+   - p95 지연 시간은 하네스 모델 기준 Single-Flight OFF 4,065.1ms, ON 27.3ms이다. 게이트웨이 코드 기반 측정은 `singleflight-effect.md`(단일 노드 DB 경로 진입 50건 → 1건, 3노드 클러스터 3회 → 1회)를 따른다.
 
 3. **악의적 공격 에지 차단**:
-   - 중복 Nonce 리플레이 공격(1,500건)과 유량 초과 플러드 공격(1,500건)을 Envoy 에지에서 전건 차단한다.
-   - 백엔드 도달 건수 0건을 유지하며, 백엔드 CPU 사용률 변동은 0%이다.
+   - 중복 Nonce 리플레이(401)와 유량 초과(429) 판정은 하네스가 `gateway.app`을 직접 호출해 확인한다 (각 1회 호출 검증).
+   - 공격 1,500건 규모, '백엔드 도달 0건', Tier 1의 CPU 수치는 시나리오 가정값이며 부하 측정 결과가 아니다.
 
 ---
 
@@ -972,6 +972,6 @@ Envoy PEP와 PoP-Sync PDP 연동 환경에서 측정한 성능 지표 요약이�
   - **Follower 추가 지연**: 클러스터 전역 Single-Flight(`CLUSTER_SINGLEFLIGHT_ENABLED=true`)에서 Follower 노드는 Leader의 L2 적재를 폴링(`CLUSTER_SF_POLL_INTERVAL_SEC=25ms`)한다. 이에 따라 평균 12.5ms에서 최대 25ms의 대기 시간과 Redis 네트워크 왕복 지연이 추가된다.
   - **Leader 장애 시 인계 지연**: Leader 노드가 락 획득 후 DB 쿼리 도중 비정상 종료(`SIGKILL` 등)되면, 락 TTL(`CLUSTER_SF_LOCK_TTL_SEC=3.0s`) 또는 타임아웃(`CLUSTER_SF_TIMEOUT_SEC=2.0s`) 만료까지 Follower 노드가 대기한 뒤 락을 인계받는다. 이 과정에서 일시적인 지연이 발생할 수 있다.
   - **Redis 가용성 의존성**: Redis 장애 시 클러스터 분산 락을 사용할 수 없어 프로세스 로컬 Single-Flight로 전환된다. 이 경우 노드당 1회의 DB 조회가 허용되는 저하 모드로 동작한다.
-- **성능 실측의 한계**: Single-Flight 성능 측정은 단일 노드 및 3개 노드 클러스터에서 DB 지연을 시뮬레이션하여 측정한 결과다 (`docs/benchmarks/singleflight-effect.md`).
+- **성능 실측의 한계**: Single-Flight 성능 측정은 단일 노드 및 3개 노드 클러스터에서 DB 지연을 시뮬레이션하여 측정한 결과다 (`docs/benchmarks/singleflight-effect.md`). Envoy ext_authz 벤치마크(`docs/benchmarks/envoy-ext-authz-benchmark.md`)는 인프로세스 시뮬레이션 하네스 결과이며 실제 네트워크 측정이 아니다.
 - **PoP 서명의 한계**: Scope B 경량 구현 규격에 따라 Timestamp 및 Host 바인딩, 다중 키 식별을 위한 `kid` 헤더 지원, 하드웨어 Attestation 검증은 지원하지 않는다. 데모 환경에는 단일 데모 키만 등록되어 있다.
 - **PoP 테스트 구성**: PoP 기능을 활성화한 시나리오는 클라이언트가 실제로 ECDSA 서명을 생성해야 하므로 `tests/test_pop.py`에서 분리하여 검증한다.

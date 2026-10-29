@@ -196,7 +196,7 @@
   - Single-Flight 메커니즘에서 백엔드 리더(Leader) 쿼리 발생 빈도와 팔로워(Follower) 병합 효율을 직관적으로 검증할 수 있는 세부 관측성 메트릭이 부재했다.
 - **수정 내용 및 결과**:
   - `SLIDING_RL_LUA` 스크립트를 **Check-Before-Increment** 방식으로 전면 개편했다. `prev`와 `curr`를 먼저 읽고 예상 트래픽 `math.floor(prev * ((window - elapsed) / window)) + curr`를 산출하여, `estimated >= limit`인 경우 `INCR` 없이 즉시 `0`(거부)을 반환하고 `estimated < limit`일 때만 `INCR` 및 `EXPIRE`를 수행하고 `1`(허용)을 반환하도록 개선했다. 인자 키 순서 호환을 위해 윈도우 타임스탬프 접미사 자동 판별 로직을 내장했다.
-  - 인메모리 로컬 폴백(`_local_rate_limit`) 및 Fixed 윈도우 분기에도 동일한 Check-Before-Increment 방식을 적용하여 Redis 장애/폴백 상황에서도 거부된 요청이 로컬 윈도우 카운터를 오염시키지 않도록 보장했다.
+  - 인메모리 로컬 폴백(`_local_rate_limit`)에 동일한 Check-Before-Increment 방식을 적용하여 Redis 장애/폴백 상황에서도 거부된 요청이 로컬 윈도우 카운터를 오염시키지 않도록 보장했다.
   - Single-Flight 관측성 강화를 위해 `stats`에 `singleflight_leader_queries` 메트릭을 추가하고, `/auth`에서 `db_loader_task`를 기동하는 Leader 요청 시점에 원자적으로 카운트를 증가시켰다 (`conftest.py:clean_gateway_state` 리셋 연동).
   - 2대 수학적 불변식 (`requests == rate_limited + nonce_replays + pop_rejected + l1_hits + l2_hits + db_fallbacks + redis_outage_blocked`, `db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + circuit_blocked`)을 100% 온전히 유지했다.
   - `test_sliding_window_rejected_requests_do_not_pollute_next_window` 및 `test_singleflight_leader_follower_efficiency_observability` 단위 테스트로 검증했다.
@@ -280,17 +280,17 @@
     - **Body Digest 규격**: 클라이언트가 전송한 `X-Body-Digest` 헤더(`sha256=<hex_digest>`)와 실제 요청 본문의 SHA-256 다이제스트를 `hmac.compare_digest`로 상수 시간 비교한다. 본문이 비어있으면 `EMPTY_BODY_DIGEST`(`sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`)를 적용한다.
     - **Query 정규화**: 쿼리 파라미터를 알파벳 오름차순으로 정렬(`parse_qsl` → `sorted` → `urlencode`)하여 파라미터 순서 불일치로 인한 오탐을 방지한다.
   - **본문 해시 사전 검증**: `X-Body-Digest` 접두사(`sha256=`)가 없거나 요청 본문과 일치하지 않으면 Nonce를 소진한 후 `400 Bad Request`(`"Missing or invalid X-Body-Digest header"` 또는 `"Body digest mismatch"`)를 반환한다(`pop_rejected += 1`). 고비용 비대칭 암호 연산(ECDSA P-256 verify) 전에 무효 요청을 차단하여 CPU 낭비를 막는다.
-  - `tests/test_pop.py`에 바디 다이제스트 누락 및 불일치 400 반환(`test_pop_signature_missing_body_digest_header_returns_400`, `test_pop_signature_body_digest_mismatch_returns_400`, `test_pop_signature_valid_request_with_body_digest_and_query_succeeds`) 및 쿼리 변조 401 차단(`test_pop_signature_query_tampering_rejected`) 테스트를 추가하여 동작을 확인했다.
+  - `tests/test_pop.py`에 바디 다이제스트 누락 및 불일치 400 반환(`test_pop_body_digest_invalid_format`, `test_pop_body_digest_mismatch`, `test_pop_query_param_valid_signature`) 및 쿼리 변조 401 차단(`test_pop_query_tampering_regression`) 테스트를 추가하여 동작을 확인했다.
 
 ### 6.3 Single-Flight OFF 모드 클라이언트 취소 시 백엔드 DB 쿼리 중단 정합성 회복
-- **대상 파일 및 함수**: `gateway.py:auth_endpoint`, `tests/test_singleflight.py:test_singleflight_disabled_client_cancellation_aborts_db`
+- **대상 파일 및 함수**: `gateway.py:auth`, `tests/test_singleflight.py:test_singleflight_off_cancellation_aborts_db_call`
 - **기존 문제**:
   - `SINGLEFLIGHT_ENABLED=False`(단일 비행 비활성화) 모드에서 DB 조회 코루틴을 `db_loader_task()` 비동기 태스크로 분리하고 `asyncio.shield()`로 감싸 실행했다.
   - 이로 인해 클라이언트 연결이 끊겨도(`CancelledError`) 백엔드 DB 쿼리가 취소되지 않고 실행되었다. 단일 비행 비활성화 모드임에도 불필요한 백엔드 DB 자원이 소모되는 문제가 있었다 (`README.md 알려진 한계점` 참조).
 - **수정 내용 및 결과**:
-  - `gateway.py:auth_endpoint`의 `singleflight_mode == "off"` 분기에서 `asyncio.shield`를 제거했다. 클라이언트 요청 컨텍스트에서 `await db_loader_task(...)`를 직접 실행하도록 변경했다.
+  - `gateway.py:auth`의 `singleflight_mode == "off"` 분기에서 `asyncio.shield`를 제거했다. 클라이언트 요청 컨텍스트에서 `await db_loader_task(...)`를 직접 실행하도록 변경했다.
   - 클라이언트가 연결을 끊으면 `asyncio.CancelledError`가 DB 조회 코루틴으로 전파되어 백엔드 호출이 즉시 중단된다.
-  - `tests/test_singleflight.py::test_singleflight_disabled_client_cancellation_aborts_db` 단위 테스트를 추가하여 OFF 모드에서 클라이언트 취소 시 DB 조회가 즉시 중단됨을 검증했다.
+  - `tests/test_singleflight.py::test_singleflight_off_cancellation_aborts_db_call` 단위 테스트를 추가하여 OFF 모드에서 클라이언트 취소 시 DB 조회가 즉시 중단됨을 검증했다.
   - `README.md`의 한계점 목록에서 관련 항목을 제거했다.
 
 ### 6.4 Rate Limiter 고정 윈도우 decr 예외 로깅 보강 및 Redis TIME 단일 시간 소스 검증
@@ -302,7 +302,7 @@
   - `check_rate_limit`의 `decr` 롤백 블록에 `logging.debug(f"Rate limit decr rollback failed for {key}: {e}")` 출력을 추가했다.
   - `tests/conftest.py:mock_common_dependencies`에 `m_redis.time` 모의 객체를 추가하여 Redis `TIME` 명령 기반의 시간 일관성 검증을 지원하도록 했다.
   - `tests/test_rate_limit.py::test_fixed_window_decr_rollback_logging` 단위 테스트를 추가하여 롤백 실패 로그 출력을 확인했다.
-  - `docs/benchmarks/rate-limit-sliding.md` 및 `README.md`에 Redis `TIME` 단일 시간 소스 사용 시의 트레이드오프(0.2~0.5ms 지연 시간 추가 대비 시계 동기화 효과)를 분석하고 관련 한계점을 정리했다.
+  - `docs/benchmarks/rate-limit-sliding.md` 및 `README.md`에 Redis `TIME` 단일 시간 소스 사용 시의 트레이드오프(0.2~0.5ms 지연 시간 추가 대비 시계 동기화 효과)를 분석하고 관련 한계점을 정리했다. (정정 2026-10-29: `gateway.py:check_rate_limit`은 현재도 노드 로컬 `time.time()`으로 윈도우를 계산하며 Redis `TIME`은 실제로 적용되어 있지 않다. 또한 `README.md`에는 해당 분석이 없다. `rate-limit-sliding.md`를 '미적용 개선 후보'로 정정했다.)
 
 ### 6.5 9대 카오스 복원력 시나리오 연속 검증 및 수학적 불변식 감사 스위트 확장
 - **대상 파일 및 함수**: `tests/test_chaos_audit.py`, `tests/conftest.py:e2e_cluster`, `.github/workflows/ci.yml`
@@ -377,5 +377,5 @@
   - Single-Flight 비활성화(OFF) 시 1,000건의 동시 요청이 Policy DB로 전달될 때, `gateway.py` 내부의 `MAX_DB_WORKERS = 5` 세마포어 경합으로 인한 큐 대기 지연(`1,000 / 5 * 20ms = 4,000ms`)이 시뮬레이션에 반영되지 않아 지연 시간이 축소되는 왜곡이 있었다.
 - **수정 내용 및 결과**:
   - **지속 부하 RPS 정규화**: 500 RPS 목표 유입량과 테스트 기간(`duration_sec`)에 맞춰 경과 시간을 정규화하여 실제 지속 부하 환경과 일치하도록 보정했다.
-  - **Single-Flight OFF 세마포어 큐 대기 보정**: Single-Flight OFF 시뮬레이션에 `asyncio.Semaphore(5)`를 적용하여 슬롯 5개에 대한 동시성 제어 및 대기 큐 적체 지연을 반영했다. 보정 결과 Single-Flight OFF 상태의 p95 지연 시간은 4,065.1ms로 측정되었다. 반면 Single-Flight ON 상태는 Leader 1건만 DB를 조회하고 999건이 결과를 공유받아 p95 지연 시간 27.3ms를 기록했다.
-  - **측정 데이터 검증**: 보정된 측정 데이터를 `docs/benchmarks/benchmark_results.json`에 확정 기록하고, 기술 문서 및 벤치마크 리포트에 동기화했다.
+  - **Single-Flight OFF 세마포어 큐 대기 보정**: Single-Flight OFF 시뮬레이션에 `asyncio.Semaphore(5)`를 적용하여 슬롯 5개에 대한 동시성 제어 및 대기 큐 적체 지연을 반영했다. 보정 결과 하네스 시뮬레이션 기준 Single-Flight OFF 상태의 p95 지연 시간은 4,065.1ms로 산출되었다. 반면 Single-Flight ON 상태는 Leader 1건만 DB를 조회하고 999건이 결과를 공유받아 p95 지연 시간 27.3ms로 산출되었다.
+  - **측정 데이터 검증 및 캐시 미스 분석 보강**: 보정된 측정 데이터를 `docs/benchmarks/benchmark_results.json`에 확정 기록하고, 기술 문서 및 벤치마크 리포트에 동기화했다. Table 1에서 백엔드 비즈니스 DB(`mock_backend.py`)는 `mode=overhead`(지연 0ms)로 고정되어 Tier 1/2에는 DB 지연이 없으며, `20ms` 지연은 Tier 3 캐시 미스 시의 Policy DB 디스크 I/O 시뮬레이션 지연임을 명시했다. 또한 순수 인가·프록시 지연은 `2.46ms`(L2 수준)이고, 처리량 `248.5 RPS`는 `MAX_DB_WORKERS = 5` 세마포어에 의한 정상 제어 결과이며, 100% Cold Miss 전제 조건과 실제 운영 환경(Single-Flight 및 L1/L2 적재로 대다수 요청이 `1.61ms`/`2.43ms` 처리) 특성을 명시했다.

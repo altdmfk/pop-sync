@@ -15,8 +15,8 @@
 | 클라이언트 요청 수 (매 Iteration) | 100 (동시) |
 | 요청 분산 방식 | 스크립트가 gateway-a/b/c에 라운드로빈 |
 | Rate Limit (per client) | 50 req/10s (L1 캐시 없는 키는 최대 50개가 DB 경로 진입) |
-| `DB_TIMEOUT_SEC` | 1.0초 (gateway.py 하드코딩) |
-| `MAX_DB_WORKERS` | 5 (gateway.py 하드코딩) |
+| `DB_TIMEOUT_SEC` | 1.0초 (gateway.py 기본값, 환경변수로 변경 가능) |
+| `MAX_DB_WORKERS` | 5 (gateway.py 기본값, 환경변수로 변경 가능) |
 | `DB_SEMAPHORE_ACQUIRE_TIMEOUT` | 0.1초 |
 | 클라이언트 타임아웃 | 30.0초 (`httpx.AsyncClient`) |
 | 측정 스크립트 | `tests/measure_singleflight_effect.py` |
@@ -35,8 +35,10 @@
 모든 조건 · 전 Iteration에서 아래 등식이 성립하는지 확인:
 
 ```
-db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + circuit_blocked
+db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_hits + policy_circuit_blocked
 ```
+
+(`policy_circuit_blocked = circuit_blocked - pubkey_circuit_blocked`. 본 측정은 PoP 검증 비활성 상태이므로 `circuit_blocked`와 같다.)
 
 결과: **18회 Iteration 전체 True**.
 
@@ -137,7 +139,7 @@ db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_h
 5. **L1 캐시 타이밍 의존성**: l1_hits 수는 100개 요청이 도착하는 타이밍과 첫 DB 응답 시점에 따라 회차마다 다름. 결정론적 재현 불가.
 6. **0.02초 조건에서 ON/OFF 차이 불분명**: DB 지연이 짧아 coalesced 기회가 적고, L1 캐시가 빠르게 채워져 DB 경로 진입 자체가 적음.
 7. **1.0초 조건 제외**: `DB_TIMEOUT_SEC=1.0`과 동일하여 타임아웃 경합 발생, 유효 조건 아님.
-8. **단일 비행 OFF 시 취소(Cancellation) 동작 차이**: OFF 모드이더라도 DB 조회는 asyncio.shield로 감싸진 백그라운드 태스크에서 실행되므로, 클라이언트 연결이 끊겨도 DB 호출이 취소되지 않는 차이점이 존재한다 (pre-singleflight 버전과 다름).
+8. **단일 비행 OFF 시 취소(Cancellation) 동작 (측정 당시와 현재의 차이)**: 본 측정(2026-10-02) 당시에는 OFF 모드에서도 DB 조회가 `asyncio.shield`로 감싸져 클라이언트 연결이 끊겨도 취소되지 않았다. 이후 v1.1.0(`DEVELOPMENT_LOG.md` 6.3)에서 OFF 모드의 `asyncio.shield`를 제거하여, 현재는 클라이언트 취소가 DB 조회 취소로 전파된다 (`tests/test_singleflight.py::test_singleflight_off_cancellation_aborts_db_call`).
 
 ---
 
@@ -147,7 +149,7 @@ db_fallbacks == db_queries_executed + singleflight_coalesced + l1_double_check_h
 
 ```powershell
 # 1. docker-compose build (policy_db.py 변경이 이미지에 반영되도록)
-cd C:\Users\user\Desktop\task\three\aegis-sync-main
+cd C:\Users\user\Desktop\task\three\pop-sync-main
 docker-compose build
 ```
 
@@ -167,7 +169,7 @@ docker-compose up -d
 Start-Sleep 15
 
 # 지연 적용 확인
-docker exec aegis-sync-main-policy_db-1 env | findstr SIMULATED
+docker exec pop-sync-main-policy_db-1 env | findstr SIMULATED
 
 # ON/OFF 상태 확인
 python -c "import httpx; print(httpx.get('http://localhost:8001/metrics', headers={'X-Admin-Token': 'super-secret-admin'}).json().get('singleflight_enabled'))"

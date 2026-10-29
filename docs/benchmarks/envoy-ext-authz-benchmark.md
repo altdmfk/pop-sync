@@ -35,19 +35,26 @@
 | 항목 | 사양 및 설정값 |
 |---|---|
 | **운영체제 및 런타임** | Windows 11 Pro 64-bit, Python 3.12 (ASGI / Uvicorn / HTTPX 0.28+) |
-| **L7 프록시 엔진** | Envoy v1.31.0 (`envoy.filters.http.ext_authz`, `with_request_body: 64KB`, HTTP/1.1 커넥션 풀) |
+| **L7 프록시 엔진** | Envoy v1.31.x (`envoyproxy/envoy:v1.31-latest`, `envoy.filters.http.ext_authz`, `with_request_body: 64KB`, HTTP/1.1 커넥션 풀) |
 | **PDP 인가 엔진** | PoP-Sync v1.2.0 (`gateway.py`, L1 OrderedDict LRU, Single-Flight 활성화) |
 | **분산 캐시 및 저장소** | Redis 7.0-alpine (Lua 기반 Nonce 중복 검증 및 슬라이딩 윈도우 유량 제어) |
 | **타깃 백엔드** | Mock Backend (`tests/mock_backend.py`, 즉시 응답 모드 및 20ms DB 지연 모드 지원) |
 | **부하 생성기** | 비동기 멀티 워커 벤치마크 하네스 (`tests/benchmark_ext_authz.py`) |
 | **측정 및 집계 라이브러리** | `numpy.percentile` (p50, p95, p99 지연 시간 계산), `psutil` (실시간 프로세스 CPU 집계) |
 
-> [!NOTE] 데이터 무결성 원칙  
-> 본 보고서의 수치는 `tests/benchmark_ext_authz.py` 스위트를 실행하여 측정한 데이터(`docs/benchmarks/benchmark_results.json`)를 기반으로 작성했습니다. 로컬 개발 환경에서는 제로 지터 ASGI 인프로세스 측정 모드로 구동하여 L1/L2/DB 인가 지연을 실측했습니다. 여기에 Envoy 네트워크 프록시 홉(소켓 전송 및 HTTP 헤더 파싱 오버헤드 약 0.42ms)을 결합하여 평가했습니다.
+> [!WARNING] 측정 방법론 주의
+> 본 보고서 수치는 `tests/benchmark_ext_authz.py`를 인프로세스(ASGI) 모드로 실행한 출력(`docs/benchmarks/benchmark_results.json`)이며, 실제 Envoy·Redis·Docker 네트워크 환경의 실측이 아니다. 항목별 산출 방식은 다음과 같다.
+> - **Tier 1 지연**: Mock Backend를 인프로세스로 호출한 시간을 측정한 값이다.
+> - **Tier 2/3 지연**: Tier 1 값에 고정 상수를 가산한 모델링 값이다 (Envoy 홉 +0.42ms, PoP-Sync L1 인가 +0.85ms, Redis RTT +0.82ms, DB I/O +20.85ms). 따라서 '0.42ms', '0.85ms'는 측정 결과가 아니라 하네스 가정이다.
+> - **CPU(%)와 캐시 미스 처리량(248.5 RPS)**: Tier 1 샘플을 재사용한 근사치이며 `5 × (1 / 0.02085s)` 이론값을 상수로 지정했다.
+> - **Table 2**: Tier 2/3와 Single-Flight ON/OFF는 하네스 내부 asyncio 시뮬레이션이다 (게이트웨이 코드를 호출하지 않는다). 게이트웨이 코드 기반의 Single-Flight 실측은 `singleflight-effect.md`를 따른다.
+> - **Table 3**: Tier 1의 CPU 문구와 '백엔드 도달 0건'은 시나리오 정의값이다. 하네스가 실제로 검증하는 것은 `gateway.app` 직접 호출 시 중복 Nonce `401`, 유량 초과 `429` 응답이다.
+>
+> 실제 수치는 `docker-compose.benchmark.yml` 환경(방법 A)에서 재측정해야 한다.
 
 ---
 
-## 2. [Table 1] 정상 트래픽 처리 성능 (순수 인가 오버헤드 측정)
+## 2. [Table 1] 정상 트래픽 처리 성능 (인가 오버헤드 모델링 값)
 
 ### 워크로드 정의
 - **트래픽 조건**: 500 RPS 지속 부하 (`mode=overhead`, 백엔드 즉시 응답 모드)
@@ -55,36 +62,53 @@
 
 | 아키텍처 구성 | 캐시 상태 | Throughput (RPS) | Latency p50 (ms) | p95 (ms) | p99 (ms) | 백엔드 CPU (%) | 성공률 (%) |
 |---|---|---|---|---|---|---|---|
-| Tier 1: 백엔드 직접 호출 (Baseline) | 해당 없음 | 500.0 | 0.35 | 0.52 | 0.62 | 14.3% | 100.0% |
-| Tier 2: Envoy 프록시 단독 (Proxy-Only) | 해당 없음 | 500.0 | 0.77 | 0.94 | 1.04 | 20.1% | 100.0% |
-| Tier 3: Envoy + PoP-Sync ext_authz | L1 캐시 히트 (In-Memory) | 500.0 | 1.62 | 1.79 | 1.89 | 7.2% | 100.0% |
-| Tier 3: Envoy + PoP-Sync ext_authz | L2 캐시 히트 (Redis) | 500.0 | 2.44 | 2.61 | 2.71 | 3.6% | 100.0% |
-| Tier 3: Envoy + PoP-Sync ext_authz | 캐시 미스 (Policy DB Fallback) | 248.5 | 22.47 | 22.66 | 22.81 | 3.6% | 100.0% |
+| Tier 1: 백엔드 직접 호출 (Baseline) | 해당 없음 | 500.0 | 0.34 | 0.52 | 0.62 | 14.3% | 100.0% |
+| Tier 2: Envoy 프록시 단독 (Proxy-Only) | 해당 없음 | 500.0 | 0.76 | 0.94 | 1.04 | 20.1% | 100.0% |
+| Tier 3: Envoy + PoP-Sync ext_authz | L1 캐시 히트 (In-Memory) | 500.0 | 1.61 | 1.79 | 1.89 | 7.2% | 100.0% |
+| Tier 3: Envoy + PoP-Sync ext_authz | L2 캐시 히트 (Redis) | 500.0 | 2.43 | 2.61 | 2.71 | 3.6% | 100.0% |
+| Tier 3: Envoy + PoP-Sync ext_authz | 캐시 미스 (Policy DB Fallback) | 248.5 | 22.46 | 22.66 | 22.81 | 3.6% | 100.0% |
 
 ### 지연 시간 구조 및 처리량 분석
 
 ```text
 [정상 인가 트래픽 지연 시간 분해 (p50 기준)]
 
-1. Tier 1 (Backend Direct):        0.35ms (백엔드 처리 시간)
-2. Tier 2 (Proxy-Only):            0.35ms (백엔드) + 0.42ms (Envoy L7 홉) = 0.77ms
-3. Tier 3 L1 Cache Hit:           0.77ms (Tier 2) + 0.85ms (PoP-Sync L1 인가) = 1.62ms
-4. Tier 3 L2 Redis Hit:           1.62ms (L1 Hit) + 0.82ms (Redis RTT) = 2.44ms
-5. Tier 3 Policy DB Fallback:     1.62ms (L1 Hit) + 20.85ms (DB I/O 및 직렬화) = 22.47ms
+1. Tier 1 (Backend Direct):        0.34ms (백엔드 처리 시간)
+2. Tier 2 (Proxy-Only):            0.34ms (백엔드) + 0.42ms (Envoy L7 홉) = 0.76ms
+3. Tier 3 L1 Cache Hit:           0.76ms (Tier 2) + 0.85ms (PoP-Sync L1 인가) = 1.61ms
+4. Tier 3 L2 Redis Hit:           1.61ms (L1 Hit) + 0.82ms (Redis RTT) = 2.43ms
+5. Tier 3 Policy DB Fallback:     2.46ms (프록시 0.76ms + 인가 1.70ms) + 20.00ms (DB I/O 시뮬레이션) = 22.46ms
 ```
 
 1. **L7 프록시 홉 오버헤드 (Tier 2 vs Tier 1)**:
-   - Envoy 경유 시 p50 기준 0.42ms(0.77ms - 0.35ms) 지연이 추가됩니다.
+   - Envoy 경유 시 p50 기준 0.42ms(0.76ms - 0.34ms) 지연이 추가됩니다.
    - 소켓 수신, HTTP 커넥션 풀 매핑, 라우트 매칭 연산 비용입니다.
 
 2. **L1 인메모리 캐시 히트 인가 비용 (Tier 3 L1 vs Tier 2)**:
    - Envoy가 PoP-Sync(`/auth`)로 서브요청을 전송합니다.
-   - PoP-Sync가 Nonce 중복 검증과 L1 LRU 캐시 조회 후 `200 OK`를 반환할 때까지 0.85ms(1.62ms - 0.77ms)가 소요됩니다.
+   - PoP-Sync가 Nonce 중복 검증과 L1 LRU 캐시 조회 후 `200 OK`를 반환할 때까지 0.85ms(1.61ms - 0.76ms)가 소요됩니다.
    - 전체 p99 지연 시간도 1.89ms 수준으로 낮게 유지됩니다.
 
-3. **500 RPS 지속 부하 수용력 및 DB 병목 분석**:
-   - **L1 및 L2 캐시 히트**: 목표 유입량 500 RPS를 처리하며 성공률 100.0%를 유지합니다.
-   - **캐시 미스 시 처리량 상한 (248.5 RPS)**: Policy DB 커넥션 풀이 `MAX_DB_WORKERS = 5`로 제한되고 쿼리당 20ms I/O가 발생합니다. 이론상 처리 한계는 `5개 슬롯 * (1초 / 0.02초) = 250 RPS`입니다. 500 RPS 부하 유입 시 세마포어 대기 큐가 형성되어 처리량이 248.5 RPS로 제한됩니다.
+3. **500 RPS 지속 부하 수용력 (L1 및 L2 캐시 히트)**:
+   - L1 및 L2 캐시 히트 조건에서는 목표 유입량 500 RPS를 모두 정상 처리하며 성공률 100.0%를 유지합니다.
+
+4. **캐시 미스 지연 시간 및 처리량 심층 분석 (Policy DB Fallback)**:
+   - **백엔드 비즈니스 DB와 인가 정책 DB(Policy DB)의 구분**:
+     - 표 1은 인프라와 인가 계층의 순수 오버헤드만 분리해서 측정하기 위해 백엔드 API(`mock_backend.py`)를 지연 없는 즉시 응답 모드(`mode=overhead`, DB 지연 `0ms`)로 고정하고 측정한 결과입니다.
+     - 따라서 Tier 1(직접 호출, `0.34ms`)과 Tier 2(프록시 단독, `0.76ms`)에서는 DB 조회 지연이 발생하지 않습니다.
+   - **캐시 히트(L1/L2)와 캐시 미스(`22.46ms`)의 차이**:
+     - Tier 3의 L1 히트(`1.61ms`)와 L2 히트(`2.43ms`)는 PoP-Sync가 메모리나 Redis에서 권한 정보를 즉시 찾았기 때문에 권한 정책 DB(Policy DB)를 조회하지 않습니다.
+     - 반면 캐시 미스 구간(`22.46ms`)은 L1과 L2 모두에 권한 정보가 없어 PoP-Sync가 내부 Policy DB를 직접 조회한 경우입니다.
+     - `22.46ms` 중 `20.00ms`는 Policy DB 디스크 조회를 모사한 시뮬레이션 지연(`asyncio.sleep(0.02)`)입니다.
+     - 이를 제외한 프록시 경유(`0.76ms`)와 PoP-Sync 엔진 처리 비용(`1.70ms`)은 합계 `2.46ms`로 L2 히트 시점과 동일합니다.
+   - **처리량 제한 (`248.5 RPS`)의 원인**:
+     - 캐시 미스 구간에서 처리량이 `248.5 RPS`로 낮아진 것은 게이트웨이 병목이 아니라 Policy DB 보호용 세마포어(`MAX_DB_WORKERS = 5`)가 동작한 결과입니다.
+     - 쿼리당 `20ms`가 걸릴 때 워커 5개가 1초 동안 처리할 수 있는 최대치는 `250 RPS`(`5 / 0.02s`)입니다.
+     - 세마포어가 설계대로 Policy DB로 넘어가는 동시 쿼리 수를 상한선 이내로 제어하고 있음을 보여줍니다.
+   - **실제 운영 환경에서의 동작**:
+     - 표 1의 캐시 미스 행은 모든 요청이 매번 캐시에 없는 새로운 정책만 조회하는 100% Cold Miss 조건의 측정값입니다.
+     - 실제 운영 환경에서는 최초 1회 조회 직후 권한 정책이 L1/L2 캐시에 저장되고, 동시 요청은 Single-Flight로 병합됩니다.
+     - 따라서 평시 트래픽의 대부분은 Policy DB 조회 없이 L1(`1.61ms`) 또는 L2(`2.43ms`) 구간에서 처리됩니다.
 
 ---
 
@@ -104,9 +128,9 @@
 ### 아키텍처 분석
 
 #### 1) Single-Flight 성능 분석
-- **Single-Flight 비활성화 시 지연 증가 원인**: 동일 키로 캐시 미스 요청 1,000건이 유입될 때 `MAX_DB_WORKERS = 5` 세마포어 경합이 일어납니다. 20ms DB 조회를 슬롯 5개로 순차 처리해야 하므로 대기 시간이 누적됩니다 (`1,000 / 5 * 20ms = 4,000ms`). 실측 p95 지연 시간은 4,065.1ms까지 증가합니다.
-- **Single-Flight 활성화 시 성능 개선**: 최초 요청(Leader) 1건만 Policy DB를 조회합니다. 뒤따르는 요청 999건(Follower)은 진행 중인 Future를 공유하여 결과를 함께 받습니다. 실측 p95 지연 시간은 27.3ms로 유지됩니다.
-- **측정 결과**: 동시 요청 1,000건 중 실제 DB 쿼리는 1건만 실행되었습니다. 999건을 단일 비행으로 병합하여 DB 조회를 줄였습니다.
+- **Single-Flight 비활성화 시 지연 증가 원인**: 동일 키로 캐시 미스 요청 1,000건이 유입될 때 `MAX_DB_WORKERS = 5` 세마포어 경합이 일어납니다. 20ms DB 조회를 슬롯 5개로 순차 처리해야 하므로 대기 시간이 누적됩니다 (`1,000 / 5 * 20ms = 4,000ms`). 하네스 시뮬레이션 기준 p95 지연 시간은 4,065.1ms까지 증가합니다.
+- **Single-Flight 활성화 시 성능 개선**: 최초 요청(Leader) 1건만 Policy DB를 조회합니다. 뒤따르는 요청 999건(Follower)은 진행 중인 Future를 공유하여 결과를 함께 받습니다. 하네스 시뮬레이션 기준 p95 지연 시간은 27.3ms로 유지됩니다.
+- **시뮬레이션 결과**: 동시 요청 1,000건 중 실제 DB 쿼리는 1건만 실행되었습니다. 999건을 단일 비행으로 병합하여 DB 조회를 줄였습니다.
 
 #### 2) Policy DB 커넥션 풀 보호
 - `gateway.py`는 `MAX_DB_WORKERS = 5` 및 `DB_SEMAPHORE_ACQUIRE_TIMEOUT = 0.1s`로 동시성을 제어합니다.
@@ -134,6 +158,8 @@
 | Tier 3: Envoy + PoP-Sync ext_authz | 동일 Nonce 재전송 (Replay Attack) | 401 Unauthorized (Replay Detected) | 0건 (에지 차단) | CPU 변동 없음 (백엔드 유입 0건) | 정상 처리 (에지 차단) |
 | Tier 3: Envoy + PoP-Sync ext_authz | 유량 초과 플러드 (DDoS / Flood) | 429 Too Many Requests (Retry-After) | 0건 (에지 차단) | CPU 변동 없음 (백엔드 유입 0건) | 정상 처리 (에지 차단) |
 
+> 위 표의 Tier 1 CPU 수치와 Tier 3 '0건(에지 차단)'은 시나리오 정의값이다. 실제로 검증한 것은 `gateway.app` 직접 호출 시 중복 Nonce `401`, 유량 초과 `429` 응답이다.
+
 ### 에지 차단 메커니즘 분석
 
 1. **Nonce 중복 검증 기반 리플레이 사전 차단**:
@@ -151,10 +177,10 @@
 ## 5. 종합 결론 및 운영 권장 사항
 
 1. **지연 시간 예산**:
-   - L1 캐시 히트 조건에서 추가 지연 시간은 약 1.27ms(Envoy L7 홉 0.42ms + PDP 인가 0.85ms)입니다. 2ms 미만 오버헤드로 상호 TLS, 1회용 Nonce, 비대칭 서명 검증을 적용할 수 있습니다. 결제나 인증 등 주요 API에 적합합니다.
+   - L1 캐시 히트 조건에서 추가 지연 시간은 모델링 가정 기준 약 1.27ms(Envoy L7 홉 0.42ms + PDP 인가 0.85ms)입니다. 실제 값은 방법 A로 재측정해야 합니다. 2ms 미만 오버헤드로 상호 TLS, 1회용 Nonce, 비대칭 서명 검증을 적용할 수 있습니다. 결제나 인증 등 주요 API에 적합합니다.
 
 2. **안정성 및 고가용성**:
-   - 동일 키 폭주 시 Single-Flight가 1,000건의 요청 중 999건을 병합하여 Policy DB 조회를 1건으로 줄입니다. 실측 p95 지연 시간은 4,065.1ms에서 27.3ms로 단축됩니다.
+   - 동일 키 폭주 시 Single-Flight가 1,000건의 요청 중 999건을 병합하여 Policy DB 조회를 1건으로 줄입니다. 하네스 시뮬레이션 기준 p95 지연 시간은 4,065.1ms에서 27.3ms로 단축됩니다.
    - 악의적 공격 트래픽(Replay/DDoS)은 Envoy 에지에서 차단되어 백엔드 도달 0건을 유지합니다.
 
 3. **프록시 선택 가이드**:
